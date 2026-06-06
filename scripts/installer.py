@@ -1,0 +1,1733 @@
+#!/usr/bin/env python3
+"""installer.py — ONE installer for the chat4000 plugin across BOTH agent hosts.
+
+It scans the system for every Hermes (Python agent) and OpenClaw (Node agent)
+instance, reports what it found, lets you choose where to install when there's
+more than one, then installs the plugin with the right toolchain for that host:
+
+  • Hermes   → pip/uv install into Hermes' venv, then `chat4000 wizard`
+  • OpenClaw → `openclaw plugins install @chat4000/openclaw-plugin`, then
+               `openclaw chat4000 setup --self-redeem` + gateway restart
+
+Runs in the system Python (stdlib only) — no third-party deps, because the
+`rich`/SDK code only exists AFTER the plugin is installed.
+
+────────────────────────────────────────────────────────────────────────
+A note about the telemetry in this file, from us at chat4000:
+
+We send anonymous events to PostHog (product analytics) and Sentry (uncaught
+crashes) FROM THE INSTALLER ITSELF, so we can see what % of installs succeed,
+which step fails most, and get a real stack trace when it crashes.
+
+Things we NEVER send: your message content, prompts, command arguments, env
+vars, pairing codes, group keys, usernames, or your file paths (home/username
+path segments are scrubbed before send).
+
+What WE send is bounded to: which install step ran/failed + the error class;
+python + agent version, OS platform; the merged-environment scan described
+below; and an anonymous UUID (~/.config/chat4000/install-id).
+
+The merged scan additionally reports, per detected agent (so we can size the
+installed base and prioritise the right host): the agent's install DATE, the
+names + COUNT of channels/plugins it has, and how many SESSIONS live on it.
+These are counts and public package names — never content.
+
+Opt out any of three ways:
+  • CHAT4000_TELEMETRY_DISABLED=1 in your env
+  • pass --no-telemetry on the curl|bash line
+  • after install: `chat4000 telemetry disable` (Hermes) /
+                   `openclaw chat4000 telemetry disable` (OpenClaw)
+
+Privacy policy: https://chat4000.com/privacy
+Love, chat4000 ❤️
+────────────────────────────────────────────────────────────────────────
+
+PostHog events fired by this file (routed to the matching host's project):
+  - installer_started                    {selected_kind?}
+  - installer_environment_scan           {hermes_count, openclaw_count, total}  (→ both)
+  - installer_agent_detected             {kind, agent_version, install_date,
+                                          age_days, channels, channel_count,
+                                          session_count, agent_count,
+                                          plugin_installed, plugin_version}
+  - installer_hermes_detected            {hermes_layout, hermes_path}
+  - installer_openclaw_detected          {openclaw_version, openclaw_path}
+  - installer_pkg_installed              {...}
+  - installer_gateway_restarted          {method}            (openclaw)
+  - installer_handing_off_to_wizard      (hermes)
+  - installer_handing_off_to_setup       {paired}            (openclaw)
+  - installer_succeeded / installer_failed / installer_cancelled / installer_crashed
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import os
+import platform
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+import uuid
+from pathlib import Path
+from typing import Optional
+
+# Line-buffer stdout/stderr so subprocess output stays interleaved in order
+# when piped through `docker exec` / `ssh`.
+with contextlib.suppress(Exception):
+    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+
+# ─── Constants ────────────────────────────────────────────────────────────
+
+# Hermes — Python plugin, git-installed into Hermes' venv.
+HERMES_REPO_URL = "https://github.com/chat4000/chat4000-hermes-plugin"
+HERMES_DEFAULT_REF = "stable"
+# Prebuilt Matrix-E2EE wheels (not on PyPI); pip resolves the chat4000-pyvodozemac
+# hard dep from here, per platform, so users never need a Rust toolchain.
+PYVODOZEMAC_FIND_LINKS = (
+    "https://github.com/chat4000/chat4000-pyvodozemac/releases/expanded_assets/v0.1.0"
+)
+HERMES_PKG = "chat4000-hermes-plugin"
+
+# OpenClaw — Node plugin, installed from npm.
+OPENCLAW_REPO_URL = "https://github.com/chat4000/chat4000-openclaw-plugin"
+OPENCLAW_NPM_PACKAGE = "@chat4000/openclaw-plugin"
+
+# Public PostHog credentials — one project per host (same projects the plugins
+# + the iOS/Mac apps use), so each host's install funnel stays correlated with
+# that host's runtime events. Public keys; safe to embed.
+POSTHOG = {
+    "hermes": {
+        "key": "phc_s49DnTamyFDnEC6MyumNmmjjf7p455LXCVzPE94hPemZ",
+        "url": "https://us.i.posthog.com/capture/",
+    },
+    "openclaw": {
+        "key": "phc_wNRtzk3h5FTw2X6h4CvieEoxdSdqUd42eUqbgW6nD7B4",
+        "url": "https://posthog.chat4000.com/capture/",
+    },
+}
+
+# Sentry DSNs — one per host, matching each plugin's runtime telemetry project.
+# Public-by-design (write-only ingestion endpoints, not secrets).
+SENTRY_DSN = {
+    "hermes": "https://ac3dabffdf2c91c9c90a87cd9b258908@o4511305222193152.ingest.us.sentry.io/4511433133129728",
+    "openclaw": "https://ca71dd0ea0a2740ec9ced9774c780197@o4511305222193152.ingest.us.sentry.io/4511305367289856",
+}
+INSTALLER_RELEASE = "chat4000-installer@1.0.0"
+INSTALLER_VERSION = "1.0.0"
+
+_STARTED_AT_MS = int(time.time() * 1000)
+
+# ─── ANSI ─────────────────────────────────────────────────────────────────
+
+if sys.stdout.isatty():
+    C_RED = "\033[1;31m"
+    C_GRN = "\033[1;32m"
+    C_YEL = "\033[1;33m"
+    C_BLU = "\033[1;34m"
+    C_MAG = "\033[1;35m"
+    C_CYN = "\033[1;36m"
+    C_DIM = "\033[2m"
+    C_BOLD = "\033[1m"
+    C_RST = "\033[0m"
+else:
+    C_RED = C_GRN = C_YEL = C_BLU = C_MAG = C_CYN = C_DIM = C_BOLD = C_RST = ""
+
+
+def say(msg: str) -> None:
+    print(f"{C_CYN}>{C_RST} {msg}")
+
+
+def ok(msg: str) -> None:
+    print(f"{C_GRN}✓{C_RST} {msg}")
+
+
+def warn(msg: str) -> None:
+    print(f"{C_YEL}⚠{C_RST} {msg}")
+
+
+def err(msg: str) -> None:
+    print(f"{C_RED}✗{C_RST} {msg}", file=sys.stderr)
+
+
+def hdr(msg: str) -> None:
+    line = "━" * 63
+    print(f"\n{C_MAG}{line}{C_RST}\n{C_MAG}{C_BOLD}{msg}{C_RST}\n{C_MAG}{line}{C_RST}\n")
+
+
+def banner() -> None:
+    print(f"\n{C_MAG}┌─────────────────────────────────────────────────────────────┐{C_RST}")
+    print(
+        f"{C_MAG}│{C_RST}  {C_MAG}{C_BOLD}🔐 chat4000{C_RST}  ·  {C_BLU}{C_BOLD}plugin installer{C_RST}  {C_DIM}(Hermes + OpenClaw){C_RST}            {C_MAG}│{C_RST}"  # noqa: E501
+    )
+    print(
+        f"{C_MAG}│{C_RST}  {C_DIM}Native iPhone / Mac / CLI app for your coding agent{C_RST}        {C_MAG}│{C_RST}"  # noqa: E501
+    )
+    print(f"{C_MAG}└─────────────────────────────────────────────────────────────┘{C_RST}\n")
+
+
+# ─── install_id (matches what each plugin reuses later) ───────────────────
+
+
+def resolve_install_id() -> str:
+    cfg = Path.home() / ".config" / "chat4000"
+    path = cfg / "install-id"
+    try:
+        if path.exists():
+            existing = path.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
+        new_id = str(uuid.uuid4())
+        cfg.mkdir(parents=True, exist_ok=True)
+        path.write_text(new_id + "\n", encoding="utf-8")
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o600)
+        return new_id
+    except OSError:
+        # Read-only / sandboxed fs — fall back to a process-local anonymous id.
+        return str(uuid.uuid4())
+
+
+# ─── Scrubbing ────────────────────────────────────────────────────────────
+
+
+def _scrub_path(s):
+    if not isinstance(s, str):
+        return s
+    home = str(Path.home())
+    if home and home in s:
+        s = s.replace(home, "~")
+    return re.sub(r"/(Users|home)/[^/]+", r"/\1/<user>", s)
+
+
+def _scrub_props_value(v):
+    """Recursively scrub username/home paths out of a telemetry prop value."""
+    if isinstance(v, str):
+        return _scrub_path(v)
+    if isinstance(v, list):
+        return [_scrub_props_value(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _scrub_props_value(x) for k, x in v.items()}
+    return v
+
+
+def _scrub_secrets(s: str) -> str:
+    if not isinstance(s, str):
+        return s
+    s = re.sub(r"sk-[A-Za-z0-9]{20,}", "[REDACTED_API_KEY]", s)
+    s = re.sub(r"phc_[A-Za-z0-9]{30,}", "[REDACTED_POSTHOG_KEY]", s)
+    s = re.sub(r"(?i)Bearer\s+[A-Za-z0-9._-]+", "Bearer [REDACTED]", s)
+    return s
+
+
+# ─── PostHog (stdlib HTTPS, no SDK) ───────────────────────────────────────
+
+_SESSION_ID = str(uuid.uuid4())
+_TELEMETRY_DISABLED = (
+    os.environ.get("CHAT4000_TELEMETRY_DISABLED", "").strip().lower() in ("1", "true", "yes")
+    or "--no-telemetry" in sys.argv
+)
+
+
+def _base_props() -> dict:
+    enriched = {
+        "source": "chat4000-installer",
+        "installer_version": INSTALLER_VERSION,
+        "python_version": (
+            f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+        ),
+        "os_platform": sys.platform,
+        "session_id": _SESSION_ID,
+        "arch": platform.machine() or "unknown",
+        "cpu_count": os.cpu_count() or 0,
+        "locale": (os.environ.get("LANG") or "").split(".")[0] or "unknown",
+        "since_start_ms": int(time.time() * 1000) - _STARTED_AT_MS,
+        "is_root": hasattr(os, "geteuid") and os.geteuid() == 0,
+    }
+    try:
+        sysname = platform.system()
+        if sysname == "Linux":
+            os_rel = f"Linux {platform.release()}"
+            try:
+                for line in Path("/etc/os-release").read_text(errors="ignore").splitlines():
+                    if line.startswith("PRETTY_NAME="):
+                        os_rel = line.split("=", 1)[1].strip().strip('"')
+                        break
+            except OSError:
+                pass
+            enriched["os_release"] = os_rel
+        elif sysname == "Darwin":
+            mv = platform.mac_ver()[0]
+            enriched["os_release"] = f"macOS {mv}" if mv else f"Darwin {platform.release()}"
+        elif sysname == "Windows":
+            wv = platform.win32_ver()[0]
+            enriched["os_release"] = f"Windows {wv}" if wv else "Windows"
+        else:
+            enriched["os_release"] = f"{sysname} {platform.release()}".strip()
+    except (OSError, ValueError, IndexError):
+        enriched["os_release"] = "unknown"
+    try:
+        in_container = False
+        if Path("/.dockerenv").exists() or os.environ.get("KUBERNETES_SERVICE_HOST"):
+            in_container = True
+        else:
+            cgroup = Path("/proc/1/cgroup").read_text(errors="ignore")
+            in_container = any(s in cgroup for s in ("docker", "kubepods", "containerd", "podman"))
+        enriched["is_container"] = in_container
+    except OSError:
+        enriched["is_container"] = False
+    # Redacted, scrubbed argv.
+    argv_out, skip_next = [], False
+    for a in sys.argv[1:]:
+        if skip_next:
+            argv_out.append("<redacted>")
+            skip_next = False
+            continue
+        if "=" in a:
+            k = a.partition("=")[0]
+            if any(s in k.lower() for s in ("token", "key", "secret", "pass", "dsn")):
+                argv_out.append(f"{k}=<redacted>")
+                continue
+        if a.startswith(("sk-", "phc_", "ghp_", "Bearer")):
+            argv_out.append("<redacted>")
+            continue
+        if a in ("--token", "--api-key", "--secret", "--password", "--dsn", "--service-token"):
+            argv_out.append(a)
+            skip_next = True
+            continue
+        argv_out.append(a)
+    enriched["flags"] = argv_out
+    return enriched
+
+
+def _post_posthog(dest: str, event: str, props: dict) -> None:
+    cred = POSTHOG.get(dest)
+    if not cred:
+        return
+    body = json.dumps(
+        {
+            "api_key": cred["key"],
+            "event": event,
+            "distinct_id": resolve_install_id(),
+            "properties": props,
+        }
+    ).encode("utf-8")
+    req = urllib.request.Request(  # noqa: S310  # our own PostHog https ingestion endpoint
+        cred["url"],
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    # Best-effort: a network failure must never break the install.
+    with contextlib.suppress(urllib.error.URLError, OSError, TimeoutError, ValueError):
+        urllib.request.urlopen(req, timeout=3).read()  # noqa: S310
+
+
+def _emit(event: str, props: Optional[dict] = None, dest: str = "both") -> None:
+    """Fire a PostHog event to one host's project ("hermes"/"openclaw") or
+    "both". Best-effort, never raises, scrubs home/username paths from props."""
+    if _TELEMETRY_DISABLED:
+        return
+    enriched = _base_props()
+    if props:
+        enriched.update(props)
+    enriched = {k: _scrub_props_value(v) for k, v in enriched.items()}
+    targets = ("hermes", "openclaw") if dest == "both" else (dest,)
+    for t in targets:
+        _post_posthog(t, event, enriched)
+
+
+# ─── Sentry (stdlib envelope POST, no SDK) ────────────────────────────────
+
+
+def send_sentry_envelope(exc: BaseException, *, kind: str = "both", tags: Optional[dict] = None) -> None:
+    """Post a Sentry envelope describing `exc` to one host's DSN (or both).
+    Stdlib only; best-effort; strips home paths + obvious secrets first."""
+    if _TELEMETRY_DISABLED:
+        return
+    kinds = ("hermes", "openclaw") if kind == "both" else (kind,)
+    for k in kinds:
+        _send_sentry_one(SENTRY_DSN.get(k, ""), exc, kind=k, tags=tags)
+
+
+def _send_sentry_one(dsn: str, exc: BaseException, *, kind: str, tags: Optional[dict]) -> None:
+    if not dsn:
+        return
+    try:
+        import datetime
+        from urllib.parse import urlparse
+
+        parsed = urlparse(dsn)
+        public_key = parsed.username or ""
+        project_id = (parsed.path or "").lstrip("/")
+        if not public_key or not project_id or not parsed.hostname:
+            return
+        envelope_url = f"{parsed.scheme}://{parsed.hostname}/api/{project_id}/envelope/"
+
+        frames = []
+        tb = exc.__traceback__
+        while tb is not None:
+            co = tb.tb_frame.f_code
+            frames.append(
+                {
+                    "filename": _scrub_path(co.co_filename),
+                    "function": co.co_name,
+                    "lineno": tb.tb_lineno,
+                    "module": co.co_name,
+                    "in_app": "installer.py" in co.co_filename,
+                }
+            )
+            tb = tb.tb_next
+
+        event = {
+            "event_id": uuid.uuid4().hex,
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "platform": "python",
+            "level": "error",
+            "release": INSTALLER_RELEASE,
+            "environment": os.environ.get("CHAT4000_ENV") or os.environ.get("HERMES_ENV") or "production",
+            "tags": {
+                "installer": "merged",
+                "host_kind": kind,
+                "python_version": (
+                    f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+                ),
+                "os_platform": sys.platform,
+                **(tags or {}),
+            },
+            "exception": {
+                "values": [
+                    {
+                        "type": type(exc).__name__,
+                        "value": _scrub_secrets(str(exc))[:500],
+                        "stacktrace": {"frames": frames},
+                    }
+                ]
+            },
+            "user": {"id": resolve_install_id()},
+            "sdk": {"name": "chat4000-installer", "version": INSTALLER_VERSION},
+        }
+
+        envelope_header = json.dumps({"dsn": dsn, "event_id": event["event_id"]})
+        item_header = json.dumps({"type": "event"})
+        item_payload = json.dumps(event)
+        body = (envelope_header + "\n" + item_header + "\n" + item_payload + "\n").encode("utf-8")
+
+        req = urllib.request.Request(  # noqa: S310  # our own Sentry https ingestion endpoint
+            envelope_url,
+            data=body,
+            headers={
+                "Content-Type": "application/x-sentry-envelope",
+                "X-Sentry-Auth": (
+                    f"Sentry sentry_version=7, sentry_key={public_key}, "
+                    f"sentry_client=chat4000-installer/1.0"
+                ),
+            },
+            method="POST",
+        )
+        urllib.request.urlopen(req, timeout=5).read()  # noqa: S310
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        # This IS the crash-reporting path — must never raise back into _entry().
+        pass
+
+
+# ─── Detection: Hermes ────────────────────────────────────────────────────
+
+HERMES_LAYOUTS = [
+    ("~/.hermes/hermes-agent/venv/bin", "curl-installer"),
+    ("/usr/local/lib/hermes-agent/venv/bin", "fhs-source"),
+    ("/opt/hermes/.venv/bin", "docker"),
+    ("/opt/homebrew/Cellar/hermes-agent/*/libexec/bin", "homebrew-arm64"),
+    ("/usr/local/Cellar/hermes-agent/*/libexec/bin", "homebrew-intel"),
+    ("/home/linuxbrew/.linuxbrew/Cellar/hermes-agent/*/libexec/bin", "linuxbrew"),
+    ("~/.local/share/pipx/venvs/hermes-agent/bin", "pipx-modern"),
+    ("~/.local/pipx/venvs/hermes-agent/bin", "pipx-legacy"),
+    ("~/.local/share/uv/tools/hermes-agent/bin", "uv-tool"),
+    ("/opt/venvs/hermes-agent/bin", "dh-virtualenv"),
+    ("/usr/share/hermes-agent/venv/bin", "deb-alt"),
+    ("/usr/lib/hermes-agent/venv/bin", "rpm"),
+    ("/usr/libexec/hermes-agent/venv/bin", "rpm-libexec"),
+    ("/opt/hermes-agent/venv/bin", "rpm-opt"),
+    ("~/.local/lib/hermes-agent/venv/bin", "user-prefix"),
+    ("~/.local/share/hermes-agent/venv/bin", "xdg-data"),
+    ("~/Library/Application Support/Hermes Agent/venv/bin", "macos-app-support"),
+]
+
+
+def _layout_label(path: str) -> str:
+    if "/nix/store/" in path:
+        return "nix"
+    for pattern, label in HERMES_LAYOUTS:
+        expanded = str(Path(pattern).expanduser())
+        if "*" in expanded:
+            rx = re.escape(expanded).replace(r"\*", "[^/]+")
+            if re.fullmatch(rx, path):
+                return label
+        elif path == expanded:
+            return label
+    return "unknown"
+
+
+def detect_hermes_all() -> list:
+    """Return a list of (venv_bin_path, layout_label) for EVERY Hermes venv we
+    can find — env overrides, `hermes` on PATH, and all known layouts (glob-aware
+    for Homebrew Cellar). Deduplicated by resolved path, ordered by priority."""
+    found: list = []
+    seen: set = set()
+
+    def add(bin_path: str, label: str) -> None:
+        try:
+            key = str(Path(bin_path).resolve())
+        except OSError:
+            key = bin_path
+        if key in seen:
+            return
+        seen.add(key)
+        found.append((bin_path, label))
+
+    # 1. Env-var overrides (project-owned). Highest priority.
+    install_dir = (os.environ.get("HERMES_INSTALL_DIR") or "").strip()
+    if install_dir:
+        p = str(Path(install_dir).expanduser() / "venv" / "bin")
+        if Path(f"{p}/python").exists():
+            add(p, "env:HERMES_INSTALL_DIR")
+    hermes_home = (os.environ.get("HERMES_HOME") or "").strip()
+    if hermes_home:
+        p = str(Path(hermes_home).expanduser() / "hermes-agent" / "venv" / "bin")
+        if Path(f"{p}/python").exists():
+            add(p, "env:HERMES_HOME")
+    venv = (os.environ.get("VIRTUAL_ENV") or "").strip()
+    if venv:
+        p = str(Path(venv).expanduser() / "bin")
+        if Path(f"{p}/hermes").exists() and Path(f"{p}/python").exists():
+            add(p, "env:VIRTUAL_ENV")
+
+    # 2. `hermes` on PATH — wrapper-grep, then resolve as symlink.
+    hermes_cmd = shutil.which("hermes")
+    if hermes_cmd:
+        try:
+            content = Path(hermes_cmd).read_text(errors="ignore")
+            for pat in (
+                r"/[^\"'\s]+/\.?venv/bin",
+                r"/nix/store/[^\"'\s]+-hermes-agent-env-[^/]+/bin",
+            ):
+                m = re.search(pat, content)
+                if m:
+                    bin_path = m.group(0)
+                    if Path(f"{bin_path}/python").exists() or Path(f"{bin_path}/hermes").exists():
+                        add(bin_path, _layout_label(bin_path))
+        except OSError:
+            pass
+        try:
+            real = Path(hermes_cmd).resolve()
+            bin_path = str(real.parent)
+            if Path(f"{bin_path}/python").exists():
+                add(bin_path, _layout_label(bin_path))
+        except OSError:
+            pass
+
+    # 3. Known layouts with glob support (collect ALL matches).
+    for pattern, label in HERMES_LAYOUTS:
+        expanded = str(Path(pattern).expanduser())
+        if "*" in expanded:
+            try:
+                matches = sorted(Path("/").glob(expanded.lstrip("/")))
+                for match in reversed(matches):
+                    if (match / "python").exists():
+                        add(str(match), label)
+            except OSError:
+                continue
+        else:
+            if (Path(expanded) / "python").exists():
+                add(expanded, label)
+    return found
+
+
+# ─── Detection: OpenClaw ──────────────────────────────────────────────────
+
+OPENCLAW_LOCATIONS = [
+    "/usr/local/bin/openclaw",
+    "/opt/homebrew/bin/openclaw",
+    "/home/linuxbrew/.linuxbrew/bin/openclaw",
+    "~/.openclaw/bin/openclaw",
+    "~/.local/bin/openclaw",
+    "~/.npm-global/bin/openclaw",
+    "/usr/bin/openclaw",
+    "/Applications/OpenClaw.app/Contents/Resources/cli/openclaw",
+    "~/.nvm/versions/node/*/bin/openclaw",
+    "~/.nix-profile/bin/openclaw",
+    "/run/current-system/sw/bin/openclaw",
+]
+
+
+def _openclaw_version(path: str) -> str:
+    try:
+        out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10)
+        blob = (out.stdout or out.stderr).strip()
+        line = blob.splitlines()[0] if blob else "unknown"
+        m = re.search(r"\b(\d+\.\d+\.\d+\S*)", line)
+        return m.group(1) if m else line
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
+def detect_openclaw_all() -> list:
+    """Return a list of (openclaw_path, version) for EVERY openclaw binary we
+    can find. Deduplicated by resolved path, ordered by priority."""
+    found: list = []
+    seen: set = set()
+
+    def add(path: str) -> None:
+        try:
+            key = str(Path(path).resolve())
+        except OSError:
+            key = path
+        if key in seen:
+            return
+        seen.add(key)
+        found.append((path, _openclaw_version(path)))
+
+    which = shutil.which("openclaw")
+    if which:
+        add(which)
+    for pattern in OPENCLAW_LOCATIONS:
+        expanded = str(Path(pattern).expanduser())
+        if "*" in expanded:
+            try:
+                for match in sorted(Path("/").glob(expanded.lstrip("/")), reverse=True):
+                    if match.exists() and os.access(match, os.X_OK):
+                        add(str(match))
+            except OSError:
+                continue
+        else:
+            if Path(expanded).exists() and os.access(expanded, os.X_OK):
+                add(expanded)
+    return found
+
+
+def detect_uv() -> Optional[str]:
+    p = shutil.which("uv")
+    if p:
+        return p
+    for cand in (
+        Path.home() / ".local" / "bin" / "uv",
+        Path("/usr/local/bin/uv"),
+        Path("/opt/homebrew/bin/uv"),
+    ):
+        if cand.exists() and os.access(cand, os.X_OK):
+            return str(cand)
+    return None
+
+
+# ─── Stats: install date / channels / sessions (the new analytics) ────────
+
+
+def _install_date(p: Path) -> tuple:
+    """(iso_date|None, age_days|None) for a path — best-effort. Prefers birth
+    time (macOS) else the earlier of ctime/mtime."""
+    try:
+        st = p.stat()
+    except OSError:
+        return (None, None)
+    ts = getattr(st, "st_birthtime", None)
+    if not ts:
+        ts = min(st.st_ctime, st.st_mtime)
+    try:
+        import datetime
+
+        iso = datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+    except (OSError, ValueError, OverflowError):
+        iso = None
+    age_days = max(0, int((time.time() - ts) / 86400)) if ts else None
+    return (iso, age_days)
+
+
+def _count_json_entries(text: str) -> Optional[int]:
+    """Count session-like entries in a sessions store JSON blob. Handles a top
+    array, a `{sessions|entries|items: [...|{}]}` wrapper, or a direct id→entry
+    map (excluding obvious metadata keys)."""
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(data, list):
+        return len(data)
+    if isinstance(data, dict):
+        for key in ("sessions", "entries", "items"):
+            v = data.get(key)
+            if isinstance(v, list):
+                return len(v)
+            if isinstance(v, dict):
+                return len(v)
+        meta = {"version", "updatedat", "schema", "schemaversion"}
+        keys = [k for k in data.keys() if str(k).lower() not in meta]
+        return len(keys)
+    return None
+
+
+def _openclaw_home() -> Path:
+    explicit = (os.environ.get("OPENCLAW_STATE_DIR") or "").strip()
+    if explicit:
+        return Path(explicit).expanduser()
+    home = (os.environ.get("OPENCLAW_HOME") or "").strip()
+    base = Path(home).expanduser() if home else Path.home()
+    return base / ".openclaw"
+
+
+def collect_openclaw_stats(openclaw_path: str) -> dict:
+    """install date + channels/plugins + session/agent counts for an OpenClaw."""
+    stats: dict = {
+        "install_date": None,
+        "age_days": None,
+        "channels": [],
+        "channel_count": None,
+        "session_count": None,
+        "agent_count": None,
+        "plugin_installed": False,
+        "plugin_version": None,
+    }
+    # install date — stat the (resolved) binary.
+    try:
+        stats["install_date"], stats["age_days"] = _install_date(Path(openclaw_path).resolve())
+    except OSError:
+        pass
+
+    home = _openclaw_home()
+
+    # Sessions: ~/.openclaw/agents/<id>/sessions/sessions.json (per agent).
+    try:
+        agents_dir = home / "agents"
+        if agents_dir.is_dir():
+            agents = [d for d in agents_dir.iterdir() if d.is_dir()]
+            stats["agent_count"] = len(agents)
+            total = 0
+            counted = False
+            for a in agents:
+                sj = a / "sessions" / "sessions.json"
+                if sj.is_file():
+                    n = _count_json_entries(sj.read_text(errors="ignore"))
+                    if n is not None:
+                        total += n
+                        counted = True
+            if counted:
+                stats["session_count"] = total
+    except OSError:
+        pass
+
+    # Channels / plugins: prefer the CLI, fall back to the plugins dir.
+    names = _openclaw_plugins_via_cli(openclaw_path)
+    if names is None:
+        names = _openclaw_plugins_via_dir(home)
+    if names is not None:
+        stats["channels"] = names[:50]
+        stats["channel_count"] = len(names)
+
+    # Is our plugin already there + at which version?
+    installed, cur, _latest, _newer = detect_plugin_state(openclaw_path)
+    stats["plugin_installed"] = bool(installed)
+    stats["plugin_version"] = cur
+    return stats
+
+
+def _openclaw_plugins_via_cli(openclaw_path: str) -> Optional[list]:
+    for cmd in (
+        [openclaw_path, "plugins", "list", "--json"],
+        [openclaw_path, "plugins", "list"],
+    ):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        out = (r.stdout or "").strip()
+        if r.returncode != 0 or not out:
+            continue
+        # JSON form?
+        start = out.find("[")
+        obj_start = out.find("{")
+        with contextlib.suppress(ValueError, TypeError):
+            if start >= 0:
+                data = json.loads(out[start:])
+                names = [_plugin_name(x) for x in data]
+                names = [n for n in names if n]
+                if names:
+                    return names
+            elif obj_start >= 0:
+                data = json.loads(out[obj_start:])
+                if isinstance(data, dict):
+                    plugins = data.get("plugins", data)
+                    if isinstance(plugins, dict):
+                        return list(plugins.keys())
+                    if isinstance(plugins, list):
+                        names = [n for n in (_plugin_name(x) for x in plugins) if n]
+                        if names:
+                            return names
+        # Plain text: one plugin per line, strip bullets/status decorations.
+        names = []
+        for line in out.splitlines():
+            t = line.strip().lstrip("•-*◦ ").strip()
+            t = t.split()[0] if t else ""
+            if t and not t.lower().startswith(("name", "plugin", "installed", "no ")):
+                names.append(t)
+        if names:
+            return names
+    return None
+
+
+def _plugin_name(x) -> Optional[str]:
+    if isinstance(x, str):
+        return x.strip() or None
+    if isinstance(x, dict):
+        for k in ("name", "id", "package", "pkg"):
+            v = x.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
+
+
+def _openclaw_plugins_via_dir(home: Path) -> Optional[list]:
+    pdir = home / "plugins"
+    try:
+        if pdir.is_dir():
+            return [d.name for d in pdir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+    except OSError:
+        pass
+    return None
+
+
+def _hermes_home() -> Path:
+    home = (os.environ.get("HERMES_HOME") or "").strip()
+    return Path(home).expanduser() if home else Path.home() / ".hermes"
+
+
+def collect_hermes_stats(venv_bin: str) -> dict:
+    """install date + channels/plugins + session count for a Hermes venv."""
+    stats: dict = {
+        "install_date": None,
+        "age_days": None,
+        "channels": [],
+        "channel_count": None,
+        "session_count": None,
+        "agent_count": None,
+        "plugin_installed": False,
+        "plugin_version": None,
+        "agent_version": None,
+    }
+    # install date — stat the venv dir (parent of .../bin).
+    try:
+        venv_dir = Path(venv_bin).resolve().parent
+        stats["install_date"], stats["age_days"] = _install_date(venv_dir)
+    except OSError:
+        pass
+    # agent version
+    hermes_bin = Path(venv_bin) / "hermes"
+    if hermes_bin.exists():
+        try:
+            out = subprocess.run([str(hermes_bin), "--version"], capture_output=True, text=True, timeout=10)
+            blob = (out.stdout or out.stderr).strip()
+            if blob:
+                m = re.search(r"\b(\d+\.\d+\.\d+\S*)", blob.splitlines()[0])
+                stats["agent_version"] = m.group(1) if m else blob.splitlines()[0]
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+    home = _hermes_home()
+
+    # Channels + enabled plugins from config.yaml (yaml if available).
+    names = _hermes_channels_plugins(home)
+    if names is not None:
+        stats["channels"] = names[:50]
+        stats["channel_count"] = len(names)
+
+    # Sessions — probe known session stores under the Hermes home.
+    stats["session_count"] = _count_hermes_sessions(home)
+
+    # Is our plugin importable in this venv + at which version?
+    vp = f"{venv_bin}/python"
+    try:
+        chk = subprocess.run(
+            [vp, "-c", "import chat4000_hermes_plugin"], capture_output=True, timeout=15
+        )
+        if chk.returncode == 0:
+            stats["plugin_installed"] = True
+            ver = subprocess.run(
+                [
+                    vp,
+                    "-c",
+                    "from chat4000_hermes_plugin.package_info import read_package_version;"
+                    "print(read_package_version())",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            if ver.returncode == 0 and ver.stdout.strip():
+                stats["plugin_version"] = ver.stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return stats
+
+
+def _hermes_channels_plugins(home: Path) -> Optional[list]:
+    names: list = []
+    cfg_path = home / "config.yaml"
+    parsed_yaml = False
+    if cfg_path.is_file():
+        try:
+            import yaml  # type: ignore[import-not-found]
+
+            cfg = yaml.safe_load(cfg_path.read_text(errors="ignore"))
+            parsed_yaml = True
+            if isinstance(cfg, dict):
+                plugins = cfg.get("plugins")
+                if isinstance(plugins, dict):
+                    enabled = plugins.get("enabled")
+                    if isinstance(enabled, list):
+                        names += [str(p) for p in enabled]
+                channels = cfg.get("channels")
+                if isinstance(channels, dict):
+                    names += [str(k) for k in channels.keys()]
+                elif isinstance(channels, list):
+                    names += [str(c) for c in channels]
+        except ImportError:
+            parsed_yaml = False
+        except (OSError, ValueError):
+            parsed_yaml = True  # file existed but unparseable; don't double-count via dir
+    # Fallback (no yaml available): enumerate installed plugin dirs.
+    if not parsed_yaml:
+        pdir = home / "plugins"
+        try:
+            if pdir.is_dir():
+                names += [d.name for d in pdir.iterdir() if d.is_dir() and not d.name.startswith(".")]
+        except OSError:
+            pass
+    # De-dup, preserve order.
+    seen: set = set()
+    deduped = []
+    for n in names:
+        if n and n not in seen:
+            seen.add(n)
+            deduped.append(n)
+    return deduped or None
+
+
+def _count_hermes_sessions(home: Path) -> Optional[int]:
+    """Best-effort session count for a Hermes home. Counts entries in any
+    `sessions.json` index and files/dirs in any `sessions/` dir we find under
+    the home (direct, per-agent, or under state/). Returns None if no session
+    store is discoverable (reported as 'unknown')."""
+    total = 0
+    found = False
+    index_candidates = [
+        home / "sessions.json",
+        home / "state" / "sessions.json",
+        home / "sessions" / "sessions.json",
+    ]
+    for idx in index_candidates:
+        try:
+            if idx.is_file():
+                n = _count_json_entries(idx.read_text(errors="ignore"))
+                if n is not None:
+                    total += n
+                    found = True
+        except OSError:
+            continue
+    dir_candidates = [home / "sessions", home / "state" / "sessions"]
+    try:
+        agents_dir = home / "agents"
+        if agents_dir.is_dir():
+            for a in agents_dir.iterdir():
+                if a.is_dir():
+                    dir_candidates.append(a / "sessions")
+    except OSError:
+        pass
+    for sdir in dir_candidates:
+        try:
+            if sdir.is_dir():
+                entries = [
+                    e
+                    for e in sdir.iterdir()
+                    if (e.is_dir() and not e.name.startswith("."))
+                    or (e.is_file() and e.suffix == ".json" and e.name != "sessions.json")
+                ]
+                if entries:
+                    total += len(entries)
+                    found = True
+        except OSError:
+            continue
+    return total if found else None
+
+
+# ─── Hermes install steps ─────────────────────────────────────────────────
+
+
+def hermes_install_via_uv(uv: str, venv_python: str, ref: str) -> None:
+    subprocess.run(
+        [
+            uv, "pip", "install", "--python", venv_python,
+            "--find-links", PYVODOZEMAC_FIND_LINKS,
+            f"git+{HERMES_REPO_URL}@{ref}",
+        ],
+        check=True,
+    )
+
+
+def hermes_install_via_pip(venv_python: str, ref: str) -> None:
+    has_pip = (
+        subprocess.run([venv_python, "-c", "import pip"], capture_output=True).returncode == 0
+    )
+    if not has_pip:
+        say("Bootstrapping pip via ensurepip…")
+        if subprocess.run([venv_python, "-m", "ensurepip", "--upgrade"], capture_output=True).returncode != 0:
+            say("ensurepip failed — fetching get-pip.py")
+            with urllib.request.urlopen("https://bootstrap.pypa.io/get-pip.py", timeout=20) as resp:  # noqa: S310
+                bootstrap = resp.read()
+            subprocess.run([venv_python], input=bootstrap, check=True)
+    subprocess.run(
+        [
+            venv_python, "-m", "pip", "install", "--upgrade",
+            "--find-links", PYVODOZEMAC_FIND_LINKS,
+            f"git+{HERMES_REPO_URL}@{ref}",
+        ],
+        check=True,
+    )
+
+
+def hermes_uninstall(venv_python: str, uv: Optional[str]) -> None:
+    if uv:
+        subprocess.run([uv, "pip", "uninstall", "--python", venv_python, HERMES_PKG], check=False)
+    else:
+        subprocess.run([venv_python, "-m", "pip", "uninstall", "-y", HERMES_PKG], check=False)
+
+
+def hermes_reset_local_state() -> None:
+    state_dir = _hermes_home() / "plugins" / "chat4000"
+    if state_dir.exists():
+        warn(
+            f"Removing {state_dir} (key + ack store) — already-paired devices "
+            "will fail to decrypt until re-paired."
+        )
+        ans = input(f"{C_YEL}Continue? [y/N]:{C_RST} ").strip().lower()
+        if ans not in ("y", "yes"):
+            say("Reset cancelled.")
+            return
+        shutil.rmtree(state_dir, ignore_errors=True)
+        ok(f"Removed {state_dir}")
+
+
+def symlink_chat4000_onto_path(venv_bin: str) -> None:
+    src = Path(venv_bin) / "chat4000"
+    if not src.exists():
+        return
+    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+    for d in (Path("/usr/local/bin"), Path.home() / ".local" / "bin"):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            if not os.access(d, os.W_OK):
+                continue
+            link = d / "chat4000"
+            if link.is_symlink() or link.exists():
+                link.unlink()
+            link.symlink_to(src)
+            ok(
+                f"Linked {C_CYN}chat4000{C_RST} -> {link}  "
+                f"{C_DIM}(run `chat4000 status` from anywhere){C_RST}"
+            )
+            if str(d) not in path_dirs:
+                warn(f"{d} isn't on your PATH — add it, or use {link} directly.")
+            return
+        except OSError:
+            continue
+    warn(f"Couldn't symlink chat4000 onto PATH; run it via {src}")
+
+
+# ─── OpenClaw install steps ───────────────────────────────────────────────
+
+
+def detect_plugin_state(openclaw: str) -> tuple:
+    """(installed, current, latest, newer) via the plugin's own read-only
+    `openclaw chat4000 update --check --json`. Best-effort ⇒ not installed."""
+    try:
+        r = subprocess.run(
+            [openclaw, "chat4000", "update", "--check", "--json"],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return (False, None, None, False)
+    if r.returncode != 0 or not (r.stdout or "").strip():
+        return (False, None, None, False)
+    try:
+        text = r.stdout
+        start = text.find("{")
+        data = json.loads(text[start:]) if start >= 0 else {}
+    except (ValueError, TypeError):
+        return (False, None, None, False)
+    cur = data.get("currentVersion")
+    latest = data.get("latestVersion")
+    newer = bool(data.get("newerAvailable"))
+    return (bool(cur), cur, latest, newer)
+
+
+def openclaw_install_plugin(openclaw: str, force: bool, spec: Optional[str] = None) -> tuple:
+    target = f"{OPENCLAW_NPM_PACKAGE}@{spec}" if spec else OPENCLAW_NPM_PACKAGE
+    base_cmds = [
+        [openclaw, "plugins", "install", target],
+        [openclaw, "plugin", "install", target],
+    ]
+    last_tail = ""
+    for cmd in base_cmds:
+        if force:
+            cmd = cmd[:3] + ["--force"] + cmd[3:]
+        say(f"$ {' '.join(cmd)}")
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        buf: list = []
+        if proc.stdout is not None:
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                buf.append(line)
+        if proc.wait() == 0:
+            return True, ""
+        last_tail = "".join(buf)[-512:]
+    return False, _scrub_secrets(last_tail) if last_tail else ""
+
+
+def detect_restart_method() -> Optional[str]:
+    docker = shutil.which("docker")
+    if docker:
+        try:
+            r = subprocess.run(
+                [docker, "ps", "--filter", "name=openclaw-gateway", "--format", "{{.Names}}"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if "openclaw-gateway" in (r.stdout or ""):
+                return "docker"
+        except (OSError, subprocess.SubprocessError):
+            pass
+    openclaw = shutil.which("openclaw") or "openclaw"
+    try:
+        r = subprocess.run([openclaw, "gateway", "status"], capture_output=True, text=True, timeout=5)
+        out = (r.stdout or "") + (r.stderr or "")
+        if "service disabled" in out.lower() or "service is not installed" in out.lower():
+            return "foreground"
+        if r.returncode == 0 and out.strip():
+            return "openclaw-supervised"
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return "foreground"
+
+
+def restart_gateway(method: str) -> bool:
+    openclaw = shutil.which("openclaw") or "openclaw"
+    if method == "docker":
+        docker = shutil.which("docker")
+        if not docker:
+            return False
+        say("$ docker restart openclaw-gateway")
+        r = subprocess.run([docker, "restart", "openclaw-gateway"], capture_output=True, text=True)
+        if r.returncode != 0:
+            warn(f"docker restart failed: {r.stderr.strip()[:200]}")
+            return False
+        return True
+    if method == "openclaw-supervised":
+        say(f"$ {openclaw} gateway restart")
+        r = subprocess.run([openclaw, "gateway", "restart"], capture_output=True, text=True)
+        out = (r.stdout or "") + (r.stderr or "")
+        if "service disabled" in out.lower():
+            warn("Gateway service is not installed under a supervisor — starting in foreground.")
+            return restart_gateway("foreground")
+        if r.returncode == 0:
+            return True
+        if out.strip():
+            warn(out.strip()[:500])
+        return False
+    if method == "foreground":
+        log_path = "/tmp/openclaw-gateway.log"
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(["pkill", "-9", "-f", "openclaw gateway run"], capture_output=True, timeout=5)
+        time.sleep(1)
+        try:
+            logf = open(log_path, "ab")
+            subprocess.Popen(
+                [openclaw, "gateway", "run"],
+                stdout=logf, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
+            )
+            say(f"Started gateway in background. Log: {C_CYN}{log_path}{C_RST}")
+            time.sleep(4)
+            return True
+        except (OSError, subprocess.SubprocessError) as exc:
+            warn(f"Could not start gateway: {exc}")
+            return False
+    return False
+
+
+def openclaw_reset_local_state() -> None:
+    state_dir = _openclaw_home() / "plugins" / "chat4000"
+    if state_dir.exists():
+        warn(f"Removing {state_dir} (key + ack store) — already-paired devices will fail to decrypt until re-paired.")
+        ans = input(f"{C_YEL}Continue? [y/N]:{C_RST} ").strip().lower()
+        if ans not in ("y", "yes"):
+            say("Reset cancelled.")
+            return
+        shutil.rmtree(state_dir, ignore_errors=True)
+        ok(f"Removed {state_dir}")
+
+
+SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+
+
+def wait_for_chat4000_connected(timeout: float = 120.0) -> bool:
+    runtime_log = _openclaw_home() / "plugins" / "chat4000" / "logs" / "runtime.log"
+    gateway_log = Path("/tmp/openclaw-gateway.log")
+    deadline = time.time() + timeout
+    started = time.time()
+    frame_idx = 0
+    is_tty = sys.stdout.isatty()
+    last_status = ""
+    print()
+    while time.time() < deadline:
+        if runtime_log.exists():
+            try:
+                if "runtime.hello_ok" in runtime_log.read_text(errors="ignore"):
+                    if is_tty:
+                        sys.stdout.write("\r" + " " * 100 + "\r")
+                        sys.stdout.flush()
+                    return True
+            except OSError:
+                pass
+        status = "starting gateway"
+        if gateway_log.exists():
+            try:
+                gw = gateway_log.read_text(errors="ignore")
+                if "[gateway] ready" in gw or "starting channels and sidecars" in gw:
+                    status = "loading channels"
+                if "[chat4000]" in gw and "Starting chat4000" in gw:
+                    status = "chat4000 channel starting"
+                if runtime_log.exists():
+                    status = "chat4000 connecting to gateway"
+            except OSError:
+                pass
+        if is_tty:
+            elapsed = int(time.time() - started)
+            frame = SPINNER_FRAMES[frame_idx % len(SPINNER_FRAMES)]
+            line = f"\r{C_CYN}{frame}{C_RST}  {C_BOLD}{status}{C_RST}{C_DIM}  ({elapsed}s){C_RST}"
+            pad = max(0, len(last_status) - len(line))
+            sys.stdout.write(line + (" " * pad))
+            sys.stdout.flush()
+            last_status = line
+        time.sleep(0.1)
+        frame_idx += 1
+    if is_tty:
+        sys.stdout.write("\r" + " " * 100 + "\r")
+        sys.stdout.flush()
+    return False
+
+
+# ─── Targets: model, scan report, selection ───────────────────────────────
+
+
+def build_targets(args) -> list:
+    """Discover every install target on this host (every Hermes venv + every
+    OpenClaw binary), honoring --hermes-bin / --openclaw-bin overrides. Each
+    target is a dict with a `kind` and the per-kind paths. Stats are NOT
+    collected here (that happens in the scan)."""
+    targets: list = []
+
+    # Explicit overrides short-circuit detection for that kind.
+    if args.hermes_bin:
+        cand = str(Path(args.hermes_bin.rstrip("/")).expanduser())
+        if Path(f"{cand}/python").exists():
+            targets.append(_mk_hermes(cand, "user-override"))
+        else:
+            err(f"--hermes-bin {cand}: no `python` found there.")
+    if args.openclaw_bin:
+        cand = str(Path(args.openclaw_bin).expanduser())
+        if Path(cand).exists() and os.access(cand, os.X_OK):
+            targets.append(_mk_openclaw(cand, _openclaw_version(cand), "user-override"))
+        else:
+            err(f"--openclaw-bin {cand}: not an executable file.")
+    if args.hermes_bin or args.openclaw_bin:
+        return targets
+
+    for venv_bin, layout in detect_hermes_all():
+        targets.append(_mk_hermes(venv_bin, layout))
+    for path, version in detect_openclaw_all():
+        targets.append(_mk_openclaw(path, version, "detected"))
+    return targets
+
+
+def _mk_hermes(venv_bin: str, layout: str) -> dict:
+    return {
+        "kind": "hermes",
+        "venv_bin": venv_bin,
+        "venv_python": f"{venv_bin}/python",
+        "layout": layout,
+        "display": venv_bin,
+        "version": None,
+        "stats": None,
+    }
+
+
+def _mk_openclaw(path: str, version: str, layout: str) -> dict:
+    return {
+        "kind": "openclaw",
+        "bin": path,
+        "layout": layout,
+        "display": path,
+        "version": version,
+        "stats": None,
+    }
+
+
+def scan_and_report(targets: list) -> None:
+    """Collect stats for every detected target, print a table, and emit the
+    per-agent + summary analytics."""
+    hdr("🔎 Scanning this machine for Hermes / OpenClaw")
+    h = sum(1 for t in targets if t["kind"] == "hermes")
+    o = sum(1 for t in targets if t["kind"] == "openclaw")
+    if not targets:
+        warn("No Hermes or OpenClaw install detected.")
+    for idx, t in enumerate(targets, 1):
+        if t["kind"] == "hermes":
+            t["stats"] = collect_hermes_stats(t["venv_bin"])
+            t["version"] = t["stats"].get("agent_version") or t["version"]
+        else:
+            t["stats"] = collect_openclaw_stats(t["bin"])
+        _print_target_row(idx, t)
+        _emit_agent_detected(t)
+    _emit(
+        "installer_environment_scan",
+        {"hermes_count": h, "openclaw_count": o, "total": len(targets)},
+        dest="both",
+    )
+
+
+def _print_target_row(idx: int, t: dict) -> None:
+    st = t["stats"] or {}
+    kind = t["kind"].upper()
+    ver = t.get("version") or "?"
+    date = st.get("install_date") or "?"
+    age = st.get("age_days")
+    age_s = f"{age}d ago" if age is not None else "?"
+    chans = st.get("channel_count")
+    chans_s = str(chans) if chans is not None else "?"
+    sess = st.get("session_count")
+    sess_s = str(sess) if sess is not None else "?"
+    plug = "yes" if st.get("plugin_installed") else "no"
+    pv = st.get("plugin_version")
+    plug_s = f"{plug} ({pv})" if pv else plug
+    print(f"  {C_BOLD}[{idx}]{C_RST} {C_BLU}{kind}{C_RST}  {C_CYN}{t['display']}{C_RST}")
+    print(
+        f"      {C_DIM}agent{C_RST} {ver}  ·  {C_DIM}installed{C_RST} {date} ({age_s})  ·  "
+        f"{C_DIM}channels{C_RST} {chans_s}  ·  {C_DIM}sessions{C_RST} {sess_s}  ·  "
+        f"{C_DIM}chat4000 plugin{C_RST} {plug_s}"
+    )
+    ch = st.get("channels") or []
+    if ch:
+        shown = ", ".join(ch[:8]) + (" …" if len(ch) > 8 else "")
+        print(f"      {C_DIM}↳ {shown}{C_RST}")
+
+
+def _emit_agent_detected(t: dict) -> None:
+    st = t["stats"] or {}
+    _emit(
+        "installer_agent_detected",
+        {
+            "kind": t["kind"],
+            "agent_version": t.get("version"),
+            "layout": t.get("layout"),
+            "install_date": st.get("install_date"),
+            "age_days": st.get("age_days"),
+            "channels": st.get("channels"),
+            "channel_count": st.get("channel_count"),
+            "session_count": st.get("session_count"),
+            "agent_count": st.get("agent_count"),
+            "plugin_installed": st.get("plugin_installed"),
+            "plugin_version": st.get("plugin_version"),
+        },
+        dest=t["kind"],
+    )
+
+
+def select_targets(targets: list, args) -> Optional[list]:
+    """Resolve which target(s) to install into. Honors --target/--all and
+    prompts when there's more than one and the choice is ambiguous. Returns a
+    list (usually length 1) or None to abort."""
+    pool = targets
+    if args.target:
+        pool = [t for t in targets if t["kind"] == args.target]
+        if not pool:
+            err(f"--target {args.target}: no {args.target} install detected.")
+            return None
+
+    if not pool:
+        return None
+    if args.all:
+        return pool
+    if len(pool) == 1:
+        return pool
+
+    # More than one instance — ask where to install.
+    hdr("Where should we install the chat4000 plugin?")
+    for idx, t in enumerate(pool, 1):
+        ver = t.get("version") or "?"
+        print(f"  {C_BOLD}{idx}{C_RST}) {C_BLU}{t['kind']}{C_RST}  {C_CYN}{t['display']}{C_RST}  {C_DIM}({ver}){C_RST}")
+    print(f"  {C_BOLD}a{C_RST}) all of them")
+    print(f"  {C_BOLD}q{C_RST}) cancel")
+    if not sys.stdin.isatty():
+        err("Multiple instances found but this is a non-interactive shell.")
+        err("Re-run interactively, or narrow it with --target hermes|openclaw, --hermes-bin/--openclaw-bin, or --all.")
+        _emit("installer_failed", {"stage": "select_target", "error_class": "Ambiguous", "error_msg": f"{len(pool)} targets, non-interactive"}, dest="both")
+        return None
+    while True:
+        try:
+            choice = input(f"{C_CYN}? Pick a target [1-{len(pool)}/a/q]:{C_RST} ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            warn("Cancelled.")
+            return None
+        if choice in ("q", ""):
+            warn("Cancelled.")
+            return None
+        if choice == "a":
+            return pool
+        if choice.isdigit() and 1 <= int(choice) <= len(pool):
+            return [pool[int(choice) - 1]]
+        warn("Invalid choice — type a number, 'a', or 'q'.")
+
+
+# ─── Per-kind install flows ───────────────────────────────────────────────
+
+
+def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
+    venv_bin = t["venv_bin"]
+    venv_python = t["venv_python"]
+    ok(f"Hermes venv:  {C_CYN}{venv_bin}{C_RST}  {C_DIM}({t['layout']}){C_RST}")
+    _emit("installer_hermes_detected", {"hermes_layout": t["layout"], "hermes_path": venv_bin}, dest="hermes")
+
+    if args.uninstall:
+        hdr("Uninstall mode (Hermes)")
+        hermes_uninstall(venv_python, detect_uv())
+        ok("Plugin uninstalled. Local key + state at ~/.hermes/plugins/chat4000 NOT removed (use --reset).")
+        return 0
+    if args.reset:
+        hdr("Reset mode (Hermes, destructive)")
+        hermes_reset_local_state()
+
+    hdr(f"📦 Installing chat4000 plugin from {HERMES_REPO_URL}@{args.ref}")
+    uv = detect_uv()
+    try:
+        if uv:
+            ok(f"Using uv at {C_CYN}{uv}{C_RST}")
+            _emit("installer_uv_detected", {"uv_path": uv}, dest="hermes")
+            hermes_install_via_uv(uv, venv_python, args.ref)
+            installer_used = "uv"
+        else:
+            warn("uv not found — falling back to venv pip")
+            hermes_install_via_pip(venv_python, args.ref)
+            installer_used = "pip"
+    except subprocess.CalledProcessError as exc:
+        err(f"Install failed: {exc}")
+        _emit("installer_failed", {"stage": "pip_install", "error_class": type(exc).__name__, "error_msg": str(exc)[:200], "installer_used": uv and "uv" or "pip"}, dest="hermes")
+        return 1
+    ok("Plugin installed.")
+
+    check = subprocess.run(
+        [venv_python, "-c", "import chat4000_hermes_plugin; print(chat4000_hermes_plugin.__name__)"],
+        capture_output=True, text=True,
+    )
+    if check.returncode != 0:
+        err("Plugin installed but import failed:")
+        err(check.stderr.strip())
+        _emit("installer_failed", {"stage": "import_check", "error_msg": check.stderr.strip()[:200]}, dest="hermes")
+        return 1
+
+    ver = subprocess.run(
+        [venv_python, "-c", "from chat4000_hermes_plugin.package_info import read_package_version; print(read_package_version())"],
+        capture_output=True, text=True,
+    )
+    plugin_version = ver.stdout.strip() if ver.returncode == 0 else "unknown"
+    ok(f"Installed version: {C_GRN}{plugin_version}{C_RST}")
+    _emit("installer_pkg_installed", {"installer_used": installer_used, "plugin_ref": args.ref, "plugin_version": plugin_version}, dest="hermes")
+
+    symlink_chat4000_onto_path(venv_bin)
+
+    if args.no_wizard or not interactive:
+        if not interactive:
+            warn("Multiple targets selected — skipping the interactive wizard for this one.")
+        else:
+            warn("Skipping wizard (--no-wizard).")
+        print(f"  Pair it any time:  {C_CYN}{venv_bin}/chat4000 wizard{C_RST}")
+        return 0
+
+    hdr("🪄 Running install wizard")
+    _emit("installer_handing_off_to_wizard", dest="hermes")
+    # exec so the wizard owns the tty for Ctrl-C handling during pair. Only safe
+    # for a single selected target (it replaces this process).
+    try:
+        os.execv(f"{venv_bin}/chat4000", [f"{venv_bin}/chat4000", "wizard"])  # noqa: S606
+    except OSError as exc:
+        err(f"Could not exec wizard: {exc}")
+        _emit("installer_failed", {"stage": "wizard_exec", "error_class": type(exc).__name__, "error_msg": str(exc)[:200]}, dest="hermes")
+        return 1
+    return 0  # unreachable after execv
+
+
+def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
+    openclaw_path = t["bin"]
+    ok(f"OpenClaw:  {C_CYN}{openclaw_path}{C_RST}  {C_DIM}({t.get('version')}){C_RST}")
+    _emit("installer_openclaw_detected", {"openclaw_version": t.get("version"), "openclaw_path": openclaw_path}, dest="openclaw")
+
+    if args.uninstall:
+        hdr("Uninstall mode (OpenClaw)")
+        subprocess.run([openclaw_path, "plugins", "uninstall", OPENCLAW_NPM_PACKAGE], check=False)
+        ok("Plugin uninstalled. Local key + state at ~/.openclaw/plugins/chat4000 NOT removed (use --reset).")
+        return 0
+    if args.reset:
+        hdr("Reset mode (OpenClaw, destructive)")
+        openclaw_reset_local_state()
+
+    # Install / upgrade.
+    spec = args.plugin_version
+    installed, cur_ver, latest_ver, newer = detect_plugin_state(openclaw_path)
+    if spec:
+        hdr(f"🧪 Installing {OPENCLAW_NPM_PACKAGE}@{spec}" + (f" (replacing {cur_ver})" if installed else ""))
+        force = True
+    elif installed:
+        if newer:
+            hdr(f"⬆️  Upgrading {OPENCLAW_NPM_PACKAGE}: {cur_ver} → {latest_ver or 'latest'}")
+        elif latest_ver and cur_ver == latest_ver:
+            hdr(f"♻️  Reinstalling {OPENCLAW_NPM_PACKAGE} (already on latest: {cur_ver})")
+        else:
+            hdr(f"⬆️  Updating {OPENCLAW_NPM_PACKAGE} to the latest version (have {cur_ver})")
+        force = True
+    else:
+        hdr(f"📦 Installing {OPENCLAW_NPM_PACKAGE} into OpenClaw")
+        force = bool(args.force)
+
+    success, output_tail = openclaw_install_plugin(openclaw_path, force=force, spec=spec)
+    if not success:
+        err("`openclaw plugins install` failed.")
+        err("Common causes: npm registry unreachable, OpenClaw too old for `plugins install`, or plugin-dir permissions.")
+        if spec:
+            err(f"  - The version/tag `{spec}` may not exist on npm yet")
+        _emit("installer_failed", {"stage": "plugin_install", "error_class": "InstallFailed", "error_msg": output_tail[:200] or "no output", "output_tail": output_tail, "spec": spec}, dest="openclaw")
+        return 1
+    ok(f"chat4000 plugin ready ({latest_ver or 'latest version'}).")
+    _emit("installer_pkg_installed", {"plugin_package": OPENCLAW_NPM_PACKAGE, "from_version": cur_ver, "to_version": latest_ver, "spec": spec, "was_installed": installed}, dest="openclaw")
+
+    # Onboard + pair.
+    setup_cmd = [openclaw_path, "chat4000", "setup", "--self-redeem"]
+    if args.stage:
+        setup_cmd.append("--stage")
+    elif args.env:
+        setup_cmd += ["--env", args.env]
+    if args.service_token:
+        setup_cmd += ["--service-token", args.service_token]
+
+    do_pair = interactive and not args.no_pair
+    if not do_pair:
+        setup_cmd.append("--no-pair")
+        hdr("🔑 Onboarding the plugin's Matrix identity")
+        if not interactive:
+            warn("Multiple targets selected — onboarding identity only (pair each later).")
+        _emit("installer_handing_off_to_setup", {"paired": False}, dest="openclaw")
+    else:
+        hdr("📱 Onboarding + pairing a device")
+        print(f"{C_DIM}Scan the QR with the chat4000 iOS/macOS app. Ctrl-C to cancel.{C_RST}\n")
+        _emit("installer_handing_off_to_setup", {"paired": True}, dest="openclaw")
+    try:
+        pair_rc = subprocess.run(setup_cmd).returncode
+    except KeyboardInterrupt:
+        warn("Onboarding cancelled.")
+        _emit("installer_cancelled", {"stage": "setup"}, dest="openclaw")
+        return 130
+    if pair_rc != 0:
+        err(f"Setup exited {pair_rc}.")
+        err("If this is a token error, pass --service-token <TOKEN> and select --env prod|stage.")
+        _emit("installer_failed", {"stage": "setup", "exit_code": pair_rc}, dest="openclaw")
+        return pair_rc
+    if not do_pair:
+        ok("Identity onboarded. Pair a device any time with:")
+        print(f"  {C_CYN}{openclaw_path} chat4000 pair{C_RST}")
+    else:
+        _emit("pairing_completed_via_installer", {}, dest="openclaw")
+
+    # (Re)start gateway.
+    if args.no_restart:
+        warn("Skipping gateway restart (--no-restart).")
+        print(f"  {C_CYN}{openclaw_path} gateway run{C_RST}")
+        return 0
+
+    hdr("🔁 Starting OpenClaw gateway")
+    method = detect_restart_method()
+    if method is not None and restart_gateway(method):
+        ok(f"Gateway started (method: {method}).")
+        _emit("installer_gateway_restarted", {"method": method}, dest="openclaw")
+    else:
+        warn("Could not auto-start the gateway.")
+        warn("Docker: docker restart openclaw-gateway · terminal: openclaw gateway run · service: openclaw gateway start")
+        _emit("installer_failed", {"stage": "gateway_restart", "error_class": "RestartUnavailable", "error_msg": f"no working method (probed: {method or 'none'})"}, dest="openclaw")
+        return 1
+
+    if not interactive:
+        ok("Installed. Pair + verify each target individually when ready.")
+        return 0
+
+    print(f"{C_DIM}First install can take a couple of minutes while OpenClaw loads plugins{C_RST}")
+    print(f"{C_DIM}and the chat4000 channel connects. Grab a coffee — we'll tell you when ready.{C_RST}")
+    if wait_for_chat4000_connected(timeout=120):
+        ok("chat4000 connected. Send a message from your iOS/Mac app — your OpenClaw agent will reply.")
+        _emit("installer_succeeded", {}, dest="openclaw")
+        _emit("installer_chat4000_relay_connected", {}, dest="openclaw")
+        return 0
+    warn("chat4000 didn't connect within 120s.")
+    warn(f"Watch logs: {C_CYN}tail -f ~/.openclaw/plugins/chat4000/logs/runtime.log{C_RST}")
+    _emit("installer_failed", {"stage": "relay_handshake", "error_class": "Timeout", "error_msg": "no runtime.hello_ok within 120s"}, dest="openclaw")
+    return 1
+
+
+def prompt_manual_target(args) -> Optional[list]:
+    """Nothing detected — let the user point us at a Hermes venv or OpenClaw bin."""
+    print()
+    err("We couldn't find Hermes or OpenClaw on this machine.")
+    print()
+    print("We looked for:")
+    print(f"  · {C_CYN}hermes{C_RST} / {C_CYN}openclaw{C_RST} on PATH, env overrides, and all known install layouts")
+    print()
+    print(f"{C_BOLD}Point us at one, or cancel:{C_RST}")
+    print("  · a Hermes venv-bin dir (contains `python` and `hermes`), or")
+    print("  · the full path to an `openclaw` executable")
+    print(f"  · or press {C_CYN}Ctrl+C{C_RST} to cancel")
+    print()
+    print(f"{C_BOLD}Or re-run non-interactively:{C_RST}")
+    print(f"  {C_CYN}curl ... | bash -s -- --hermes-bin /path/to/venv/bin{C_RST}")
+    print(f"  {C_CYN}curl ... | bash -s -- --openclaw-bin /path/to/openclaw{C_RST}")
+    print()
+    if not sys.stdin.isatty():
+        err("(non-interactive shell — cannot prompt. Re-run interactively or pass --hermes-bin/--openclaw-bin.)")
+        _emit("installer_failed", {"stage": "detect", "error_class": "NotFound", "error_msg": "nothing detected; non-interactive"}, dest="both")
+        return None
+    try:
+        user_input = input(f"{C_CYN}? Path to a Hermes venv-bin or an openclaw binary:{C_RST} ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        warn("Cancelled.")
+        return None
+    if not user_input:
+        err("Empty path. Bailing.")
+        return None
+    cand = str(Path(user_input).expanduser())
+    # Hermes venv-bin?
+    if Path(f"{cand}/python").exists():
+        ok(f"Hermes venv:  {C_CYN}{cand}{C_RST}  {C_DIM}(user input){C_RST}")
+        _emit("installer_hermes_path_via_user_input", {"hermes_path": cand}, dest="hermes")
+        t = _mk_hermes(cand.rstrip("/"), "user-input")
+        t["stats"] = collect_hermes_stats(t["venv_bin"])
+        return [t]
+    # OpenClaw binary?
+    if Path(cand).exists() and os.access(cand, os.X_OK):
+        ver = _openclaw_version(cand)
+        ok(f"OpenClaw:  {C_CYN}{cand}{C_RST}  {C_DIM}({ver}, user input){C_RST}")
+        _emit("installer_openclaw_path_via_user_input", {"openclaw_path": cand}, dest="openclaw")
+        t = _mk_openclaw(cand, ver, "user-input")
+        t["stats"] = collect_openclaw_stats(cand)
+        return [t]
+    err(f"{cand} is neither a Hermes venv-bin (no `python`) nor an executable openclaw. Bailing.")
+    _emit("installer_failed", {"stage": "detect", "error_class": "InvalidUserInput", "error_msg": "unrecognized path"}, dest="both")
+    return None
+
+
+# ─── Main ─────────────────────────────────────────────────────────────────
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="chat4000 plugin installer (Hermes + OpenClaw)", add_help=True)
+    # Selection
+    parser.add_argument("--target", choices=["hermes", "openclaw"], help="only consider this host kind")
+    parser.add_argument("--all", action="store_true", help="install into EVERY detected target (no interactive pair)")
+    parser.add_argument("--scan-only", action="store_true", help="scan + report + emit analytics, then exit (install nothing)")
+    parser.add_argument("--hermes-bin", default=None, metavar="PATH", help="use this Hermes venv-bin dir directly (contains python + hermes)")
+    parser.add_argument("--openclaw-bin", default=None, metavar="PATH", help="use this openclaw executable directly")
+    # Hermes flow
+    parser.add_argument("--no-wizard", action="store_true", help="(hermes) install only, don't run the wizard")
+    parser.add_argument("--ref", default=HERMES_DEFAULT_REF, help=f"(hermes) git ref to install (default: {HERMES_DEFAULT_REF})")
+    # OpenClaw flow
+    parser.add_argument("--no-pair", action="store_true", help="(openclaw) install + restart only, don't pair")
+    parser.add_argument("--no-restart", action="store_true", help="(openclaw) install only, don't touch the gateway")
+    parser.add_argument("--force", action="store_true", help="(openclaw) force-reinstall in place")
+    parser.add_argument("--plugin-version", default=None, metavar="SPEC", help="(openclaw) install this exact version or npm dist-tag")
+    parser.add_argument("--env", default=None, metavar="NAME", help="(openclaw) backend environment: prod | stage")
+    parser.add_argument("--service-token", default=None, metavar="TOKEN", help="(openclaw) registrar SERVICE_TOKEN for self-onboard")
+    # Common
+    parser.add_argument("--reset", action="store_true", help="wipe local key + ack store for the chosen target (destructive)")
+    parser.add_argument("--uninstall", action="store_true", help="remove the plugin from the chosen target")
+    parser.add_argument("--stage", action="store_true", help="use the chat4000 stage servers")
+    parser.add_argument("--no-telemetry", action="store_true", help="disable PostHog + Sentry for this run")
+    parser.add_argument("--installer-ref", default=None, help="(internal) ref install.sh fetched this installer from")
+    parser.add_argument("--verbose", action="store_true", help="echo every subprocess command")
+    args = parser.parse_args()
+
+    banner()
+
+    if args.stage:
+        os.environ["CHAT4000_ENV"] = "stage"
+        say("Stage mode: onboarding/pairing will use the stage servers.")
+    # A Hermes git install should match the installer install.sh fetched.
+    if args.installer_ref and args.ref == HERMES_DEFAULT_REF and "--ref" not in sys.argv:
+        args.ref = args.installer_ref
+
+    _emit("installer_started", {"env": os.environ.get("CHAT4000_ENV", "production")}, dest="both")
+
+    # 1. Discover every target, scan + report + emit the new analytics.
+    targets = build_targets(args)
+    scan_and_report(targets)
+
+    if args.scan_only:
+        ok("Scan complete (--scan-only). Nothing installed.")
+        return 0
+
+    # 2. Resolve which target(s) to install into.
+    if not targets:
+        chosen = prompt_manual_target(args)
+    else:
+        chosen = select_targets(targets, args)
+    if not chosen:
+        return 130
+
+    # 3. Install. Interactive pairing/wizard only when exactly one target.
+    interactive = len(chosen) == 1
+    rc = 0
+    for t in chosen:
+        if t["kind"] == "hermes":
+            rc = install_into_hermes(t, args, interactive=interactive) or rc
+        else:
+            rc = install_into_openclaw(t, args, interactive=interactive) or rc
+    return rc
+
+
+def _entry() -> int:
+    try:
+        return main()
+    except KeyboardInterrupt:
+        print()
+        warn("Install cancelled.")
+        _emit("installer_cancelled", {"stage": "uncaught"}, dest="both")
+        return 130
+    except SystemExit:
+        raise
+    except BaseException as exc:  # noqa: BLE001  # installer top-level boundary: reports to its own sinks, then exits
+        err(f"Installer crashed unexpectedly: {type(exc).__name__}: {exc}")
+        _emit("installer_crashed", {"error_class": type(exc).__name__, "error_msg": str(exc)[:200]}, dest="both")
+        send_sentry_envelope(exc, kind="both", tags={"crash_stage": "uncaught"})
+        err("Crash report sent. If this keeps happening, please open an issue at:")
+        err("  https://github.com/chat4000/chat4000-installer/issues")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(_entry())
