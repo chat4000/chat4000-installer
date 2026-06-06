@@ -5,8 +5,10 @@ It scans the system for every Hermes (Python agent) and OpenClaw (Node agent)
 instance, reports what it found, lets you choose where to install when there's
 more than one, then installs the plugin with the right toolchain for that host:
 
-  • Hermes   → pip/uv install into Hermes' venv, then `chat4000 wizard`
-  • OpenClaw → `openclaw plugins install @chat4000/openclaw-plugin`, then
+  • Hermes   → pip/uv git-install from the gh `stable` tag into Hermes' venv,
+               then `chat4000 wizard`
+  • OpenClaw → `openclaw plugins install github:chat4000/chat4000-openclaw-plugin#stable`
+               (gh tag, NOT the npm registry), then
                `openclaw chat4000 setup --self-redeem` + gateway restart
 
 Runs in the system Python (stdlib only) — no third-party deps, because the
@@ -84,9 +86,12 @@ with contextlib.suppress(Exception):
 
 # ─── Constants ────────────────────────────────────────────────────────────
 
-# Hermes — Python plugin, git-installed into Hermes' venv.
+# Both plugins install from their GitHub repo's `stable` tag (NOT from a package
+# registry — no PyPI, no npm registry). `--ref` overrides this tag for both hosts.
+DEFAULT_REF = "stable"
+
+# Hermes — Python plugin, git-installed into Hermes' venv from the gh tag.
 HERMES_REPO_URL = "https://github.com/chat4000/chat4000-hermes-plugin"
-HERMES_DEFAULT_REF = "stable"
 # Prebuilt Matrix-E2EE wheels (not on PyPI); pip resolves the chat4000-pyvodozemac
 # hard dep from here, per platform, so users never need a Rust toolchain.
 PYVODOZEMAC_FIND_LINKS = (
@@ -94,9 +99,18 @@ PYVODOZEMAC_FIND_LINKS = (
 )
 HERMES_PKG = "chat4000-hermes-plugin"
 
-# OpenClaw — Node plugin, installed from npm.
-OPENCLAW_REPO_URL = "https://github.com/chat4000/chat4000-openclaw-plugin"
-OPENCLAW_NPM_PACKAGE = "@chat4000/openclaw-plugin"
+# OpenClaw — Node plugin, installed from the gh tag via an npm git spec
+# (github:owner/repo#ref). The repo ships TS source with no build-on-install
+# step, so a git install delivers the same bytes as the registry tarball.
+# OPENCLAW_PKG is the package *identity* (its package.json name) — still used to
+# uninstall and to talk to the `openclaw chat4000` subcommands once installed.
+OPENCLAW_REPO_SLUG = "chat4000/chat4000-openclaw-plugin"
+OPENCLAW_PKG = "@chat4000/openclaw-plugin"
+
+
+def openclaw_gh_spec(ref: str) -> str:
+    """npm git spec for the OpenClaw plugin at a GitHub ref (tag/branch/SHA)."""
+    return f"github:{OPENCLAW_REPO_SLUG}#{ref}"
 
 # Public PostHog credentials — one project per host (same projects the plugins
 # + the iOS/Mac apps use), so each host's install funnel stays correlated with
@@ -1072,28 +1086,37 @@ def detect_plugin_state(openclaw: str) -> tuple:
     return (bool(cur), cur, latest, newer)
 
 
-def openclaw_install_plugin(openclaw: str, force: bool, spec: Optional[str] = None) -> tuple:
-    target = f"{OPENCLAW_NPM_PACKAGE}@{spec}" if spec else OPENCLAW_NPM_PACKAGE
-    base_cmds = [
-        [openclaw, "plugins", "install", target],
-        [openclaw, "plugin", "install", target],
+def openclaw_install_plugin(openclaw: str, ref: str, force: bool = True) -> tuple:
+    """Install the OpenClaw plugin FROM ITS GITHUB TAG (not the npm registry).
+
+    Tries the npm github shorthand first, then an explicit git+https URL, each
+    against the canonical `plugins install` and the legacy `plugin install` CLI
+    forms. Returns (success, used_spec, output_tail) — tail is the last ~512
+    chars of output on total failure."""
+    specs = [
+        openclaw_gh_spec(ref),                                  # github:owner/repo#ref
+        f"git+https://github.com/{OPENCLAW_REPO_SLUG}.git#{ref}",  # explicit git url
+    ]
+    cmd_forms = [
+        [openclaw, "plugins", "install"],   # canonical (2026.4+)
+        [openclaw, "plugin", "install"],    # legacy
     ]
     last_tail = ""
-    for cmd in base_cmds:
-        if force:
-            cmd = cmd[:3] + ["--force"] + cmd[3:]
-        say(f"$ {' '.join(cmd)}")
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        buf: list = []
-        if proc.stdout is not None:
-            for line in proc.stdout:
-                sys.stdout.write(line)
-                sys.stdout.flush()
-                buf.append(line)
-        if proc.wait() == 0:
-            return True, ""
-        last_tail = "".join(buf)[-512:]
-    return False, _scrub_secrets(last_tail) if last_tail else ""
+    for spec in specs:
+        for form in cmd_forms:
+            cmd = list(form) + (["--force"] if force else []) + [spec]
+            say(f"$ {' '.join(cmd)}")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            buf: list = []
+            if proc.stdout is not None:
+                for line in proc.stdout:
+                    sys.stdout.write(line)
+                    sys.stdout.flush()
+                    buf.append(line)
+            if proc.wait() == 0:
+                return True, spec, ""
+            last_tail = "".join(buf)[-512:]
+    return False, None, _scrub_secrets(last_tail) if last_tail else ""
 
 
 def detect_restart_method() -> Optional[str]:
@@ -1484,41 +1507,34 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
 
     if args.uninstall:
         hdr("Uninstall mode (OpenClaw)")
-        subprocess.run([openclaw_path, "plugins", "uninstall", OPENCLAW_NPM_PACKAGE], check=False)
+        subprocess.run([openclaw_path, "plugins", "uninstall", OPENCLAW_PKG], check=False)
         ok("Plugin uninstalled. Local key + state at ~/.openclaw/plugins/chat4000 NOT removed (use --reset).")
         return 0
     if args.reset:
         hdr("Reset mode (OpenClaw, destructive)")
         openclaw_reset_local_state()
 
-    # Install / upgrade.
-    spec = args.plugin_version
-    installed, cur_ver, latest_ver, newer = detect_plugin_state(openclaw_path)
-    if spec:
-        hdr(f"🧪 Installing {OPENCLAW_NPM_PACKAGE}@{spec}" + (f" (replacing {cur_ver})" if installed else ""))
-        force = True
-    elif installed:
-        if newer:
-            hdr(f"⬆️  Upgrading {OPENCLAW_NPM_PACKAGE}: {cur_ver} → {latest_ver or 'latest'}")
-        elif latest_ver and cur_ver == latest_ver:
-            hdr(f"♻️  Reinstalling {OPENCLAW_NPM_PACKAGE} (already on latest: {cur_ver})")
-        else:
-            hdr(f"⬆️  Updating {OPENCLAW_NPM_PACKAGE} to the latest version (have {cur_ver})")
-        force = True
+    # Install from the GitHub tag (NOT npm). --plugin-version overrides the gh
+    # ref for OpenClaw only; otherwise the shared --ref (default: stable) is used.
+    oc_ref = args.plugin_version or args.ref
+    installed, cur_ver, _latest, _newer = detect_plugin_state(openclaw_path)
+    if installed:
+        hdr(f"⬆️  Reinstalling {OPENCLAW_PKG} from GitHub @{oc_ref}  {C_DIM}(have {cur_ver}){C_RST}")
     else:
-        hdr(f"📦 Installing {OPENCLAW_NPM_PACKAGE} into OpenClaw")
-        force = bool(args.force)
+        hdr(f"📦 Installing {OPENCLAW_PKG} from GitHub @{oc_ref}")
 
-    success, output_tail = openclaw_install_plugin(openclaw_path, force=force, spec=spec)
+    success, used_spec, output_tail = openclaw_install_plugin(openclaw_path, oc_ref, force=True)
     if not success:
-        err("`openclaw plugins install` failed.")
-        err("Common causes: npm registry unreachable, OpenClaw too old for `plugins install`, or plugin-dir permissions.")
-        if spec:
-            err(f"  - The version/tag `{spec}` may not exist on npm yet")
-        _emit("installer_failed", {"stage": "plugin_install", "error_class": "InstallFailed", "error_msg": output_tail[:200] or "no output", "output_tail": output_tail, "spec": spec}, dest="openclaw")
+        err("Installing the OpenClaw plugin from GitHub failed.")
+        err("Common causes:")
+        err("  - GitHub / network unreachable from this host (proxy / offline)")
+        err(f"  - This OpenClaw's `plugins install` doesn't accept git specs — try `{openclaw_path} --help`")
+        err(f"  - The `{oc_ref}` tag doesn't exist on github.com/{OPENCLAW_REPO_SLUG} yet")
+        err("  - Permissions on the OpenClaw plugins directory")
+        _emit("installer_failed", {"stage": "plugin_install", "error_class": "InstallFailed", "error_msg": output_tail[:200] or "no output", "output_tail": output_tail, "ref": oc_ref}, dest="openclaw")
         return 1
-    ok(f"chat4000 plugin ready ({latest_ver or 'latest version'}).")
-    _emit("installer_pkg_installed", {"plugin_package": OPENCLAW_NPM_PACKAGE, "from_version": cur_ver, "to_version": latest_ver, "spec": spec, "was_installed": installed}, dest="openclaw")
+    ok(f"chat4000 plugin ready (GitHub @{oc_ref}).")
+    _emit("installer_pkg_installed", {"plugin_package": OPENCLAW_PKG, "source": "github", "ref": oc_ref, "spec": used_spec, "from_version": cur_ver, "was_installed": installed}, dest="openclaw")
 
     # Onboard + pair.
     setup_cmd = [openclaw_path, "chat4000", "setup", "--self-redeem"]
@@ -1655,12 +1671,12 @@ def main() -> int:
     parser.add_argument("--openclaw-bin", default=None, metavar="PATH", help="use this openclaw executable directly")
     # Hermes flow
     parser.add_argument("--no-wizard", action="store_true", help="(hermes) install only, don't run the wizard")
-    parser.add_argument("--ref", default=HERMES_DEFAULT_REF, help=f"(hermes) git ref to install (default: {HERMES_DEFAULT_REF})")
+    parser.add_argument("--ref", default=DEFAULT_REF, help=f"GitHub tag/branch/SHA to install for BOTH hosts (default: {DEFAULT_REF})")
     # OpenClaw flow
     parser.add_argument("--no-pair", action="store_true", help="(openclaw) install + restart only, don't pair")
     parser.add_argument("--no-restart", action="store_true", help="(openclaw) install only, don't touch the gateway")
-    parser.add_argument("--force", action="store_true", help="(openclaw) force-reinstall in place")
-    parser.add_argument("--plugin-version", default=None, metavar="SPEC", help="(openclaw) install this exact version or npm dist-tag")
+    parser.add_argument("--force", action="store_true", help="(openclaw) force-reinstall in place (gh installs are always forced)")
+    parser.add_argument("--plugin-version", default=None, metavar="REF", help="(openclaw) override the GitHub ref for OpenClaw only (tag/branch/SHA)")
     parser.add_argument("--env", default=None, metavar="NAME", help="(openclaw) backend environment: prod | stage")
     parser.add_argument("--service-token", default=None, metavar="TOKEN", help="(openclaw) registrar SERVICE_TOKEN for self-onboard")
     # Common

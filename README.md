@@ -13,10 +13,15 @@ and OpenClaw (Node). It merges the two previous per-plugin installers
    session count, and whether the chat4000 plugin is already on it.
 3. **Asks where to install** when more than one instance is found (or pass
    `--target`, `--hermes-bin`, `--openclaw-bin`, or `--all`).
-4. **Installs** with the right toolchain:
-   - Hermes → `uv`/`pip` git-install into the venv, then `chat4000 wizard`.
-   - OpenClaw → `openclaw plugins install @chat4000/openclaw-plugin`, then
-     `openclaw chat4000 setup --self-redeem` + gateway restart + relay wait.
+4. **Installs from each plugin's GitHub `stable` tag** (not from PyPI or the npm
+   registry) with the right toolchain:
+   - Hermes → `uv`/`pip` git-install `git+…/chat4000-hermes-plugin@stable` into
+     the venv, then `chat4000 wizard`.
+   - OpenClaw → `openclaw plugins install github:chat4000/chat4000-openclaw-plugin#stable`,
+     then `openclaw chat4000 setup --self-redeem` + gateway restart + relay wait.
+
+   Override the tag for both hosts with `--ref <tag|branch|sha>` (OpenClaw-only:
+   `--plugin-version <ref>`).
 
 ## Run it
 
