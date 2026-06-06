@@ -1677,11 +1677,17 @@ def main() -> int:
     if args.stage:
         os.environ["CHAT4000_ENV"] = "stage"
         say("Stage mode: onboarding/pairing will use the stage servers.")
-    # A Hermes git install should match the installer install.sh fetched.
-    if args.installer_ref and args.ref == HERMES_DEFAULT_REF and "--ref" not in sys.argv:
-        args.ref = args.installer_ref
+    # NOTE: --installer-ref pins only WHICH installer.py was fetched (this repo,
+    # chat4000-installer). It deliberately does NOT set the Hermes plugin ref —
+    # the plugin lives in a DIFFERENT repo (chat4000-hermes-plugin), so an
+    # installer SHA is not a valid plugin ref. To pin the Hermes plugin to a
+    # dev build, pass --ref <hermes-plugin-ref> explicitly (default: stable).
 
-    _emit("installer_started", {"env": os.environ.get("CHAT4000_ENV", "production")}, dest="both")
+    _emit(
+        "installer_started",
+        {"env": os.environ.get("CHAT4000_ENV", "production"), "installer_ref": args.installer_ref},
+        dest="both",
+    )
 
     # 1. Discover every target, scan + report + emit the new analytics.
     targets = build_targets(args)
