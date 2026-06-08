@@ -87,8 +87,10 @@ with contextlib.suppress(Exception):
 # ─── Constants ────────────────────────────────────────────────────────────
 
 # Both plugins install from their GitHub repo's `stable` tag (NOT from a package
-# registry — no PyPI, no npm registry). `--ref` overrides this tag for both hosts.
+# registry — no PyPI, no npm registry). `--ref` overrides this tag for both
+# hosts; `--latest` is shorthand for the repo's default branch (newest code).
 DEFAULT_REF = "stable"
+LATEST_REF = "main"
 
 # Hermes — Python plugin, git-installed into Hermes' venv from the gh tag.
 HERMES_REPO_URL = "https://github.com/chat4000/chat4000-hermes-plugin"
@@ -1672,6 +1674,7 @@ def main() -> int:
     # Hermes flow
     parser.add_argument("--no-wizard", action="store_true", help="(hermes) install only, don't run the wizard")
     parser.add_argument("--ref", default=DEFAULT_REF, help=f"GitHub tag/branch/SHA to install for BOTH hosts (default: {DEFAULT_REF})")
+    parser.add_argument("--latest", action="store_true", help=f"install the LATEST code (the repo's default branch '{LATEST_REF}') instead of the '{DEFAULT_REF}' tag")
     # OpenClaw flow
     parser.add_argument("--no-pair", action="store_true", help="(openclaw) install + restart only, don't pair")
     parser.add_argument("--no-restart", action="store_true", help="(openclaw) install only, don't touch the gateway")
@@ -1693,6 +1696,11 @@ def main() -> int:
     if args.stage:
         os.environ["CHAT4000_ENV"] = "stage"
         say("Stage mode: onboarding/pairing will use the stage servers.")
+    # --latest installs the repo's default branch (newest code) instead of the
+    # 'stable' tag — for both hosts. An explicit --ref always wins over --latest.
+    if args.latest and "--ref" not in sys.argv:
+        args.ref = LATEST_REF
+        say(f"Installing the LATEST code (GitHub @{LATEST_REF}) — not the '{DEFAULT_REF}' tag.")
     # NOTE: --installer-ref pins only WHICH installer.py was fetched (this repo,
     # chat4000-installer). It deliberately does NOT set the Hermes plugin ref —
     # the plugin lives in a DIFFERENT repo (chat4000-hermes-plugin), so an

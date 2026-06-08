@@ -20,8 +20,10 @@ and OpenClaw (Node). It merges the two previous per-plugin installers
    - OpenClaw → `openclaw plugins install github:chat4000/chat4000-openclaw-plugin#stable`,
      then `openclaw chat4000 setup --self-redeem` + gateway restart + relay wait.
 
-   Override the tag for both hosts with `--ref <tag|branch|sha>` (OpenClaw-only:
-   `--plugin-version <ref>`).
+   Override the tag for both hosts with `--ref <tag|branch|sha>`, or pass
+   `--latest` to install the newest code (the repo's default branch `main`)
+   instead of `stable`. OpenClaw-only override: `--plugin-version <ref>`.
+   Explicit `--ref` wins over `--latest`.
 
 ## Run it
 
