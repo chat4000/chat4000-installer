@@ -1674,6 +1674,7 @@ def main() -> int:
     # Hermes flow
     parser.add_argument("--no-wizard", action="store_true", help="(hermes) install only, don't run the wizard")
     parser.add_argument("--ref", default=DEFAULT_REF, help=f"GitHub tag/branch/SHA to install for BOTH hosts (default: {DEFAULT_REF})")
+    parser.add_argument("--branch", default=None, metavar="NAME", help="install the plugin from this GitHub branch (both hosts) — alias for --ref <branch>")
     parser.add_argument("--latest", action="store_true", help=f"install the LATEST code (the repo's default branch '{LATEST_REF}') instead of the '{DEFAULT_REF}' tag")
     # OpenClaw flow
     parser.add_argument("--no-pair", action="store_true", help="(openclaw) install + restart only, don't pair")
@@ -1696,11 +1697,15 @@ def main() -> int:
     if args.stage:
         os.environ["CHAT4000_ENV"] = "stage"
         say("Stage mode: onboarding/pairing will use the stage servers.")
-    # --latest installs the repo's default branch (newest code) instead of the
-    # 'stable' tag — for both hosts. An explicit --ref always wins over --latest.
-    if args.latest and "--ref" not in sys.argv:
-        args.ref = LATEST_REF
-        say(f"Installing the LATEST code (GitHub @{LATEST_REF}) — not the '{DEFAULT_REF}' tag.")
+    # Resolve the GitHub ref for the plugin install (both hosts). Precedence:
+    # explicit --ref > --branch > --latest (default branch) > the 'stable' tag.
+    if "--ref" not in sys.argv:
+        if args.branch:
+            args.ref = args.branch
+            say(f"Installing from branch {C_CYN}{args.branch}{C_RST} (GitHub @{args.branch}).")
+        elif args.latest:
+            args.ref = LATEST_REF
+            say(f"Installing the LATEST code (GitHub @{LATEST_REF}) — not the '{DEFAULT_REF}' tag.")
     # NOTE: --installer-ref pins only WHICH installer.py was fetched (this repo,
     # chat4000-installer). It deliberately does NOT set the Hermes plugin ref —
     # the plugin lives in a DIFFERENT repo (chat4000-hermes-plugin), so an
