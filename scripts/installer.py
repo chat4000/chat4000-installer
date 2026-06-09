@@ -68,6 +68,7 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1750,20 +1751,43 @@ def _pair_env() -> dict:
     return env
 
 
-def spawn_detached_pair(cmd: list, env: dict) -> tuple:
+def spawn_detached_pair(cmd: list, env: dict, post_success_sh: Optional[str] = None) -> tuple:
     """Start the pair command DETACHED (own session, output → a /tmp log), then
     tail the log until it prints the pairing code + QR. Returns
     (code, qr_uri, logpath, error). On success the child keeps running (polling
     the registrar for the rest of its TTL) after we return — we never wait on it,
-    which is the whole point: this process exits while pairing continues."""
+    which is the whole point: this process exits while pairing continues.
+
+    If `post_success_sh` is given, the detached child becomes a wrapper that runs
+    the pair command and, ONLY if it exits 0 (the device actually paired), runs
+    that shell. On Hermes that shell (re)starts the gateway so it loads chat4000
+    and invites the just-paired user. Crucially the restart fires AFTER a redeem,
+    which can only happen after the user got the code we hand back — so it can
+    never race the agent's relay of that code."""
     logpath = f"/tmp/chat4000-pair-{uuid.uuid4().hex[:8]}.log"
     try:
         logf = open(logpath, "ab")  # noqa: SIM115  # handed to the child; we close our copy below
     except OSError as exc:
         return (None, None, None, f"could not open pairing log {logpath}: {exc}")
+
+    child_cmd = cmd
+    if post_success_sh:
+        # Stage the post-success shell as a TEMP FILE rather than inlining it, so
+        # the wrapper's own command line never contains the gateway match-pattern
+        # — otherwise `pkill -f 'hermes gateway'` inside it could match and kill
+        # the wrapper itself. A file's contents are not in any process's argv.
+        quoted = " ".join(shlex.quote(c) for c in cmd)
+        sh_path = f"/tmp/chat4000-postpair-{uuid.uuid4().hex[:8]}.sh"
+        try:
+            Path(sh_path).write_text("#!/usr/bin/env bash\n" + post_success_sh + '\nrm -f "$0"\n', encoding="utf-8")
+            os.chmod(sh_path, 0o700)
+            child_cmd = ["bash", "-c", f'{quoted}\nrc=$?\nif [ "$rc" -eq 0 ]; then bash {shlex.quote(sh_path)}; fi\n']
+        except OSError:
+            child_cmd = cmd  # couldn't stage the restart; still run the pairing itself
+
     try:
         proc = subprocess.Popen(
-            cmd,
+            child_cmd,
             stdout=logf,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
@@ -1809,6 +1833,34 @@ def spawn_detached_pair(cmd: list, env: dict) -> tuple:
     if last_code:
         return (last_code, None, logpath, None)
     return (None, None, logpath, f"pairing didn't print a code within {int(PAIR_EMIT_TIMEOUT)}s (log: {logpath})")
+
+
+def _hermes_gateway_reload_sh(hermes_bin: str) -> str:
+    """Shell run by the detached pair wrapper ONLY after a successful pair: make
+    the gateway load chat4000 so it invites the freshly-paired user. Hermes has
+    no hot-reload, so a gateway that booted BEFORE chat4000 was enabled must
+    restart to pick it up. We capture the running gateway's EXACT argv from
+    /proc and relaunch it identically (the live gateway runs as `hermes gateway`,
+    not `hermes gateway run`, so we don't guess the command), detached so it
+    outlives this wrapper. If a supervisor respawns it first, we don't double
+    start. The match pattern never appears in the wrapper's own argv (it's in a
+    temp file), so pkill can't kill the wrapper."""
+    hb = shlex.quote(hermes_bin)
+    return f"""sleep 3
+gpid=$(pgrep -f 'hermes gateway' 2>/dev/null | head -n1)
+if [ -n "$gpid" ] && [ -r "/proc/$gpid/cmdline" ]; then cp "/proc/$gpid/cmdline" /tmp/chat4000-gw-argv.bin 2>/dev/null; fi
+pkill -9 -f 'hermes gateway' 2>/dev/null || true
+for _ in $(seq 1 12); do pgrep -f 'hermes gateway' >/dev/null 2>&1 || break; sleep 1; done
+sleep 2
+if pgrep -f 'hermes gateway' >/dev/null 2>&1; then exit 0; fi
+if [ -s /tmp/chat4000-gw-argv.bin ]; then
+  mapfile -d '' gargv < /tmp/chat4000-gw-argv.bin
+  [ -n "${{gargv[-1]:-}}" ] || unset 'gargv[-1]'
+  setsid "${{gargv[@]}}" >/tmp/chat4000-gateway.log 2>&1 </dev/null &
+else
+  setsid {hb} gateway run >/tmp/chat4000-gateway.log 2>&1 </dev/null &
+fi
+"""
 
 
 def install_openclaw_agent(t: dict, args) -> int:
@@ -1879,19 +1931,21 @@ def install_hermes_agent(t: dict, args) -> int:
     r = subprocess.run(prep_cmd, capture_output=True, text=True)
     if r.returncode != 0:
         return agent_error("preparing the Hermes plugin (enable + onboard)", ((r.stdout or "") + (r.stderr or "")).strip())
-    # 4. Start device pairing DETACHED and capture the code.
+    # 4. Start device pairing DETACHED. When it COMPLETES (the user redeems), the
+    #    detached wrapper (re)starts the gateway so it loads chat4000 and invites
+    #    the just-paired user. This can't race the relay: a redeem only happens
+    #    after the user received the code we hand back below. And because the
+    #    restart is gated on pair SUCCESS, an expired/abandoned code never bounces
+    #    the gateway.
     pair_cmd = [chat4000, "pair"]
     if args.stage:
         pair_cmd.append("--stage")
-    code, qr, logpath, perr = spawn_detached_pair(pair_cmd, _pair_env())
+    reload_sh = _hermes_gateway_reload_sh(f"{venv_bin}/hermes")
+    code, qr, logpath, perr = spawn_detached_pair(pair_cmd, _pair_env(), post_success_sh=reload_sh)
     if not code:
         return agent_error("starting device pairing", perr or "no pairing code produced")
-    # We deliberately do NOT restart the Hermes gateway: if the agent running us
-    # IS that gateway, a restart would kill it mid-relay. A running gateway invites
-    # the paired user within seconds with no restart; otherwise the plugin takes
-    # effect on the next gateway restart.
-    note = ("plugin installed & enabled. A running Hermes gateway invites the user within seconds "
-            "of pairing; otherwise it takes effect on the next gateway restart")
+    note = ("once the user enters the code, pairing finishes and I auto-(re)start the Hermes gateway "
+            "so it loads chat4000 and invites them — the bot may blip for a few seconds during that restart")
     _emit("installer_pkg_installed", {"plugin_ref": args.ref, "mode": "agent"}, dest="hermes")
     return agent_success("Hermes", code, qr, logpath, note)
 

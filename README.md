@@ -36,7 +36,7 @@ Useful flags (all pass through `install.sh` → `installer.py`):
 | Flag | Effect |
 |------|--------|
 | `--scan-only` | Report + emit analytics, install nothing |
-| `--agent` | **Agent mode** — for when an agent (not a human) runs the installer (e.g. over Telegram). No banner/QR/TUI: installs quietly, prints the pairing **code + QR** addressed to the calling agent so it can relay them to its user, and runs pairing **detached** so the process exits immediately (the pair-and-wait keeps polling in the background). Errors come back as one terse `SCRIPT ERROR` block. Auto-detects the host (Hermes or OpenClaw); pass `--target`/`--hermes-bin`/`--openclaw-bin` if more than one is present. |
+| `--agent` | **Agent mode** — for when an agent (not a human) runs the installer (e.g. over Telegram). No banner/QR/TUI: installs quietly, prints the pairing **code + QR** addressed to the calling agent so it can relay them to its user, and runs pairing **detached** so the process exits immediately (the pair-and-wait keeps polling in the background). Errors come back as one terse `SCRIPT ERROR` block. Auto-detects the host (Hermes or OpenClaw); pass `--target`/`--hermes-bin`/`--openclaw-bin` if more than one is present. On Hermes, when the device actually pairs the detached wrapper auto-(re)starts the gateway so it loads chat4000 and invites the new user (the bot blips briefly); the restart is gated on pair success, so an abandoned code never bounces the gateway. |
 | `--target hermes\|openclaw` | Only consider that host kind |
 | `--all` | Install into every detected target (no interactive pairing) |
 | `--hermes-bin PATH` / `--openclaw-bin PATH` | Skip detection, use this one |
