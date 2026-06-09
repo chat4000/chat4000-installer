@@ -155,28 +155,47 @@ else:
     C_RED = C_GRN = C_YEL = C_BLU = C_MAG = C_CYN = C_DIM = C_BOLD = C_RST = ""
 
 
+# Agent mode: terse, machine-addressed output for when an AGENT (not a human)
+# runs the installer — e.g. an OpenClaw/Hermes agent driving it over Telegram.
+# When on, the human-pretty helpers below are SILENCED and everything the caller
+# sees goes through agent_success() / agent_error(). Set in main().
+_AGENT_MODE = False
+
+
 def say(msg: str) -> None:
+    if _AGENT_MODE:
+        return
     print(f"{C_CYN}>{C_RST} {msg}")
 
 
 def ok(msg: str) -> None:
+    if _AGENT_MODE:
+        return
     print(f"{C_GRN}✓{C_RST} {msg}")
 
 
 def warn(msg: str) -> None:
+    if _AGENT_MODE:
+        return
     print(f"{C_YEL}⚠{C_RST} {msg}")
 
 
 def err(msg: str) -> None:
+    if _AGENT_MODE:
+        return
     print(f"{C_RED}✗{C_RST} {msg}", file=sys.stderr)
 
 
 def hdr(msg: str) -> None:
+    if _AGENT_MODE:
+        return
     line = "━" * 63
     print(f"\n{C_MAG}{line}{C_RST}\n{C_MAG}{C_BOLD}{msg}{C_RST}\n{C_MAG}{line}{C_RST}\n")
 
 
 def banner() -> None:
+    if _AGENT_MODE:
+        return
     print(f"\n{C_MAG}┌─────────────────────────────────────────────────────────────┐{C_RST}")
     print(
         f"{C_MAG}│{C_RST}  {C_MAG}{C_BOLD}🔐 chat4000{C_RST}  ·  {C_BLU}{C_BOLD}plugin installer{C_RST}  {C_DIM}(Hermes + OpenClaw){C_RST}            {C_MAG}│{C_RST}"  # noqa: E501
@@ -981,18 +1000,18 @@ def _count_hermes_sessions(home: Path) -> Optional[int]:
 # ─── Hermes install steps ─────────────────────────────────────────────────
 
 
-def hermes_install_via_uv(uv: str, venv_python: str, ref: str) -> None:
+def hermes_install_via_uv(uv: str, venv_python: str, ref: str, *, capture: bool = False) -> None:
     subprocess.run(
         [
             uv, "pip", "install", "--python", venv_python,
             "--find-links", PYVODOZEMAC_FIND_LINKS,
             f"git+{HERMES_REPO_URL}@{ref}",
         ],
-        check=True,
+        check=True, capture_output=capture, text=capture,
     )
 
 
-def hermes_install_via_pip(venv_python: str, ref: str) -> None:
+def hermes_install_via_pip(venv_python: str, ref: str, *, capture: bool = False) -> None:
     has_pip = (
         subprocess.run([venv_python, "-c", "import pip"], capture_output=True).returncode == 0
     )
@@ -1009,7 +1028,7 @@ def hermes_install_via_pip(venv_python: str, ref: str) -> None:
             "--find-links", PYVODOZEMAC_FIND_LINKS,
             f"git+{HERMES_REPO_URL}@{ref}",
         ],
-        check=True,
+        check=True, capture_output=capture, text=capture,
     )
 
 
@@ -1088,7 +1107,7 @@ def detect_plugin_state(openclaw: str) -> tuple:
     return (bool(cur), cur, latest, newer)
 
 
-def openclaw_install_plugin(openclaw: str, ref: str, force: bool = True) -> tuple:
+def openclaw_install_plugin(openclaw: str, ref: str, force: bool = True, *, quiet: bool = False) -> tuple:
     """Install the OpenClaw plugin FROM ITS GITHUB TAG (not the npm registry).
 
     Tries the npm github shorthand first, then an explicit git+https URL, each
@@ -1112,8 +1131,9 @@ def openclaw_install_plugin(openclaw: str, ref: str, force: bool = True) -> tupl
             buf: list = []
             if proc.stdout is not None:
                 for line in proc.stdout:
-                    sys.stdout.write(line)
-                    sys.stdout.flush()
+                    if not quiet:
+                        sys.stdout.write(line)
+                        sys.stdout.flush()
                     buf.append(line)
             if proc.wait() == 0:
                 return True, spec, ""
@@ -1660,6 +1680,282 @@ def prompt_manual_target(args) -> Optional[list]:
     return None
 
 
+# ─── Agent mode (terse, machine-addressed, detached pairing) ──────────────
+#
+# When an AGENT runs the installer (not a human at a terminal), we don't want a
+# banner/QR/TUI. We want: install quietly, hand the agent the pairing CODE + QR
+# so it can relay them to its user, and run the actual pair-and-wait DETACHED so
+# this process exits immediately. On any failure: one terse error the agent can
+# pass on. Everything the caller sees goes through agent_success/agent_error.
+
+PAIR_EMIT_TIMEOUT = 60.0  # seconds to wait for the detached pair child to print its code
+_QR_RE = re.compile(r"(chat4000://pair\?\S+)")
+_CODE_IN_URI_RE = re.compile(r"[?&]code=(\d+)")
+_CODE_LINE_RE = re.compile(r"[Pp]airing code:\s*([0-9][0-9 ]{3,})")
+
+
+def _agent_print(lines: list) -> None:
+    sys.stdout.write("\n".join(lines) + "\n")
+    sys.stdout.flush()
+
+
+def agent_error(stage: str, detail: str) -> int:
+    detail = _scrub_secrets((detail or "").strip())[-800:] or "(no further detail)"
+    _agent_print(
+        [
+            "[chat4000 installer → agent]  SCRIPT ERROR",
+            f"I'm the chat4000 plugin installer and I failed while {stage}.",
+            "Relay this to your user, then stop — there's no pairing code this run:",
+            "",
+            detail,
+        ]
+    )
+    return 1
+
+
+def agent_success(kind: str, code: str, qr: Optional[str], logpath: str, note: Optional[str] = None) -> int:
+    qr_display = qr or "(unavailable — the 6-digit code alone is enough)"
+    lines = [
+        "[chat4000 installer → agent]",
+        "I'm the chat4000 plugin installer. I install the plugin that lets your user",
+        "reach you from the chat4000 iPhone / Mac app — like another one of your plugins.",
+        f"I installed the files into this {kind} host and started pairing in the background.",
+        "",
+        "Relay these to your user so they can pair their app (a 6-digit code + a QR link):",
+        f"  PAIRING CODE:  {code}",
+        f"  QR / LINK:     {qr_display}",
+        "",
+        "Machine-readable (use verbatim, don't reformat the code):",
+        f"  CODE={code}",
+    ]
+    if qr:
+        lines.append(f"  QR={qr}")
+    lines += [
+        "",
+        "The code is valid for ~5 minutes. Pairing completes on its own the moment they",
+        "enter it in the app — you don't need to wait or run anything else.",
+    ]
+    if note:
+        lines += ["", f"NOTE: {note}"]
+    lines += [f"(background pairing log: {logpath})"]
+    _agent_print(lines)
+    return 0
+
+
+def _pair_env() -> dict:
+    env = dict(os.environ)
+    # Force the (python) Hermes pair child to flush its code line to the log
+    # immediately instead of block-buffering it because stdout isn't a tty.
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+def spawn_detached_pair(cmd: list, env: dict) -> tuple:
+    """Start the pair command DETACHED (own session, output → a /tmp log), then
+    tail the log until it prints the pairing code + QR. Returns
+    (code, qr_uri, logpath, error). On success the child keeps running (polling
+    the registrar for the rest of its TTL) after we return — we never wait on it,
+    which is the whole point: this process exits while pairing continues."""
+    logpath = f"/tmp/chat4000-pair-{uuid.uuid4().hex[:8]}.log"
+    try:
+        logf = open(logpath, "ab")  # noqa: SIM115  # handed to the child; we close our copy below
+    except OSError as exc:
+        return (None, None, None, f"could not open pairing log {logpath}: {exc}")
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=logf,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,  # detach: survives our exit, no SIGHUP/SIGINT from our tty
+            close_fds=True,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logf.close()
+        return (None, None, logpath, f"could not start pairing: {exc}")
+    logf.close()  # the child holds its own copy of the fd
+
+    deadline = time.time() + PAIR_EMIT_TIMEOUT
+    last_code = None
+    while time.time() < deadline:
+        try:
+            text = Path(logpath).read_text(errors="ignore")
+        except OSError:
+            text = ""
+        qr = None
+        qm = _QR_RE.search(text)
+        if qm:
+            qr = qm.group(1).rstrip(").,")
+        code = None
+        if qr:
+            cm = _CODE_IN_URI_RE.search(qr)
+            if cm:
+                code = cm.group(1)
+        # Prefer the full QR+code (the QR line carries the code). The plain
+        # "Pairing code:" line is a fallback if the child exits/times out first.
+        if qr and code:
+            return (code, qr, logpath, None)
+        lm = _CODE_LINE_RE.search(text)
+        if lm:
+            last_code = lm.group(1).replace(" ", "")
+        rc = proc.poll()
+        if rc is not None:
+            if last_code:
+                return (last_code, qr, logpath, None)
+            tail = _scrub_secrets(text.strip())[-800:]
+            return (None, qr, logpath, tail or f"pairing exited ({rc}) before printing a code")
+        time.sleep(0.2)
+    if last_code:
+        return (last_code, None, logpath, None)
+    return (None, None, logpath, f"pairing didn't print a code within {int(PAIR_EMIT_TIMEOUT)}s (log: {logpath})")
+
+
+def install_openclaw_agent(t: dict, args) -> int:
+    oc = t["bin"]
+    oc_ref = args.plugin_version or args.ref
+    # 1. Install the plugin from the GitHub ref (quiet).
+    success, _spec, tail = openclaw_install_plugin(oc, oc_ref, force=True, quiet=True)
+    if not success:
+        return agent_error(f"installing the OpenClaw plugin from GitHub @{oc_ref}", tail or "no output")
+    # 2. Onboard the bot identity — no phone needed (--self-redeem), no pairing yet.
+    setup_cmd = [oc, "chat4000", "setup", "--self-redeem", "--no-pair"]
+    if args.stage:
+        setup_cmd.append("--stage")
+    elif args.env:
+        setup_cmd += ["--env", args.env]
+    if args.service_token:
+        setup_cmd += ["--service-token", args.service_token]
+    r = subprocess.run(setup_cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return agent_error("onboarding the plugin identity", ((r.stdout or "") + (r.stderr or "")).strip())
+    # 3. Start device pairing DETACHED and capture the code.
+    pair_cmd = [oc, "chat4000", "pair"]
+    if args.stage:
+        pair_cmd.append("--stage")
+    elif args.env:
+        pair_cmd += ["--env", args.env]
+    code, qr, logpath, perr = spawn_detached_pair(pair_cmd, _pair_env())
+    if not code:
+        return agent_error("starting device pairing", perr or "no pairing code produced")
+    # 4. (Re)start the gateway so the channel goes live. It's a separate process,
+    #    so this can't kill the agent running us. Soft-fail — the code is already
+    #    valid; the user just needs the gateway up for messages to flow.
+    note = None
+    method = detect_restart_method()
+    if not (method and restart_gateway(method)):
+        note = ("the OpenClaw gateway didn't auto-start — have the user run "
+                "`openclaw gateway run` (or `docker restart openclaw-gateway`) so messages flow")
+    _emit("installer_pkg_installed", {"plugin_package": OPENCLAW_PKG, "source": "github", "ref": oc_ref, "mode": "agent"}, dest="openclaw")
+    return agent_success("OpenClaw", code, qr, logpath, note)
+
+
+def install_hermes_agent(t: dict, args) -> int:
+    venv_bin = t["venv_bin"]
+    venv_python = t["venv_python"]
+    chat4000 = f"{venv_bin}/chat4000"
+    # 1. Install the plugin from the GitHub ref (quiet).
+    uv = detect_uv()
+    try:
+        if uv:
+            hermes_install_via_uv(uv, venv_python, args.ref, capture=True)
+        else:
+            hermes_install_via_pip(venv_python, args.ref, capture=True)
+    except subprocess.CalledProcessError as exc:
+        out = getattr(exc, "stderr", None) or getattr(exc, "stdout", None) or ""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "ignore")
+        return agent_error(f"installing the Hermes plugin from GitHub @{args.ref}", out or str(exc))
+    # 2. Import-check.
+    chk = subprocess.run([venv_python, "-c", "import chat4000_hermes_plugin"], capture_output=True, text=True)
+    if chk.returncode != 0:
+        return agent_error("verifying the installed plugin imports", (chk.stderr or "").strip())
+    symlink_chat4000_onto_path(venv_bin)
+    # 3. Enable the plugin + onboard identity. `prepare` is pre-restart prep — it
+    #    does NOT restart the gateway, so it can't kill an agent running us.
+    prep_cmd = [chat4000, "prepare"]
+    if args.stage:
+        prep_cmd.append("--stage")
+    r = subprocess.run(prep_cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return agent_error("preparing the Hermes plugin (enable + onboard)", ((r.stdout or "") + (r.stderr or "")).strip())
+    # 4. Start device pairing DETACHED and capture the code.
+    pair_cmd = [chat4000, "pair"]
+    if args.stage:
+        pair_cmd.append("--stage")
+    code, qr, logpath, perr = spawn_detached_pair(pair_cmd, _pair_env())
+    if not code:
+        return agent_error("starting device pairing", perr or "no pairing code produced")
+    # We deliberately do NOT restart the Hermes gateway: if the agent running us
+    # IS that gateway, a restart would kill it mid-relay. A running gateway invites
+    # the paired user within seconds with no restart; otherwise the plugin takes
+    # effect on the next gateway restart.
+    note = ("plugin installed & enabled. A running Hermes gateway invites the user within seconds "
+            "of pairing; otherwise it takes effect on the next gateway restart")
+    _emit("installer_pkg_installed", {"plugin_ref": args.ref, "mode": "agent"}, dest="hermes")
+    return agent_success("Hermes", code, qr, logpath, note)
+
+
+def run_agent_mode(args) -> int:
+    """`--agent`: terse, machine-addressed install for an agent caller."""
+    _emit("installer_started", {"mode": "agent", "env": os.environ.get("CHAT4000_ENV", "production")}, dest="both")
+    if args.uninstall or args.reset:
+        return agent_error("starting", "--uninstall / --reset aren't supported in --agent mode; run the installer normally for those.")
+
+    targets = build_targets(args)
+    # Silent scan: collect stats + fire analytics, print nothing.
+    for t in targets:
+        try:
+            if t["kind"] == "hermes":
+                t["stats"] = collect_hermes_stats(t["venv_bin"])
+                t["version"] = t["stats"].get("agent_version") or t["version"]
+            else:
+                t["stats"] = collect_openclaw_stats(t["bin"])
+            _emit_agent_detected(t)
+        except (OSError, subprocess.SubprocessError, ValueError):
+            pass  # scanning is best-effort; it must never break the install
+    _emit(
+        "installer_environment_scan",
+        {
+            "hermes_count": sum(1 for x in targets if x["kind"] == "hermes"),
+            "openclaw_count": sum(1 for x in targets if x["kind"] == "openclaw"),
+            "total": len(targets),
+            "mode": "agent",
+        },
+        dest="both",
+    )
+
+    pool = targets
+    if args.target:
+        pool = [t for t in targets if t["kind"] == args.target]
+    if not pool:
+        return agent_error(
+            "detecting an agent host",
+            "no Hermes or OpenClaw install found on this machine. Re-run with --hermes-bin <venv/bin> or --openclaw-bin <path>.",
+        )
+    if len(pool) > 1:
+        listed = "; ".join(f"{x['kind']} {x['display']}" for x in pool)
+        return agent_error(
+            "choosing where to install",
+            f"found {len(pool)} hosts ({listed}). Re-run with --target hermes|openclaw, or --hermes-bin/--openclaw-bin to pick one.",
+        )
+
+    t = pool[0]
+    if args.scan_only:
+        st = t.get("stats") or {}
+        _agent_print(
+            [
+                "[chat4000 installer → agent]  scan only — nothing installed.",
+                f"Detected: {t['kind']} at {t['display']} "
+                f"(chat4000 plugin {'present' if st.get('plugin_installed') else 'absent'}).",
+            ]
+        )
+        return 0
+    if t["kind"] == "hermes":
+        return install_hermes_agent(t, args)
+    return install_openclaw_agent(t, args)
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────
 
 
@@ -1669,6 +1965,7 @@ def main() -> int:
     parser.add_argument("--target", choices=["hermes", "openclaw"], help="only consider this host kind")
     parser.add_argument("--all", action="store_true", help="install into EVERY detected target (no interactive pair)")
     parser.add_argument("--scan-only", action="store_true", help="scan + report + emit analytics, then exit (install nothing)")
+    parser.add_argument("--agent", action="store_true", help="agent mode: terse machine-readable output, install quietly, hand back the pairing code + QR, and run pairing DETACHED so this process exits immediately")
     parser.add_argument("--hermes-bin", default=None, metavar="PATH", help="use this Hermes venv-bin dir directly (contains python + hermes)")
     parser.add_argument("--openclaw-bin", default=None, metavar="PATH", help="use this openclaw executable directly")
     # Hermes flow
@@ -1692,7 +1989,8 @@ def main() -> int:
     parser.add_argument("--verbose", action="store_true", help="echo every subprocess command")
     args = parser.parse_args()
 
-    banner()
+    global _AGENT_MODE
+    _AGENT_MODE = args.agent
 
     if args.stage:
         os.environ["CHAT4000_ENV"] = "stage"
@@ -1712,6 +2010,10 @@ def main() -> int:
     # installer SHA is not a valid plugin ref. To pin the Hermes plugin to a
     # dev build, pass --ref <hermes-plugin-ref> explicitly (default: stable).
 
+    if _AGENT_MODE:
+        return run_agent_mode(args)
+
+    banner()
     _emit(
         "installer_started",
         {"env": os.environ.get("CHAT4000_ENV", "production"), "installer_ref": args.installer_ref},
