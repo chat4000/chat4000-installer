@@ -1714,7 +1714,14 @@ def agent_error(stage: str, detail: str) -> int:
     return 1
 
 
-def agent_success(kind: str, code: str, qr: Optional[str], logpath: str, note: Optional[str] = None) -> int:
+def agent_success(
+    kind: str,
+    code: str,
+    qr: Optional[str],
+    logpath: str,
+    note: Optional[str] = None,
+    qr_ascii: Optional[str] = None,
+) -> int:
     qr_display = qr or "(unavailable — the 6-digit code alone is enough)"
     lines = [
         "[chat4000 installer → agent]",
@@ -1722,25 +1729,57 @@ def agent_success(kind: str, code: str, qr: Optional[str], logpath: str, note: O
         "reach you from the chat4000 iPhone / Mac app — like another one of your plugins.",
         f"I installed the files into this {kind} host and started pairing in the background.",
         "",
-        "Relay these to your user so they can pair their app (a 6-digit code + a QR link):",
-        f"  PAIRING CODE:  {code}",
-        f"  QR / LINK:     {qr_display}",
+        "👉 Show your user these so they can pair the chat4000 app — they can either",
+        "   type the 6-digit code OR scan the QR below:",
         "",
-        "Machine-readable (use verbatim, don't reformat the code):",
+        f"  PAIRING CODE:  {code}",
+    ]
+    if qr_ascii:
+        lines += ["", "  QR (show this to the user — it's scannable):", qr_ascii]
+    elif qr:
+        lines += ["", f"  QR / LINK:  {qr_display}"]  # ascii couldn't render; give the link
+    lines += [
+        "",
+        "Machine-readable (use verbatim, don't reformat):",
         f"  CODE={code}",
     ]
     if qr:
         lines.append(f"  QR={qr}")
     lines += [
         "",
-        "The code is valid for ~5 minutes. Pairing completes on its own the moment they",
-        "enter it in the app — you don't need to wait or run anything else.",
+        "The code/QR are valid for ~5 minutes. Pairing completes on its own the moment",
+        "they enter the code or scan the QR — you don't need to wait or run anything else.",
     ]
     if note:
         lines += ["", f"NOTE: {note}"]
     lines += [f"(background pairing log: {logpath})"]
     _agent_print(lines)
     return 0
+
+
+def _render_ascii_qr(uri: Optional[str], python_bins: list) -> Optional[str]:
+    """Render the pairing URI as an ASCII QR using whichever python has `qrcode`
+    (the Hermes venv ships it; system python usually doesn't). Returns the ASCII
+    block or None — best-effort. A missing lib just means the agent falls back to
+    rendering the link itself or showing the 6-digit code."""
+    if not uri:
+        return None
+    snippet = (
+        "import sys,io,qrcode\n"
+        "q=qrcode.QRCode(border=1)\n"
+        "q.add_data(sys.argv[1]); q.make(fit=True)\n"
+        "b=io.StringIO(); q.print_ascii(out=b, invert=True); sys.stdout.write(b.getvalue())\n"
+    )
+    for py in python_bins:
+        if not py:
+            continue
+        try:
+            r = subprocess.run([py, "-c", snippet, uri], capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.rstrip("\n")
+    return None
 
 
 def _pair_env() -> dict:
@@ -1899,7 +1938,8 @@ def install_openclaw_agent(t: dict, args) -> int:
         note = ("the OpenClaw gateway didn't auto-start — have the user run "
                 "`openclaw gateway run` (or `docker restart openclaw-gateway`) so messages flow")
     _emit("installer_pkg_installed", {"plugin_package": OPENCLAW_PKG, "source": "github", "ref": oc_ref, "mode": "agent"}, dest="openclaw")
-    return agent_success("OpenClaw", code, qr, logpath, note)
+    qr_ascii = _render_ascii_qr(qr, [shutil.which("python3"), "python3"])
+    return agent_success("OpenClaw", code, qr, logpath, note, qr_ascii=qr_ascii)
 
 
 def install_hermes_agent(t: dict, args) -> int:
@@ -1947,7 +1987,8 @@ def install_hermes_agent(t: dict, args) -> int:
     note = ("once the user enters the code, pairing finishes and I auto-(re)start the Hermes gateway "
             "so it loads chat4000 and invites them — the bot may blip for a few seconds during that restart")
     _emit("installer_pkg_installed", {"plugin_ref": args.ref, "mode": "agent"}, dest="hermes")
-    return agent_success("Hermes", code, qr, logpath, note)
+    qr_ascii = _render_ascii_qr(qr, [venv_python])
+    return agent_success("Hermes", code, qr, logpath, note, qr_ascii=qr_ascii)
 
 
 def run_agent_mode(args) -> int:
