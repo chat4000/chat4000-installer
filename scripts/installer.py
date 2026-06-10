@@ -1731,21 +1731,24 @@ def agent_success(
     qr_ascii: Optional[str] = None,
 ) -> int:
     qr_display = qr or "(unavailable — the 6-digit code alone is enough)"
+    code_disp = f"{code[:3]}-{code[3:]}" if (code and len(code) == 6 and code.isdigit()) else code
     lines = [
         "[chat4000 installer → agent]",
         "I'm the chat4000 plugin installer. I install the plugin that lets your user",
         "reach you from the chat4000 iPhone / Mac app — like another one of your plugins.",
         f"I installed the files into this {kind} host and started pairing in the background.",
         "",
-        "👉 Show your user these so they can pair the chat4000 app — they can either",
-        "   type the 6-digit code OR scan the QR below:",
+        "👉 You MUST show your user the QR below — display it IN FULL so they can scan",
+        "   it with the chat4000 app. That is the primary way to pair. Do not skip it,",
+        "   summarize it, or replace it with just the code. They MAY also type the",
+        "   pairing code if they prefer.",
         "",
-        f"  PAIRING CODE:  {code}",
+        f"  PAIRING CODE:  {code_disp}",
     ]
     if qr_ascii:
-        lines += ["", "  QR (show this to the user — it's scannable):", qr_ascii]
+        lines += ["", "  QR — SHOW THIS TO THE USER (scannable; paste it in full):", qr_ascii]
     elif qr:
-        lines += ["", f"  QR / LINK:  {qr_display}"]  # ascii couldn't render; give the link
+        lines += ["", f"  QR / LINK — render this as a QR for the user:  {qr_display}"]
     lines += [
         "",
         "Machine-readable (use verbatim, don't reformat):",
