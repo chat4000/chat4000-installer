@@ -44,7 +44,11 @@ Privacy policy: https://chat4000.com/privacy
 Love, chat4000 ❤️
 ────────────────────────────────────────────────────────────────────────
 
+Every event carries a `mode` prop ("agent" when run with --agent, else "human");
+Sentry events carry a matching `mode` tag.
+
 PostHog events fired by this file (routed to the matching host's project):
+  - installer_agent_invoked              (only in --agent mode; dedicated marker)
   - installer_started                    {selected_kind?}
   - installer_environment_scan           {hermes_count, openclaw_count, total}  (→ both)
   - installer_agent_detected             {kind, agent_version, install_date,
@@ -273,6 +277,9 @@ _TELEMETRY_DISABLED = (
 def _base_props() -> dict:
     enriched = {
         "source": "chat4000-installer",
+        # Stamp EVERY event with how the installer was invoked, so agent-driven
+        # installs (--agent) are cleanly separable from human ones in analytics.
+        "mode": "agent" if _AGENT_MODE else "human",
         "installer_version": INSTALLER_VERSION,
         "python_version": (
             f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
@@ -429,6 +436,7 @@ def _send_sentry_one(dsn: str, exc: BaseException, *, kind: str, tags: Optional[
             "environment": os.environ.get("CHAT4000_ENV") or os.environ.get("HERMES_ENV") or "production",
             "tags": {
                 "installer": "merged",
+                "mode": "agent" if _AGENT_MODE else "human",
                 "host_kind": kind,
                 "python_version": (
                     f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
@@ -1993,7 +2001,10 @@ def install_hermes_agent(t: dict, args) -> int:
 
 def run_agent_mode(args) -> int:
     """`--agent`: terse, machine-addressed install for an agent caller."""
-    _emit("installer_started", {"mode": "agent", "env": os.environ.get("CHAT4000_ENV", "production")}, dest="both")
+    # Dedicated, easy-to-funnel marker that this run was agent-driven (every other
+    # event also carries mode="agent" via _base_props, but this one is explicit).
+    _emit("installer_agent_invoked", {"env": os.environ.get("CHAT4000_ENV", "production")}, dest="both")
+    _emit("installer_started", {"env": os.environ.get("CHAT4000_ENV", "production")}, dest="both")
     if args.uninstall or args.reset:
         return agent_error("starting", "--uninstall / --reset aren't supported in --agent mode; run the installer normally for those.")
 
