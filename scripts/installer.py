@@ -71,13 +71,11 @@ import contextlib
 import json
 import os
 import platform
-import random
 import re
 import shlex
 import shutil
 import subprocess
 import sys
-import threading
 import time
 import urllib.error
 import urllib.request
@@ -1749,16 +1747,21 @@ def agent_success(
         f"  PAIRING CODE:  {code_disp}",
     ]
     if pair_url:
-        lines.append(f"  TAP-TO-PAIR LINK:  {pair_url}")
+        lines.append(f"  PAIR-THIS-DEVICE LINK:  `{pair_url}`")
     lines += [
         "",
         "👉 You MUST show the QR below to the user — display it IN FULL so they can scan",
         "   it. Do not skip it, summarize it, or replace it with just the code/link.",
-        "👉 Send the tap-to-pair link as PLAIN TEXT with NO link preview/unfurl (turn the",
-        "   preview card OFF). Keep the FULL code in the URL exactly as given — it's a",
-        "   short-lived pairing code, NOT a secret, so never mask, star, or shorten it",
-        "   (never send 'code=***').",
     ]
+    if pair_url:
+        lines += [
+            "👉 Send the pair link WRAPPED IN BACKTICKS (a code span), exactly like this:",
+            f"     `{pair_url}`",
+            "   Telegram does NOT show a link-preview card for a code span (it would for a",
+            "   bare link). The user taps it to COPY, then opens it. Keep the FULL code in",
+            "   the URL exactly as given — it's a short-lived pairing code, NOT a secret, so",
+            "   never mask, star, or shorten it (never send 'code=***').",
+        ]
     if qr_ascii:
         lines += ["", "  QR — SHOW THIS TO THE USER (scannable; paste it in full):", qr_ascii]
     elif qr:
@@ -1892,94 +1895,6 @@ def spawn_detached_pair(cmd: list, env: dict, post_success_sh: Optional[str] = N
     return (None, None, logpath, f"pairing didn't print a code within {int(PAIR_EMIT_TIMEOUT)}s (log: {logpath})")
 
 
-# 20 fun facts to keep the user company while the install runs. Kept short,
-# safe, and broadly delightful — the ticker / preamble hands the agent a random
-# one to relay.
-FUN_FACTS = [
-    "Octopuses have three hearts and blue blood.",
-    "Honey never spoils — archaeologists have eaten 3,000-year-old honey.",
-    "A day on Venus is longer than a year on Venus.",
-    "Bananas are berries, but strawberries aren't.",
-    "Wombat poop is cube-shaped.",
-    "The Eiffel Tower can be ~15 cm taller in summer as the metal expands.",
-    "Sharks are older than trees — by about 50 million years.",
-    "There are more possible games of chess than atoms in the observable universe.",
-    "A group of flamingos is called a 'flamboyance'.",
-    "Hot water can freeze faster than cold water (the Mpemba effect).",
-    "Sea otters hold hands while sleeping so they don't drift apart.",
-    "The shortest war in history lasted about 38 minutes.",
-    "Your stomach grows a new lining every few days so it doesn't digest itself.",
-    "Cleopatra lived closer in time to the Moon landing than to the Great Pyramid.",
-    "A bolt of lightning is about five times hotter than the surface of the Sun.",
-    "Cows have best friends and get stressed when they're separated.",
-    "The dot over a lowercase 'i' or 'j' is called a tittle.",
-    "Scotland's national animal is the unicorn.",
-    "Bubble wrap was originally invented as wallpaper.",
-    "Hummingbirds are the only birds that can fly backwards.",
-]
-
-
-def _agent_preamble() -> None:
-    """Printed FIRST, before the slow install, so that — if the agent streams our
-    output — it can tell the user something's happening and keep them company.
-    Best-effort: if the agent only reads our output once we exit, this just
-    precedes the final block."""
-    fact = random.choice(FUN_FACTS)
-    _agent_print(
-        [
-            "[chat4000 installer → agent]",
-            "Heads up — I'm setting up the chat4000 plugin now. This can take up to a",
-            "minute (download + install). RIGHT NOW, before I finish, send your user a",
-            "short message so they're not left hanging — for example:",
-            '   "Installing chat4000 — about a minute. I\'ll send you a QR to pair as soon',
-            '    as it\'s ready 🛠"',
-            "While they wait, keep them company: every ~15s send a quick 'still on it ⏳'",
-            "with a fun fact. Here's one to start with:",
-            f"   • {fact}",
-            "(More progress + facts follow below as I work. Don't link-preview any URLs.)",
-            "",
-        ]
-    )
-
-
-class _AgentTicker:
-    """While a slow step runs, print a progress note + a fresh fun fact every ~15s
-    for the agent to relay. Only surfaces to the user mid-wait if the agent streams
-    our stdout; harmless (just precedes the final block) otherwise."""
-
-    def __init__(self, interval: float = 15.0) -> None:
-        self.interval = interval
-        self._stop = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-        self._facts = random.sample(FUN_FACTS, len(FUN_FACTS))
-
-    def _run(self) -> None:
-        i = 0
-        elapsed = 0
-        while not self._stop.wait(self.interval):
-            elapsed += int(self.interval)
-            fact = self._facts[i % len(self._facts)]
-            i += 1
-            _agent_print(
-                [
-                    f"[chat4000 installer → agent]  still working ({elapsed}s) — send your user",
-                    "a quick 'still on it ⏳' with this fun fact:",
-                    f"   • {fact}",
-                    "",
-                ]
-            )
-
-    def __enter__(self) -> "_AgentTicker":
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        return self
-
-    def __exit__(self, *exc) -> None:
-        self._stop.set()
-        if self._thread is not None:
-            self._thread.join(timeout=1.0)
-
-
 def _hermes_gateway_reload_sh(hermes_bin: str) -> str:
     """Shell run by the detached pair wrapper ONLY after a successful pair: make
     the gateway load chat4000 so it invites the freshly-paired user. Hermes has
@@ -2011,28 +1926,21 @@ fi
 def install_openclaw_agent(t: dict, args) -> int:
     oc = t["bin"]
     oc_ref = args.plugin_version or args.ref
-    _agent_preamble()
-    # Install + onboard are the slow part — run them under the progress ticker, and
-    # only report a failure AFTER the ticker stops (so output never interleaves).
-    fail = None  # (stage, detail) of the first failing step
-    with _AgentTicker():
-        success, _spec, tail = openclaw_install_plugin(oc, oc_ref, force=True, quiet=True)
-        if not success:
-            fail = (f"installing the OpenClaw plugin from GitHub @{oc_ref}", tail or "no output")
-        if fail is None:
-            # Onboard the bot identity — no phone needed (--self-redeem), no pairing yet.
-            setup_cmd = [oc, "chat4000", "setup", "--self-redeem", "--no-pair"]
-            if args.stage:
-                setup_cmd.append("--stage")
-            elif args.env:
-                setup_cmd += ["--env", args.env]
-            if args.service_token:
-                setup_cmd += ["--service-token", args.service_token]
-            r = subprocess.run(setup_cmd, capture_output=True, text=True)
-            if r.returncode != 0:
-                fail = ("onboarding the plugin identity", ((r.stdout or "") + (r.stderr or "")).strip())
-    if fail is not None:
-        return agent_error(*fail)
+    # 1. Install the plugin from the GitHub ref (quiet).
+    success, _spec, tail = openclaw_install_plugin(oc, oc_ref, force=True, quiet=True)
+    if not success:
+        return agent_error(f"installing the OpenClaw plugin from GitHub @{oc_ref}", tail or "no output")
+    # 2. Onboard the bot identity — no phone needed (--self-redeem), no pairing yet.
+    setup_cmd = [oc, "chat4000", "setup", "--self-redeem", "--no-pair"]
+    if args.stage:
+        setup_cmd.append("--stage")
+    elif args.env:
+        setup_cmd += ["--env", args.env]
+    if args.service_token:
+        setup_cmd += ["--service-token", args.service_token]
+    r = subprocess.run(setup_cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return agent_error("onboarding the plugin identity", ((r.stdout or "") + (r.stderr or "")).strip())
     # 3. Start device pairing DETACHED and capture the code.
     pair_cmd = [oc, "chat4000", "pair"]
     if args.stage:
@@ -2059,38 +1967,31 @@ def install_hermes_agent(t: dict, args) -> int:
     venv_bin = t["venv_bin"]
     venv_python = t["venv_python"]
     chat4000 = f"{venv_bin}/chat4000"
-    _agent_preamble()
-    # Install + import-check + prepare are the slow part — run under the progress
-    # ticker, and report any failure AFTER it stops so output never interleaves.
-    fail = None  # (stage, detail) of the first failing step
-    with _AgentTicker():
-        uv = detect_uv()
-        try:
-            if uv:
-                hermes_install_via_uv(uv, venv_python, args.ref, capture=True)
-            else:
-                hermes_install_via_pip(venv_python, args.ref, capture=True)
-        except subprocess.CalledProcessError as exc:
-            out = getattr(exc, "stderr", None) or getattr(exc, "stdout", None) or ""
-            if isinstance(out, bytes):
-                out = out.decode("utf-8", "ignore")
-            fail = (f"installing the Hermes plugin from GitHub @{args.ref}", out or str(exc))
-        if fail is None:
-            chk = subprocess.run([venv_python, "-c", "import chat4000_hermes_plugin"], capture_output=True, text=True)
-            if chk.returncode != 0:
-                fail = ("verifying the installed plugin imports", (chk.stderr or "").strip())
-        if fail is None:
-            symlink_chat4000_onto_path(venv_bin)
-            # `prepare` is pre-restart prep — it does NOT restart the gateway, so it
-            # can't kill an agent running us.
-            prep_cmd = [chat4000, "prepare"]
-            if args.stage:
-                prep_cmd.append("--stage")
-            r = subprocess.run(prep_cmd, capture_output=True, text=True)
-            if r.returncode != 0:
-                fail = ("preparing the Hermes plugin (enable + onboard)", ((r.stdout or "") + (r.stderr or "")).strip())
-    if fail is not None:
-        return agent_error(*fail)
+    # 1. Install the plugin from the GitHub ref (quiet).
+    uv = detect_uv()
+    try:
+        if uv:
+            hermes_install_via_uv(uv, venv_python, args.ref, capture=True)
+        else:
+            hermes_install_via_pip(venv_python, args.ref, capture=True)
+    except subprocess.CalledProcessError as exc:
+        out = getattr(exc, "stderr", None) or getattr(exc, "stdout", None) or ""
+        if isinstance(out, bytes):
+            out = out.decode("utf-8", "ignore")
+        return agent_error(f"installing the Hermes plugin from GitHub @{args.ref}", out or str(exc))
+    # 2. Import-check.
+    chk = subprocess.run([venv_python, "-c", "import chat4000_hermes_plugin"], capture_output=True, text=True)
+    if chk.returncode != 0:
+        return agent_error("verifying the installed plugin imports", (chk.stderr or "").strip())
+    symlink_chat4000_onto_path(venv_bin)
+    # 3. Enable the plugin + onboard identity. `prepare` is pre-restart prep — it
+    #    does NOT restart the gateway, so it can't kill an agent running us.
+    prep_cmd = [chat4000, "prepare"]
+    if args.stage:
+        prep_cmd.append("--stage")
+    r = subprocess.run(prep_cmd, capture_output=True, text=True)
+    if r.returncode != 0:
+        return agent_error("preparing the Hermes plugin (enable + onboard)", ((r.stdout or "") + (r.stderr or "")).strip())
     # 4. Start device pairing DETACHED. When it COMPLETES (the user redeems), the
     #    detached wrapper (re)starts the gateway so it loads chat4000 and invites
     #    the just-paired user. This can't race the relay: a redeem only happens
