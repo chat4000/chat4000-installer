@@ -147,8 +147,8 @@ INSTALLER_VERSION = "1.0.0"
 CELEBRATION_GIF_URL = "https://chat4000.com/gifs/celebration.gif"
 
 # First-party QR-image endpoint: GET it with a pairing code, get back a PNG QR of
-# the canonical pairing payload. The agent posts ![](this) so Telegram renders a
-# scannable image. Contract in docs/qr-endpoint-spec.md. MUST be first-party — a
+# the canonical pairing payload (chat4000://pair?code=<code>). The agent posts
+# ![](this) so Telegram renders a scannable image. MUST be first-party — a
 # 3rd-party QR API would receive (and could redeem) the live pairing code.
 QR_IMAGE_URL_TEMPLATE = "https://pair.chat4000.com/qr?code={code}"
 
@@ -1835,9 +1835,9 @@ def agent_success(
 ) -> int:
     code_disp = f"{code[:3]}-{code[3:]}" if (code and len(code) == 6 and code.isdigit()) else code
     pair_url = f"https://pair.chat4000.com/?code={code}" if code else None
-    # First-party QR-image endpoint (see docs/qr-endpoint-spec.md): returns a PNG
-    # QR for this code. The agent posts it as image-markdown → Telegram renders a
-    # clean, scannable image (the old ASCII QR was unscannable in Telegram).
+    # First-party QR-image endpoint: returns a PNG QR for this code. The agent
+    # posts it as image-markdown → Telegram renders a clean, scannable image (the
+    # old ASCII QR was unscannable in Telegram).
     qr_img_url = QR_IMAGE_URL_TEMPLATE.format(code=code) if code else None
     lines = [
         "[chat4000 installer → agent]",
