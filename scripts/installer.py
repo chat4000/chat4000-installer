@@ -2232,6 +2232,8 @@ def run_agent_mode(args) -> int:
                 "",
             ]
         )
+
+    targets = build_targets(args)
     # Silent scan: collect stats + fire analytics, print nothing.
     for t in targets:
         try:
@@ -2386,16 +2388,22 @@ def _entry() -> int:
     try:
         return main()
     except KeyboardInterrupt:
+        _emit("installer_cancelled", {"stage": "uncaught"})
+        if _AGENT_MODE:
+            return agent_error("running — the installer process was interrupted", "KeyboardInterrupt")
         print()
         warn("Install cancelled.")
-        _emit("installer_cancelled", {"stage": "uncaught"})
         return 130
     except SystemExit:
         raise
     except BaseException as exc:  # noqa: BLE001  # installer top-level boundary: reports to its own sinks, then exits
-        err(f"Installer crashed unexpectedly: {type(exc).__name__}: {exc}")
         _emit("installer_crashed", {"error_class": type(exc).__name__, "error_msg": str(exc)[:200]})
         send_sentry_envelope(exc, tags={"crash_stage": "uncaught"})
+        if _AGENT_MODE:
+            # err()/warn() are muted in agent mode — without this, a crash exits 1
+            # in total silence and the agent gets no final block at all.
+            return agent_error("running — I crashed unexpectedly", f"{type(exc).__name__}: {exc}")
+        err(f"Installer crashed unexpectedly: {type(exc).__name__}: {exc}")
         err("Crash report sent. If this keeps happening, please open an issue at:")
         err("  https://github.com/chat4000/chat4000-installer/issues")
         return 1
