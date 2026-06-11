@@ -1730,20 +1730,28 @@ def agent_success(
     note: Optional[str] = None,
     qr_ascii: Optional[str] = None,
 ) -> int:
-    qr_display = qr or "(unavailable — the 6-digit code alone is enough)"
+    qr_display = qr or "(unavailable — the code or pair link is enough)"
     code_disp = f"{code[:3]}-{code[3:]}" if (code and len(code) == 6 and code.isdigit()) else code
+    pair_url = f"https://chat4000.com/pair?code={code}" if code else None
     lines = [
         "[chat4000 installer → agent]",
         "I'm the chat4000 plugin installer. I install the plugin that lets your user",
         "reach you from the chat4000 iPhone / Mac app — like another one of your plugins.",
         f"I installed the files into this {kind} host and started pairing in the background.",
         "",
-        "👉 You MUST show your user the QR below — display it IN FULL so they can scan",
-        "   it with the chat4000 app. That is the primary way to pair. Do not skip it,",
-        "   summarize it, or replace it with just the code. They MAY also type the",
-        "   pairing code if they prefer.",
+        "Tell your user the installer ran, then give them ALL THREE ways to pair:",
+        "  • SCAN the QR below with the chat4000 app, or",
+        "  • TYPE the pairing code into the app, or",
+        "  • if they're reading this ON the device they want to pair, just TAP the link.",
         "",
         f"  PAIRING CODE:  {code_disp}",
+    ]
+    if pair_url:
+        lines.append(f"  PAIR THIS DEVICE (tap this if you're on the device you want to pair):  {pair_url}")
+    lines += [
+        "",
+        "👉 You MUST show the QR below to the user — display it IN FULL so they can scan",
+        "   it. Do not skip it, summarize it, or replace it with just the code/link.",
     ]
     if qr_ascii:
         lines += ["", "  QR — SHOW THIS TO THE USER (scannable; paste it in full):", qr_ascii]
@@ -1751,15 +1759,8 @@ def agent_success(
         lines += ["", f"  QR / LINK — render this as a QR for the user:  {qr_display}"]
     lines += [
         "",
-        "Machine-readable (use verbatim, don't reformat):",
-        f"  CODE={code}",
-    ]
-    if qr:
-        lines.append(f"  QR={qr}")
-    lines += [
-        "",
-        "The code/QR are valid for ~5 minutes. Pairing completes on its own the moment",
-        "they enter the code or scan the QR — you don't need to wait or run anything else.",
+        "Valid for ~5 minutes. After they scan, type, or tap, pairing completes on its",
+        "own — you don't need to wait or run anything else.",
     ]
     if note:
         lines += ["", f"NOTE: {note}"]
