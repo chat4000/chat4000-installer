@@ -1828,15 +1828,17 @@ def agent_success(
         "reach you from the chat4000 iPhone / Mac app — like another one of your plugins.",
         f"I installed the files into this {kind} host and started pairing in the background.",
         "",
-        "Tell your user the installer ran, then give them ALL THREE ways to pair:",
-        "  • SCAN the QR below with the chat4000 app, or",
-        "  • TYPE the pairing code into the app, or",
-        "  • if they're reading this ON the device they want to pair, just TAP the link.",
+        "Tell your user the installer ran, then give them ALL THREE ways to pair.",
+        "Format it nicely with icons/emoji (e.g. 📱 scan · 🔢 code · 🔗 link) so it's",
+        "friendly and easy to read:",
+        "  • 📱 SCAN the QR below with the chat4000 app, or",
+        "  • 🔢 TYPE the pairing code into the app, or",
+        "  • 🔗 if they're reading this ON the device to pair, just TAP the link.",
         "",
-        f"  PAIRING CODE:  {code_disp}",
+        f"  🔢 PAIRING CODE:  {code_disp}",
     ]
     if pair_url:
-        lines.append(f"  PAIR-THIS-DEVICE LINK:  {pair_url}")
+        lines.append(f"  🔗 PAIR-THIS-DEVICE LINK:  {pair_url}")
     lines += [
         "",
         "👉 You MUST show the QR below to the user — display it IN FULL so they can scan",
@@ -1849,8 +1851,11 @@ def agent_success(
             f"   (or a proper Markdown link), exactly like:  {pair_url}",
             "   DO NOT wrap it in backticks, a code span, or a code block — that renders as",
             "   non-clickable monospace text and DEFEATS THE PURPOSE. It has to be tappable.",
-            "   Keep the FULL code in the URL exactly as given — it's a short-lived pairing",
-            "   code, NOT a secret, so never mask, star, or shorten it (never 'code=***').",
+            "⚠ CRITICAL: the code INSIDE the link is the 6 RAW DIGITS — NO dash, NO space",
+            f"   ({code}). You DISPLAY the pairing code dashed ({code_disp}), but the URL",
+            f"   must stay EXACTLY {pair_url}. A dashed code in the link (code={code_disp})",
+            "   is BROKEN and will NOT pair. Copy the URL character-for-character; never",
+            "   mask, star, or shorten the code either (never 'code=***').",
         ]
     if qr_ascii:
         lines += ["", "  QR — SHOW THIS TO THE USER (scannable; paste it in full):", qr_ascii]
