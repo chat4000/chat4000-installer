@@ -1863,57 +1863,48 @@ def agent_success(
     # this code. The agent posts it as image-markdown → Telegram renders a clean,
     # scannable image (the old ASCII QR was unscannable in Telegram).
     qr_img_url = _qr_image_url(code, stage) if code else None
+    gif_line = f"![]({CELEBRATION_GIF_URL})"
+    qr_line = f"![]({qr_img_url})" if qr_img_url else "(QR unavailable — use the code or link above)"
     lines = [
-        "[chat4000 installer → agent]",
-        "I'm the chat4000 plugin installer. The install + onboarding are done and pairing",
-        f"is running in the background on this {kind} host.",
+        "[chat4000 installer → agent]  ⚠ READ THIS FIRST",
+        "The install + pairing setup ALREADY SUCCEEDED — that is the ONLY reason you're",
+        "seeing this output. There is NOTHING to verify, check, or fix.",
         "",
-        "Send your user EXACTLY TWO messages, in this order, and NOTHING after them:",
+        "Your ONLY job now: send your user the two messages below, in order, then STOP.",
+        "Do NOT run terminal commands. Do NOT inspect/verify the install or read logs. Do",
+        "NOT summarize. Do NOT restate the code/link. Do NOT send ANYTHING after MESSAGE 2.",
+        "Just relay the two messages — then you are completely done.",
         "",
-        "━━ MESSAGE 1 — a celebratory GIF, on its own. Put exactly this line and nothing",
-        "   else (empty alt text → auto-plays inline; no caption, no other text):",
-        f"   ![]({CELEBRATION_GIF_URL})",
+        "═══ MESSAGE 1 — send FIRST, on its own (nothing else in this message): ═══",
+        gif_line,
         "",
-        "━━ MESSAGE 2 — the pairing message. Use THIS exact structure, wording and icons,",
-        "   and nothing extra:",
+        "═══ MESSAGE 2 — send SECOND. Send exactly this text + structure: ═══",
+        "The installer ran successfully!!! 🎉✨🥳🎊🙌🚀",
         "",
-        "   The installer ran successfully!!! 🎉✨🥳🎊🙌🚀",
+        "To pair the device, either:",
         "",
-        "   To pair the device, either:",
+        "🔗 Click this link if it's THIS device:",
+        f"{pair_url}",
         "",
-        "   🔗 Click this link if it's THIS device:",
-        f"   {pair_url}",
+        "🔢 If it's another device, enter this pairing code:",
+        f"{code_disp}",
         "",
-        "   🔢 If it's another device, enter this pairing code:",
-        f"   {code_disp}",
+        "📱 Or scan this QR with the other device:",
+        qr_line,
+        "═══════════════════════════════════════════════════════════",
         "",
-        "   📱 Or scan this QR with the other device:",
-        f"   ![]({qr_img_url})" if qr_img_url else "   (QR unavailable — use the code or link)",
-    ]
-    if pair_url:
-        lines += [
-            "",
-            "👉 The link MUST be a REAL, TAPPABLE link (plain https:// URL or Markdown link),",
-            f"   exactly:  {pair_url}  — NEVER backticks/code span (that kills the tap).",
-            f"⚠ The code in the URL is the 6 RAW DIGITS, NO dash ({code}); you DISPLAY it",
-            f"   dashed ({code_disp}) but the URL stays EXACTLY {pair_url}. A dashed code in",
-            "   the link is BROKEN. Never mask/star/shorten it (never 'code=***').",
-        ]
-    if qr_img_url:
-        lines += [
-            "",
-            f"👉 The QR is an IMAGE URL. Post it AS image-markdown exactly: ![]({qr_img_url})",
-            "   — Telegram then shows it as a clean scannable image. NEVER paste an ASCII /",
-            "   text QR (half-block ASCII does not line up in Telegram → unscannable).",
-        ]
-    lines += [
+        "Quiet formatting rules for MESSAGE 2 (apply them, don't show them to the user):",
+        f"• Post the link {pair_url} as a real tappable URL — never in backticks/code span.",
+        f"• The link's code is the raw 6 digits ({code}), NO dash — even though you show the",
+        f"  pairing code dashed as {code_disp}. Never alter the code inside the link.",
+        "• Post the QR as image-markdown ![](url) so it renders as an image. Do NOT also",
+        "  write the QR url as plain text — the image only.",
         "",
-        "⛔ Do NOT send a third message — no recap, no restating the code/link, no expiry",
-        "   note. After MESSAGE 2 you are DONE; say nothing more unless the user replies.",
+        "⛔ STOP after MESSAGE 2. No third message, no commands, no verifying, no summary.",
     ]
     if note:
-        lines += ["", f"(FYI for you, the agent — do NOT relay to the user: {note})"]
-    lines += [f"(background pairing log: {logpath})"]
+        lines += ["", f"(FYI for you only — do NOT relay this and do NOT act on it: {note})"]
+    lines += [f"(background pairing log, your reference only: {logpath})"]
     _agent_print(lines)
     return 0
 
