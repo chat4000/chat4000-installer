@@ -141,6 +141,11 @@ SENTRY_DSN = "https://41cf740535c8a5a722cc1a13f090ea8d@sentry.chat4000.com/2"
 INSTALLER_RELEASE = "chat4000-installer@1.0.0"
 INSTALLER_VERSION = "1.0.0"
 
+# Celebratory GIF the agent posts after a successful agent-mode install. Must be a
+# .gif URL — Hermes' reply pipeline only auto-routes .gif (image-markdown) to
+# Telegram send_animation (auto-plays inline); .mp4 URLs are NOT picked up.
+CELEBRATION_GIF_URL = "https://chat4000.com/gifs/celebration.gif"
+
 _STARTED_AT_MS = int(time.time() * 1000)
 
 # ─── ANSI ─────────────────────────────────────────────────────────────────
@@ -1862,6 +1867,11 @@ def agent_success(
     elif qr:
         lines += ["", f"  QR / LINK — render this as a QR for the user:  {qr_display}"]
     lines += [
+        "",
+        "🎉 Then send your user a celebratory GIF — include this EXACT line in your reply",
+        f"   so it auto-plays as an animation:  ![celebration]({CELEBRATION_GIF_URL})",
+        "   Post it as image-markdown exactly like that (the ![](...) form) — that's what",
+        "   makes it play inline. Don't describe it, don't paste it as a plain text link.",
         "",
         "Valid for ~5 minutes. After they scan, type, or tap, pairing completes on its",
         "own — you don't need to wait or run anything else.",
