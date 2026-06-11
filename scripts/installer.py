@@ -134,12 +134,10 @@ POSTHOG = {
     "url": "https://posthog.chat4000.com/capture/",
 }
 
-# Sentry DSNs — one per host, matching each plugin's runtime telemetry project.
-# Public-by-design (write-only ingestion endpoints, not secrets).
-SENTRY_DSN = {
-    "hermes": "https://ac3dabffdf2c91c9c90a87cd9b258908@o4511305222193152.ingest.us.sentry.io/4511433133129728",
-    "openclaw": "https://ca71dd0ea0a2740ec9ced9774c780197@o4511305222193152.ingest.us.sentry.io/4511305367289856",
-}
+# Single self-hosted Sentry — the same DSN the chat4000 plugins ship with
+# (sentry.chat4000.com, project 2). One project for everything, mirroring the
+# single PostHog destination (IN4). Public-by-design (write-only ingestion).
+SENTRY_DSN = "https://41cf740535c8a5a722cc1a13f090ea8d@sentry.chat4000.com/2"
 INSTALLER_RELEASE = "chat4000-installer@1.0.0"
 INSTALLER_VERSION = "1.0.0"
 
@@ -468,17 +466,15 @@ def _emit(event: str, props: Optional[dict] = None, *, distinct_id: Optional[str
 # ─── Sentry (stdlib envelope POST, no SDK) ────────────────────────────────
 
 
-def send_sentry_envelope(exc: BaseException, *, kind: str = "both", tags: Optional[dict] = None) -> None:
-    """Post a Sentry envelope describing `exc` to one host's DSN (or both).
+def send_sentry_envelope(exc: BaseException, *, tags: Optional[dict] = None) -> None:
+    """Post a Sentry envelope describing `exc` to the single self-hosted Sentry.
     Stdlib only; best-effort; strips home paths + obvious secrets first."""
     if _TELEMETRY_DISABLED:
         return
-    kinds = ("hermes", "openclaw") if kind == "both" else (kind,)
-    for k in kinds:
-        _send_sentry_one(SENTRY_DSN.get(k, ""), exc, kind=k, tags=tags)
+    _send_sentry_one(SENTRY_DSN, exc, tags=tags)
 
 
-def _send_sentry_one(dsn: str, exc: BaseException, *, kind: str, tags: Optional[dict]) -> None:
+def _send_sentry_one(dsn: str, exc: BaseException, *, tags: Optional[dict]) -> None:
     if not dsn:
         return
     try:
@@ -517,7 +513,6 @@ def _send_sentry_one(dsn: str, exc: BaseException, *, kind: str, tags: Optional[
             "tags": {
                 "installer": "merged",
                 "mode": "agent" if _AGENT_MODE else "human",
-                "host_kind": kind,
                 "python_version": (
                     f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
                 ),
@@ -2281,7 +2276,7 @@ def _entry() -> int:
     except BaseException as exc:  # noqa: BLE001  # installer top-level boundary: reports to its own sinks, then exits
         err(f"Installer crashed unexpectedly: {type(exc).__name__}: {exc}")
         _emit("installer_crashed", {"error_class": type(exc).__name__, "error_msg": str(exc)[:200]})
-        send_sentry_envelope(exc, kind="both", tags={"crash_stage": "uncaught"})
+        send_sentry_envelope(exc, tags={"crash_stage": "uncaught"})
         err("Crash report sent. If this keeps happening, please open an issue at:")
         err("  https://github.com/chat4000/chat4000-installer/issues")
         return 1
