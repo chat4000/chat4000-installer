@@ -146,6 +146,12 @@ INSTALLER_VERSION = "1.0.0"
 # Telegram send_animation (auto-plays inline); .mp4 URLs are NOT picked up.
 CELEBRATION_GIF_URL = "https://chat4000.com/gifs/celebration.gif"
 
+# First-party QR-image endpoint: GET it with a pairing code, get back a PNG QR of
+# the canonical pairing payload. The agent posts ![](this) so Telegram renders a
+# scannable image. Contract in docs/qr-endpoint-spec.md. MUST be first-party — a
+# 3rd-party QR API would receive (and could redeem) the live pairing code.
+QR_IMAGE_URL_TEMPLATE = "https://pair.chat4000.com/qr?code={code}"
+
 _STARTED_AT_MS = int(time.time() * 1000)
 
 # ─── ANSI ─────────────────────────────────────────────────────────────────
@@ -1792,6 +1798,10 @@ def prompt_manual_target(args) -> Optional[list]:
 # pass on. Everything the caller sees goes through agent_success/agent_error.
 
 PAIR_EMIT_TIMEOUT = 60.0  # seconds to wait for the detached pair child to print its code
+# Seconds the detached gateway-reload waits before bouncing the Hermes gateway —
+# long enough for the agent to relay the code (+GIF) to the user first, since the
+# restart kills the gateway that IS the relaying agent.
+GATEWAY_RELOAD_DELAY_S = 30
 _QR_RE = re.compile(r"(chat4000://pair\?\S+)")
 _CODE_IN_URI_RE = re.compile(r"[?&]code=(\d+)")
 _CODE_LINE_RE = re.compile(r"[Pp]airing code:\s*([0-9][0-9 ]{3,})")
@@ -1825,7 +1835,10 @@ def agent_success(
 ) -> int:
     code_disp = f"{code[:3]}-{code[3:]}" if (code and len(code) == 6 and code.isdigit()) else code
     pair_url = f"https://pair.chat4000.com/?code={code}" if code else None
-    qr_payload = qr or pair_url or ""
+    # First-party QR-image endpoint (see docs/qr-endpoint-spec.md): returns a PNG
+    # QR for this code. The agent posts it as image-markdown → Telegram renders a
+    # clean, scannable image (the old ASCII QR was unscannable in Telegram).
+    qr_img_url = QR_IMAGE_URL_TEMPLATE.format(code=code) if code else None
     lines = [
         "[chat4000 installer → agent]",
         "I'm the chat4000 plugin installer. The install + onboarding are done and pairing",
@@ -1851,7 +1864,7 @@ def agent_success(
         f"   {code_disp}",
         "",
         "   📱 Or scan this QR with the other device:",
-        "   [the QR image — see the QR rule below]",
+        f"   ![]({qr_img_url})" if qr_img_url else "   (QR unavailable — use the code or link)",
     ]
     if pair_url:
         lines += [
@@ -1862,12 +1875,14 @@ def agent_success(
             f"   dashed ({code_disp}) but the URL stays EXACTLY {pair_url}. A dashed code in",
             "   the link is BROKEN. Never mask/star/shorten it (never 'code=***').",
         ]
+    if qr_img_url:
+        lines += [
+            "",
+            f"👉 The QR is an IMAGE URL. Post it AS image-markdown exactly: ![]({qr_img_url})",
+            "   — Telegram then shows it as a clean scannable image. NEVER paste an ASCII /",
+            "   text QR (half-block ASCII does not line up in Telegram → unscannable).",
+        ]
     lines += [
-        "",
-        "👉 QR: render it as an IMAGE and send it inline. DO NOT paste the QR as ASCII,",
-        "   text, or a code block — half-block ASCII does NOT line up in Telegram and",
-        "   comes out unscannable. The QR must encode EXACTLY this:",
-        f"   {qr_payload}",
         "",
         "⛔ Do NOT send a third message — no recap, no restating the code/link, no expiry",
         "   note. After MESSAGE 2 you are DONE; say nothing more unless the user replies.",
@@ -1887,43 +1902,21 @@ def _pair_env() -> dict:
     return env
 
 
-def spawn_detached_pair(cmd: list, env: dict, post_success_sh: Optional[str] = None) -> tuple:
+def spawn_detached_pair(cmd: list, env: dict) -> tuple:
     """Start the pair command DETACHED (own session, output → a /tmp log), then
     tail the log until it prints the pairing code + QR. Returns
     (code, qr_uri, logpath, error). On success the child keeps running (polling
     the registrar for the rest of its TTL) after we return — we never wait on it,
-    which is the whole point: this process exits while pairing continues.
-
-    If `post_success_sh` is given, the detached child becomes a wrapper that runs
-    the pair command and, ONLY if it exits 0 (the device actually paired), runs
-    that shell. On Hermes that shell (re)starts the gateway so it loads chat4000
-    and invites the just-paired user. Crucially the restart fires AFTER a redeem,
-    which can only happen after the user got the code we hand back — so it can
-    never race the agent's relay of that code."""
+    which is the whole point: this process exits while pairing continues."""
     logpath = f"/tmp/chat4000-pair-{uuid.uuid4().hex[:8]}.log"
     try:
         logf = open(logpath, "ab")  # noqa: SIM115  # handed to the child; we close our copy below
     except OSError as exc:
         return (None, None, None, f"could not open pairing log {logpath}: {exc}")
 
-    child_cmd = cmd
-    if post_success_sh:
-        # Stage the post-success shell as a TEMP FILE rather than inlining it, so
-        # the wrapper's own command line never contains the gateway match-pattern
-        # — otherwise `pkill -f 'hermes gateway'` inside it could match and kill
-        # the wrapper itself. A file's contents are not in any process's argv.
-        quoted = " ".join(shlex.quote(c) for c in cmd)
-        sh_path = f"/tmp/chat4000-postpair-{uuid.uuid4().hex[:8]}.sh"
-        try:
-            Path(sh_path).write_text("#!/usr/bin/env bash\n" + post_success_sh + '\nrm -f "$0"\n', encoding="utf-8")
-            os.chmod(sh_path, 0o700)
-            child_cmd = ["bash", "-c", f'{quoted}\nrc=$?\nif [ "$rc" -eq 0 ]; then bash {shlex.quote(sh_path)}; fi\n']
-        except OSError:
-            child_cmd = cmd  # couldn't stage the restart; still run the pairing itself
-
     try:
         proc = subprocess.Popen(
-            child_cmd,
+            cmd,
             stdout=logf,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
@@ -1972,15 +1965,15 @@ def spawn_detached_pair(cmd: list, env: dict, post_success_sh: Optional[str] = N
 
 
 def _hermes_gateway_reload_sh(hermes_bin: str) -> str:
-    """Shell run by the detached pair wrapper ONLY after a successful pair: make
-    the gateway load chat4000 so it invites the freshly-paired user. Hermes has
-    no hot-reload, so a gateway that booted BEFORE chat4000 was enabled must
-    restart to pick it up. We capture the running gateway's EXACT argv from
-    /proc and relaunch it identically (the live gateway runs as `hermes gateway`,
-    not `hermes gateway run`, so we don't guess the command), detached so it
-    outlives this wrapper. If a supervisor respawns it first, we don't double
-    start. The match pattern never appears in the wrapper's own argv (it's in a
-    temp file), so pkill can't kill the wrapper."""
+    """Shell that makes the gateway load chat4000: Hermes has no hot-reload, so a
+    gateway that booted BEFORE chat4000 was enabled must restart to pick it up. We
+    capture the running gateway's EXACT argv from /proc and relaunch it identically
+    (the live gateway runs as `hermes gateway`, NOT `hermes gateway run`, so we
+    don't guess the command — the wizard's run-only grep is the bug that left it
+    unrestarted), detached so it outlives us. If a supervisor respawns it first, we
+    don't double-start. Run from a temp file (see _spawn_detached_gateway_reload)
+    so the match pattern never appears in the caller's own argv → pkill can't
+    kill the reloader itself."""
     hb = shlex.quote(hermes_bin)
     return f"""sleep 3
 gpid=$(pgrep -f 'hermes gateway' 2>/dev/null | head -n1)
@@ -1997,6 +1990,32 @@ else
   setsid {hb} gateway run >/tmp/chat4000-gateway.log 2>&1 </dev/null &
 fi
 """
+
+
+def _spawn_detached_gateway_reload(hermes_bin: str, delay: int = GATEWAY_RELOAD_DELAY_S) -> None:
+    """Detached: after `delay`s (giving the agent time to relay the code + GIF
+    first), reload the Hermes gateway so it loads chat4000. Unconditional — the
+    gateway discovers plugins only at startup, so it must restart regardless of
+    whether/when the phone pairs, or a slow / expired / later-manual pair finds no
+    plugin loaded. The reload script lives in a temp file so its own argv never
+    contains the 'hermes gateway' pkill pattern (can't self-kill); it self-deletes."""
+    script = f"sleep {int(delay)}\n" + _hermes_gateway_reload_sh(hermes_bin)
+    sh_path = f"/tmp/chat4000-gwreload-{uuid.uuid4().hex[:8]}.sh"
+    try:
+        Path(sh_path).write_text("#!/usr/bin/env bash\n" + script + '\nrm -f "$0"\n', encoding="utf-8")
+        os.chmod(sh_path, 0o700)
+    except OSError:
+        return
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.Popen(
+            ["bash", sh_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,  # survives our exit AND the gateway it bounces
+            close_fds=True,
+            env=_pair_env(),
+        )
 
 
 def install_openclaw_agent(t: dict, args) -> int:
@@ -2069,21 +2088,24 @@ def install_hermes_agent(t: dict, args) -> int:
     r = subprocess.run(prep_cmd, capture_output=True, text=True)
     if r.returncode != 0:
         return agent_error("preparing the Hermes plugin (enable + onboard)", ((r.stdout or "") + (r.stderr or "")).strip())
-    # 4. Start device pairing DETACHED. When it COMPLETES (the user redeems), the
-    #    detached wrapper (re)starts the gateway so it loads chat4000 and invites
-    #    the just-paired user. This can't race the relay: a redeem only happens
-    #    after the user received the code we hand back below. And because the
-    #    restart is gated on pair SUCCESS, an expired/abandoned code never bounces
-    #    the gateway.
+    # 4. Start device pairing DETACHED, capture the code.
     pair_cmd = [chat4000, "pair"]
     if args.stage:
         pair_cmd.append("--stage")
-    reload_sh = _hermes_gateway_reload_sh(f"{venv_bin}/hermes")
-    code, qr, logpath, perr = spawn_detached_pair(pair_cmd, _pair_env(), post_success_sh=reload_sh)
+    code, qr, logpath, perr = spawn_detached_pair(pair_cmd, _pair_env())
     if not code:
         return agent_error("starting device pairing", perr or "no pairing code produced")
-    note = ("once the user enters the code, pairing finishes and I auto-(re)start the Hermes gateway "
-            "so it loads chat4000 and invites them — the bot may blip for a few seconds during that restart")
+    # 5. PROACTIVELY (re)start the gateway so it LOADS chat4000. Hermes discovers
+    #    plugins only at startup, so a gateway that booted before this install will
+    #    never run chat4000 until it restarts — and this must NOT be gated on the
+    #    phone pairing: a slow pair, an expired window, or a later manual `chat4000
+    #    pair` all need chat4000 already loaded. Detached + delayed so the agent
+    #    relays the code first; then the gateway reloads and invites whoever pairs,
+    #    now or later. (Earlier this was gated on pair-success — that left the
+    #    gateway plugin-less whenever the first window lapsed.)
+    _spawn_detached_gateway_reload(f"{venv_bin}/hermes", delay=GATEWAY_RELOAD_DELAY_S)
+    note = (f"I'm (re)starting the Hermes gateway in ~{GATEWAY_RELOAD_DELAY_S}s so it loads chat4000 and can "
+            "invite the user when they pair (now or later) — the bot may blip briefly during that restart")
     _emit("installer_pkg_installed", {"plugin_ref": args.ref, "mode": "agent"})
     return agent_success("Hermes", code, qr, logpath, note)
 
