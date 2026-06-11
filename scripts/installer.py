@@ -151,7 +151,12 @@ CELEBRATION_GIF_URL = "https://chat4000.com/gifs/celebration.gif"
 # so a plain phone camera can open it too). The agent posts ![](this) so Telegram
 # renders a scannable image. First-party by design — a 3rd-party QR API would
 # receive (and could redeem) the live pairing code.
-QR_IMAGE_URL_TEMPLATE = "https://registrar.chat4000.com/qr?code={code}"
+#
+# The URL MUST contain an image extension (.png): Hermes' reply pipeline only
+# treats a ![](url) as an image when the URL looks like one (extension check) —
+# a plain /qr?code=… is left as raw text. So the endpoint serves the PNG at
+# /qr.png?code=<code>.
+QR_IMAGE_URL_TEMPLATE = "https://registrar.chat4000.com/qr.png?code={code}"
 
 _STARTED_AT_MS = int(time.time() * 1000)
 
