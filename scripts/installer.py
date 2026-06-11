@@ -27,12 +27,14 @@ path segments are scrubbed before send).
 
 What WE send is bounded to: which install step ran/failed + the error class;
 python + agent version, OS platform; the merged-environment scan described
-below; and an anonymous UUID (~/.config/chat4000/install-id).
+below; and two anonymous UUIDs — a stable agent_install_id (in the agent's data
+dir; the distinct_id) and a churny env_id (~/.config/chat4000/install-id; a
+property). See the two-id scheme below.
 
 The merged scan additionally reports, per detected agent (so we can size the
 installed base and prioritise the right host): the agent's install DATE, the
-names + COUNT of channels/plugins it has, and how many SESSIONS live on it.
-These are counts and public package names — never content.
+COUNT of channels/plugins it has, and how many SESSIONS live on it. Counts and
+dates only — never content, and (IN1) never the channel names themselves.
 
 Opt out any of three ways:
   • CHAT4000_TELEMETRY_DISABLED=1 in your env
@@ -44,17 +46,21 @@ Privacy policy: https://chat4000.com/privacy
 Love, chat4000 ❤️
 ────────────────────────────────────────────────────────────────────────
 
-Every event carries a `mode` prop ("agent" when run with --agent, else "human");
-Sentry events carry a matching `mode` tag.
+Identity (IN5 / IDN7-9): distinct_id = agent_install_id (stable, agent data dir);
+env_id (churny, ~/.config) rides every event as a property. distinct_id is env_id
+until a target is chosen, then the target's agent_install_id. A fresh env_id with
+a surviving agent_install_id emits container_rebuilt. Every event also carries a
+`mode` prop ("agent" with --agent, else "human"); Sentry events carry a `mode` tag.
 
-PostHog events fired by this file (routed to the matching host's project):
+PostHog events fired by this file (ONE self-hosted project, IN4/INF5):
   - installer_agent_invoked              (only in --agent mode; dedicated marker)
   - installer_started                    {selected_kind?}
-  - installer_environment_scan           {hermes_count, openclaw_count, total}  (→ both)
-  - installer_agent_detected             {kind, agent_version, install_date,
-                                          age_days, channels, channel_count,
+  - installer_environment_scan           {hermes_count, openclaw_count, total}
+  - installer_agent_detected             {kind, agent_install_id, agent_version,
+                                          install_date, age_days, channel_count,
                                           session_count, agent_count,
                                           plugin_installed, plugin_version}
+  - container_rebuilt                    {env_id}            (IDN9, when applicable)
   - installer_hermes_detected            {hermes_layout, hermes_path}
   - installer_openclaw_detected          {openclaw_version, openclaw_path}
   - installer_pkg_installed              {...}
@@ -119,18 +125,13 @@ def openclaw_gh_spec(ref: str) -> str:
     """npm git spec for the OpenClaw plugin at a GitHub ref (tag/branch/SHA)."""
     return f"github:{OPENCLAW_REPO_SLUG}#{ref}"
 
-# Public PostHog credentials — one project per host (same projects the plugins
-# + the iOS/Mac apps use), so each host's install funnel stays correlated with
-# that host's runtime events. Public keys; safe to embed.
+# IN4 / INF5: ONE self-hosted PostHog project for everything. The former
+# "openclaw" project (posthog.chat4000.com) is now THE chat4000 project; the
+# US-cloud project is abandoned (no history migration, DEC4). Every installer
+# event goes here — no more per-host routing / double-firing. Public key.
 POSTHOG = {
-    "hermes": {
-        "key": "phc_s49DnTamyFDnEC6MyumNmmjjf7p455LXCVzPE94hPemZ",
-        "url": "https://us.i.posthog.com/capture/",
-    },
-    "openclaw": {
-        "key": "phc_wNRtzk3h5FTw2X6h4CvieEoxdSdqUd42eUqbgW6nD7B4",
-        "url": "https://posthog.chat4000.com/capture/",
-    },
+    "key": "phc_wNRtzk3h5FTw2X6h4CvieEoxdSdqUd42eUqbgW6nD7B4",
+    "url": "https://posthog.chat4000.com/capture/",
 }
 
 # Sentry DSNs — one per host, matching each plugin's runtime telemetry project.
@@ -211,26 +212,105 @@ def banner() -> None:
     print(f"{C_MAG}└─────────────────────────────────────────────────────────────┘{C_RST}\n")
 
 
-# ─── install_id (matches what each plugin reuses later) ───────────────────
+# ─── Two-id scheme (IN5 / IDN7–IDN9) ──────────────────────────────────────
+#
+# env_id (IDN7): the CHURNY id at ~/.config/chat4000/install-id — survives a
+#   plugin reinstall but dies with a docker rebuild / fresh home. Rides every
+#   event as a PROPERTY.
+# agent_install_id (IDN8): the STABLE id, a file in the agent data-dir ROOT
+#   (Hermes profile dir / OpenClaw state dir — what people volume-mount), so it
+#   survives docker rebuilds. THE distinct_id once a target is chosen. It lives
+#   at the data-dir ROOT, NOT under plugins/chat4000 (that dir is wiped by
+#   `chat4000 uninstall`, which would churn the "stable" id — BA4).
+# Comparing the two at start yields container_rebuilt (IDN9).
+
+_ENV_ID: Optional[str] = None
+_ENV_ID_FRESH: bool = False
+_DISTINCT_ID: Optional[str] = None
+_AGENT_IDS: dict = {}  # kind -> (agent_install_id, freshly_minted); first resolve wins
 
 
-def resolve_install_id() -> str:
-    cfg = Path.home() / ".config" / "chat4000"
-    path = cfg / "install-id"
+def _resolve_id_file(path: Path) -> tuple:
+    """Read a UUID from `path`; if absent/empty, mint a UUIDv4 and write it 0600
+    with a trailing newline (same format the plugins use). Returns (id,
+    freshly_minted). Read-only / sandboxed fs → a process-local id, fresh=True."""
     try:
         if path.exists():
             existing = path.read_text(encoding="utf-8").strip()
             if existing:
-                return existing
+                return (existing, False)
         new_id = str(uuid.uuid4())
-        cfg.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(new_id + "\n", encoding="utf-8")
         with contextlib.suppress(OSError):
             os.chmod(path, 0o600)
-        return new_id
+        return (new_id, True)
     except OSError:
-        # Read-only / sandboxed fs — fall back to a process-local anonymous id.
-        return str(uuid.uuid4())
+        return (str(uuid.uuid4()), True)
+
+
+def resolve_env_id() -> tuple:
+    """(env_id, freshly_minted) — the churny ~/.config/chat4000/install-id."""
+    return _resolve_id_file(Path.home() / ".config" / "chat4000" / "install-id")
+
+
+def _agent_install_id_path(kind: str) -> Path:
+    """Stable-id file at the agent data-dir ROOT (BA4). Hermes honors
+    $HERMES_HOME (via _hermes_home); OpenClaw uses the _openclaw_home anchor."""
+    base = _hermes_home() if kind == "hermes" else _openclaw_home()
+    return base / "chat4000-install-id"
+
+
+def resolve_agent_install_id(kind: str) -> tuple:
+    """(agent_install_id, freshly_minted) for a host kind, cached on first
+    resolve so freshness reflects whether the file SURVIVED into this run (not
+    whether a later read re-saw the file we just minted) — required for IDN9."""
+    if kind not in _AGENT_IDS:
+        _AGENT_IDS[kind] = _resolve_id_file(_agent_install_id_path(kind))
+    return _AGENT_IDS[kind]
+
+
+def init_ids() -> None:
+    """Resolve env_id once at startup; distinct_id starts as env_id (the
+    pre-target-selection events use it — BA5)."""
+    global _ENV_ID, _ENV_ID_FRESH, _DISTINCT_ID
+    _ENV_ID, _ENV_ID_FRESH = resolve_env_id()
+    _DISTINCT_ID = _ENV_ID
+
+
+def _env_id() -> str:
+    global _ENV_ID
+    if _ENV_ID is None:
+        _ENV_ID, _ = resolve_env_id()
+    return _ENV_ID
+
+
+def _current_distinct_id() -> str:
+    global _DISTINCT_ID
+    if not _DISTINCT_ID:
+        _DISTINCT_ID = _env_id()
+    return _DISTINCT_ID
+
+
+def use_agent_distinct_id(kind: str) -> str:
+    """Switch distinct_id to the chosen target's agent_install_id — every event
+    after target selection uses it (BA5)."""
+    global _DISTINCT_ID
+    _DISTINCT_ID = resolve_agent_install_id(kind)[0]
+    return _DISTINCT_ID
+
+
+def maybe_emit_container_rebuilt() -> None:
+    """IDN9 / BA6: if THIS run freshly minted env_id but a stable agent_install_id
+    SURVIVED, the runtime env was rebuilt (docker). Fire once; only the process
+    that minted the fresh env_id fires it, so installer/plugin can't double-fire.
+    prev_env_id is unrecoverable on a rebuild, so props carry env_id only."""
+    if not _ENV_ID_FRESH:
+        return
+    for _kind, (aid, fresh) in _AGENT_IDS.items():
+        if not fresh:
+            _emit("container_rebuilt", {"env_id": _env_id()}, distinct_id=aid)
+            return
 
 
 # ─── Scrubbing ────────────────────────────────────────────────────────────
@@ -280,6 +360,9 @@ def _base_props() -> dict:
         # Stamp EVERY event with how the installer was invoked, so agent-driven
         # installs (--agent) are cleanly separable from human ones in analytics.
         "mode": "agent" if _AGENT_MODE else "human",
+        # IN5 / IDN7: the churny env id rides every machine event as a property
+        # (its distinct_id role moved to agent_install_id).
+        "env_id": _env_id(),
         "installer_version": INSTALLER_VERSION,
         "python_version": (
             f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
@@ -348,20 +431,17 @@ def _base_props() -> dict:
     return enriched
 
 
-def _post_posthog(dest: str, event: str, props: dict) -> None:
-    cred = POSTHOG.get(dest)
-    if not cred:
-        return
+def _post_posthog(event: str, props: dict, distinct_id: str) -> None:
     body = json.dumps(
         {
-            "api_key": cred["key"],
+            "api_key": POSTHOG["key"],
             "event": event,
-            "distinct_id": resolve_install_id(),
+            "distinct_id": distinct_id,
             "properties": props,
         }
     ).encode("utf-8")
     req = urllib.request.Request(  # noqa: S310  # our own PostHog https ingestion endpoint
-        cred["url"],
+        POSTHOG["url"],
         data=body,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -371,18 +451,18 @@ def _post_posthog(dest: str, event: str, props: dict) -> None:
         urllib.request.urlopen(req, timeout=3).read()  # noqa: S310
 
 
-def _emit(event: str, props: Optional[dict] = None, dest: str = "both") -> None:
-    """Fire a PostHog event to one host's project ("hermes"/"openclaw") or
-    "both". Best-effort, never raises, scrubs home/username paths from props."""
+def _emit(event: str, props: Optional[dict] = None, *, distinct_id: Optional[str] = None) -> None:
+    """Fire a PostHog event to the single self-hosted project (IN4). Best-effort,
+    never raises, scrubs home/username paths from props. distinct_id defaults to
+    the current machine id — env_id before a target is selected, the target's
+    agent_install_id after (BA5)."""
     if _TELEMETRY_DISABLED:
         return
     enriched = _base_props()
     if props:
         enriched.update(props)
     enriched = {k: _scrub_props_value(v) for k, v in enriched.items()}
-    targets = ("hermes", "openclaw") if dest == "both" else (dest,)
-    for t in targets:
-        _post_posthog(t, event, enriched)
+    _post_posthog(event, enriched, distinct_id or _current_distinct_id())
 
 
 # ─── Sentry (stdlib envelope POST, no SDK) ────────────────────────────────
@@ -453,7 +533,7 @@ def _send_sentry_one(dsn: str, exc: BaseException, *, kind: str, tags: Optional[
                     }
                 ]
             },
-            "user": {"id": resolve_install_id()},
+            "user": {"id": _current_distinct_id()},
             "sdk": {"name": "chat4000-installer", "version": INSTALLER_VERSION},
         }
 
@@ -1356,7 +1436,6 @@ def scan_and_report(targets: list) -> None:
     _emit(
         "installer_environment_scan",
         {"hermes_count": h, "openclaw_count": o, "total": len(targets)},
-        dest="both",
     )
 
 
@@ -1388,10 +1467,15 @@ def _print_target_row(idx: int, t: dict) -> None:
 
 def _emit_agent_detected(t: dict) -> None:
     st = t["stats"] or {}
+    # BA5: this scan event's distinct_id is env_id (no target chosen yet), so it
+    # carries the agent's own agent_install_id as a prop to stay joinable. Also
+    # populates the _AGENT_IDS cache that maybe_emit_container_rebuilt() reads.
+    agent_install_id, _ = resolve_agent_install_id(t["kind"])
     _emit(
         "installer_agent_detected",
         {
             "kind": t["kind"],
+            "agent_install_id": agent_install_id,
             "agent_version": t.get("version"),
             "layout": t.get("layout"),
             "install_date": st.get("install_date"),
@@ -1404,7 +1488,6 @@ def _emit_agent_detected(t: dict) -> None:
             "plugin_installed": st.get("plugin_installed"),
             "plugin_version": st.get("plugin_version"),
         },
-        dest=t["kind"],
     )
 
 
@@ -1436,7 +1519,7 @@ def select_targets(targets: list, args) -> Optional[list]:
     if not sys.stdin.isatty():
         err("Multiple instances found but this is a non-interactive shell.")
         err("Re-run interactively, or narrow it with --target hermes|openclaw, --hermes-bin/--openclaw-bin, or --all.")
-        _emit("installer_failed", {"stage": "select_target", "error_class": "Ambiguous", "error_msg": f"{len(pool)} targets, non-interactive"}, dest="both")
+        _emit("installer_failed", {"stage": "select_target", "error_class": "Ambiguous", "error_msg": f"{len(pool)} targets, non-interactive"})
         return None
     while True:
         try:
@@ -1459,10 +1542,11 @@ def select_targets(targets: list, args) -> Optional[list]:
 
 
 def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
+    use_agent_distinct_id("hermes")  # BA5: events from here on use this target's agent_install_id
     venv_bin = t["venv_bin"]
     venv_python = t["venv_python"]
     ok(f"Hermes venv:  {C_CYN}{venv_bin}{C_RST}  {C_DIM}({t['layout']}){C_RST}")
-    _emit("installer_hermes_detected", {"hermes_layout": t["layout"], "hermes_path": venv_bin}, dest="hermes")
+    _emit("installer_hermes_detected", {"hermes_layout": t["layout"], "hermes_path": venv_bin})
 
     if args.uninstall:
         hdr("Uninstall mode (Hermes)")
@@ -1478,7 +1562,7 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
     try:
         if uv:
             ok(f"Using uv at {C_CYN}{uv}{C_RST}")
-            _emit("installer_uv_detected", {"uv_path": uv}, dest="hermes")
+            _emit("installer_uv_detected", {"uv_path": uv})
             hermes_install_via_uv(uv, venv_python, args.ref)
             installer_used = "uv"
         else:
@@ -1487,7 +1571,7 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
             installer_used = "pip"
     except subprocess.CalledProcessError as exc:
         err(f"Install failed: {exc}")
-        _emit("installer_failed", {"stage": "pip_install", "error_class": type(exc).__name__, "error_msg": str(exc)[:200], "installer_used": uv and "uv" or "pip"}, dest="hermes")
+        _emit("installer_failed", {"stage": "pip_install", "error_class": type(exc).__name__, "error_msg": str(exc)[:200], "installer_used": uv and "uv" or "pip"})
         return 1
     ok("Plugin installed.")
 
@@ -1498,7 +1582,7 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
     if check.returncode != 0:
         err("Plugin installed but import failed:")
         err(check.stderr.strip())
-        _emit("installer_failed", {"stage": "import_check", "error_msg": check.stderr.strip()[:200]}, dest="hermes")
+        _emit("installer_failed", {"stage": "import_check", "error_msg": check.stderr.strip()[:200]})
         return 1
 
     ver = subprocess.run(
@@ -1507,7 +1591,7 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
     )
     plugin_version = ver.stdout.strip() if ver.returncode == 0 else "unknown"
     ok(f"Installed version: {C_GRN}{plugin_version}{C_RST}")
-    _emit("installer_pkg_installed", {"installer_used": installer_used, "plugin_ref": args.ref, "plugin_version": plugin_version}, dest="hermes")
+    _emit("installer_pkg_installed", {"installer_used": installer_used, "plugin_ref": args.ref, "plugin_version": plugin_version})
 
     symlink_chat4000_onto_path(venv_bin)
 
@@ -1520,7 +1604,7 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
         return 0
 
     hdr("🪄 Running install wizard")
-    _emit("installer_handing_off_to_wizard", dest="hermes")
+    _emit("installer_handing_off_to_wizard")
     # IN2: run the wizard as a CHILD process (inherited stdio → it stays fully
     # interactive for the QR / pairing and owns Ctrl-C), instead of exec-replacing
     # this process. Running it as a child means we regain control on return and can
@@ -1529,21 +1613,22 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
         wizard_rc = subprocess.run([f"{venv_bin}/chat4000", "wizard"]).returncode
     except OSError as exc:
         err(f"Could not run wizard: {exc}")
-        _emit("installer_failed", {"stage": "wizard", "error_class": type(exc).__name__, "error_msg": str(exc)[:200]}, dest="hermes")
+        _emit("installer_failed", {"stage": "wizard", "error_class": type(exc).__name__, "error_msg": str(exc)[:200]})
         return 1
     if wizard_rc == 0:
         ok("Wizard completed.")
-        _emit("installer_succeeded", {}, dest="hermes")
+        _emit("installer_succeeded", {})
     else:
         err(f"Wizard exited {wizard_rc}.")
-        _emit("installer_failed", {"stage": "wizard", "exit_code": wizard_rc}, dest="hermes")
+        _emit("installer_failed", {"stage": "wizard", "exit_code": wizard_rc})
     return wizard_rc
 
 
 def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
+    use_agent_distinct_id("openclaw")  # BA5: events from here on use this target's agent_install_id
     openclaw_path = t["bin"]
     ok(f"OpenClaw:  {C_CYN}{openclaw_path}{C_RST}  {C_DIM}({t.get('version')}){C_RST}")
-    _emit("installer_openclaw_detected", {"openclaw_version": t.get("version"), "openclaw_path": openclaw_path}, dest="openclaw")
+    _emit("installer_openclaw_detected", {"openclaw_version": t.get("version"), "openclaw_path": openclaw_path})
 
     if args.uninstall:
         hdr("Uninstall mode (OpenClaw)")
@@ -1571,10 +1656,10 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
         err(f"  - This OpenClaw's `plugins install` doesn't accept git specs — try `{openclaw_path} --help`")
         err(f"  - The `{oc_ref}` tag doesn't exist on github.com/{OPENCLAW_REPO_SLUG} yet")
         err("  - Permissions on the OpenClaw plugins directory")
-        _emit("installer_failed", {"stage": "plugin_install", "error_class": "InstallFailed", "error_msg": output_tail[:200] or "no output", "output_tail": output_tail, "ref": oc_ref}, dest="openclaw")
+        _emit("installer_failed", {"stage": "plugin_install", "error_class": "InstallFailed", "error_msg": output_tail[:200] or "no output", "output_tail": output_tail, "ref": oc_ref})
         return 1
     ok(f"chat4000 plugin ready (GitHub @{oc_ref}).")
-    _emit("installer_pkg_installed", {"plugin_package": OPENCLAW_PKG, "source": "github", "ref": oc_ref, "spec": used_spec, "from_version": cur_ver, "was_installed": installed}, dest="openclaw")
+    _emit("installer_pkg_installed", {"plugin_package": OPENCLAW_PKG, "source": "github", "ref": oc_ref, "spec": used_spec, "from_version": cur_ver, "was_installed": installed})
 
     # Onboard + pair.
     setup_cmd = [openclaw_path, "chat4000", "setup", "--self-redeem"]
@@ -1591,27 +1676,27 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
         hdr("🔑 Onboarding the plugin's Matrix identity")
         if not interactive:
             warn("Multiple targets selected — onboarding identity only (pair each later).")
-        _emit("installer_handing_off_to_setup", {"paired": False}, dest="openclaw")
+        _emit("installer_handing_off_to_setup", {"paired": False})
     else:
         hdr("📱 Onboarding + pairing a device")
         print(f"{C_DIM}Scan the QR with the chat4000 iOS/macOS app. Ctrl-C to cancel.{C_RST}\n")
-        _emit("installer_handing_off_to_setup", {"paired": True}, dest="openclaw")
+        _emit("installer_handing_off_to_setup", {"paired": True})
     try:
         pair_rc = subprocess.run(setup_cmd).returncode
     except KeyboardInterrupt:
         warn("Onboarding cancelled.")
-        _emit("installer_cancelled", {"stage": "setup"}, dest="openclaw")
+        _emit("installer_cancelled", {"stage": "setup"})
         return 130
     if pair_rc != 0:
         err(f"Setup exited {pair_rc}.")
         err("If this is a token error, pass --service-token <TOKEN> and select --env prod|stage.")
-        _emit("installer_failed", {"stage": "setup", "exit_code": pair_rc}, dest="openclaw")
+        _emit("installer_failed", {"stage": "setup", "exit_code": pair_rc})
         return pair_rc
     if not do_pair:
         ok("Identity onboarded. Pair a device any time with:")
         print(f"  {C_CYN}{openclaw_path} chat4000 pair{C_RST}")
     else:
-        _emit("pairing_completed_via_installer", {}, dest="openclaw")
+        _emit("pairing_completed_via_installer", {})
 
     # (Re)start gateway.
     if args.no_restart:
@@ -1623,11 +1708,11 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
     method = detect_restart_method()
     if method is not None and restart_gateway(method):
         ok(f"Gateway started (method: {method}).")
-        _emit("installer_gateway_restarted", {"method": method}, dest="openclaw")
+        _emit("installer_gateway_restarted", {"method": method})
     else:
         warn("Could not auto-start the gateway.")
         warn("Docker: docker restart openclaw-gateway · terminal: openclaw gateway run · service: openclaw gateway start")
-        _emit("installer_failed", {"stage": "gateway_restart", "error_class": "RestartUnavailable", "error_msg": f"no working method (probed: {method or 'none'})"}, dest="openclaw")
+        _emit("installer_failed", {"stage": "gateway_restart", "error_class": "RestartUnavailable", "error_msg": f"no working method (probed: {method or 'none'})"})
         return 1
 
     if not interactive:
@@ -1638,12 +1723,12 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
     print(f"{C_DIM}and the chat4000 channel connects. Grab a coffee — we'll tell you when ready.{C_RST}")
     if wait_for_chat4000_connected(timeout=120):
         ok("chat4000 connected. Send a message from your iOS/Mac app — your OpenClaw agent will reply.")
-        _emit("installer_succeeded", {}, dest="openclaw")
-        _emit("installer_chat4000_relay_connected", {}, dest="openclaw")
+        _emit("installer_succeeded", {})
+        _emit("installer_chat4000_relay_connected", {})
         return 0
     warn("chat4000 didn't connect within 120s.")
     warn(f"Watch logs: {C_CYN}tail -f ~/.openclaw/plugins/chat4000/logs/runtime.log{C_RST}")
-    _emit("installer_failed", {"stage": "relay_handshake", "error_class": "Timeout", "error_msg": "no runtime.hello_ok within 120s"}, dest="openclaw")
+    _emit("installer_failed", {"stage": "relay_handshake", "error_class": "Timeout", "error_msg": "no runtime.hello_ok within 120s"})
     return 1
 
 
@@ -1666,7 +1751,7 @@ def prompt_manual_target(args) -> Optional[list]:
     print()
     if not sys.stdin.isatty():
         err("(non-interactive shell — cannot prompt. Re-run interactively or pass --hermes-bin/--openclaw-bin.)")
-        _emit("installer_failed", {"stage": "detect", "error_class": "NotFound", "error_msg": "nothing detected; non-interactive"}, dest="both")
+        _emit("installer_failed", {"stage": "detect", "error_class": "NotFound", "error_msg": "nothing detected; non-interactive"})
         return None
     try:
         user_input = input(f"{C_CYN}? Path to a Hermes venv-bin or an openclaw binary:{C_RST} ").strip()
@@ -1681,7 +1766,7 @@ def prompt_manual_target(args) -> Optional[list]:
     # Hermes venv-bin?
     if Path(f"{cand}/python").exists():
         ok(f"Hermes venv:  {C_CYN}{cand}{C_RST}  {C_DIM}(user input){C_RST}")
-        _emit("installer_hermes_path_via_user_input", {"hermes_path": cand}, dest="hermes")
+        _emit("installer_hermes_path_via_user_input", {"hermes_path": cand})
         t = _mk_hermes(cand.rstrip("/"), "user-input")
         t["stats"] = collect_hermes_stats(t["venv_bin"])
         return [t]
@@ -1689,12 +1774,12 @@ def prompt_manual_target(args) -> Optional[list]:
     if Path(cand).exists() and os.access(cand, os.X_OK):
         ver = _openclaw_version(cand)
         ok(f"OpenClaw:  {C_CYN}{cand}{C_RST}  {C_DIM}({ver}, user input){C_RST}")
-        _emit("installer_openclaw_path_via_user_input", {"openclaw_path": cand}, dest="openclaw")
+        _emit("installer_openclaw_path_via_user_input", {"openclaw_path": cand})
         t = _mk_openclaw(cand, ver, "user-input")
         t["stats"] = collect_openclaw_stats(cand)
         return [t]
     err(f"{cand} is neither a Hermes venv-bin (no `python`) nor an executable openclaw. Bailing.")
-    _emit("installer_failed", {"stage": "detect", "error_class": "InvalidUserInput", "error_msg": "unrecognized path"}, dest="both")
+    _emit("installer_failed", {"stage": "detect", "error_class": "InvalidUserInput", "error_msg": "unrecognized path"})
     return None
 
 
@@ -1933,6 +2018,7 @@ fi
 
 
 def install_openclaw_agent(t: dict, args) -> int:
+    use_agent_distinct_id("openclaw")  # BA5
     oc = t["bin"]
     oc_ref = args.plugin_version or args.ref
     # 1. Install the plugin from the GitHub ref (quiet).
@@ -1967,12 +2053,13 @@ def install_openclaw_agent(t: dict, args) -> int:
     if not (method and restart_gateway(method)):
         note = ("the OpenClaw gateway didn't auto-start — have the user run "
                 "`openclaw gateway run` (or `docker restart openclaw-gateway`) so messages flow")
-    _emit("installer_pkg_installed", {"plugin_package": OPENCLAW_PKG, "source": "github", "ref": oc_ref, "mode": "agent"}, dest="openclaw")
+    _emit("installer_pkg_installed", {"plugin_package": OPENCLAW_PKG, "source": "github", "ref": oc_ref, "mode": "agent"})
     qr_ascii = _render_ascii_qr(qr, [shutil.which("python3"), "python3"])
     return agent_success("OpenClaw", code, qr, logpath, note, qr_ascii=qr_ascii)
 
 
 def install_hermes_agent(t: dict, args) -> int:
+    use_agent_distinct_id("hermes")  # BA5
     venv_bin = t["venv_bin"]
     venv_python = t["venv_python"]
     chat4000 = f"{venv_bin}/chat4000"
@@ -2016,7 +2103,7 @@ def install_hermes_agent(t: dict, args) -> int:
         return agent_error("starting device pairing", perr or "no pairing code produced")
     note = ("once the user enters the code, pairing finishes and I auto-(re)start the Hermes gateway "
             "so it loads chat4000 and invites them — the bot may blip for a few seconds during that restart")
-    _emit("installer_pkg_installed", {"plugin_ref": args.ref, "mode": "agent"}, dest="hermes")
+    _emit("installer_pkg_installed", {"plugin_ref": args.ref, "mode": "agent"})
     qr_ascii = _render_ascii_qr(qr, [venv_python])
     return agent_success("Hermes", code, qr, logpath, note, qr_ascii=qr_ascii)
 
@@ -2025,8 +2112,8 @@ def run_agent_mode(args) -> int:
     """`--agent`: terse, machine-addressed install for an agent caller."""
     # Dedicated, easy-to-funnel marker that this run was agent-driven (every other
     # event also carries mode="agent" via _base_props, but this one is explicit).
-    _emit("installer_agent_invoked", {"env": os.environ.get("CHAT4000_ENV", "production")}, dest="both")
-    _emit("installer_started", {"env": os.environ.get("CHAT4000_ENV", "production")}, dest="both")
+    _emit("installer_agent_invoked", {"env": os.environ.get("CHAT4000_ENV", "production")})
+    _emit("installer_started", {"env": os.environ.get("CHAT4000_ENV", "production")})
     if args.uninstall or args.reset:
         return agent_error("starting", "--uninstall / --reset aren't supported in --agent mode; run the installer normally for those.")
 
@@ -2050,8 +2137,8 @@ def run_agent_mode(args) -> int:
             "total": len(targets),
             "mode": "agent",
         },
-        dest="both",
     )
+    maybe_emit_container_rebuilt()  # IDN9
 
     pool = targets
     if args.target:
@@ -2120,6 +2207,10 @@ def main() -> int:
     global _AGENT_MODE
     _AGENT_MODE = args.agent
 
+    # IN5: resolve env_id up front; distinct_id starts as env_id for the
+    # pre-target-selection events (BA5).
+    init_ids()
+
     if args.stage:
         os.environ["CHAT4000_ENV"] = "stage"
         say("Stage mode: onboarding/pairing will use the stage servers.")
@@ -2145,12 +2236,14 @@ def main() -> int:
     _emit(
         "installer_started",
         {"env": os.environ.get("CHAT4000_ENV", "production"), "installer_ref": args.installer_ref},
-        dest="both",
     )
 
     # 1. Discover every target, scan + report + emit the new analytics.
     targets = build_targets(args)
     scan_and_report(targets)
+    # IDN9: scan resolved each agent's stable id; if env_id churned but one
+    # survived, this run is a container rebuild.
+    maybe_emit_container_rebuilt()
 
     if args.scan_only:
         ok("Scan complete (--scan-only). Nothing installed.")
@@ -2181,13 +2274,13 @@ def _entry() -> int:
     except KeyboardInterrupt:
         print()
         warn("Install cancelled.")
-        _emit("installer_cancelled", {"stage": "uncaught"}, dest="both")
+        _emit("installer_cancelled", {"stage": "uncaught"})
         return 130
     except SystemExit:
         raise
     except BaseException as exc:  # noqa: BLE001  # installer top-level boundary: reports to its own sinks, then exits
         err(f"Installer crashed unexpectedly: {type(exc).__name__}: {exc}")
-        _emit("installer_crashed", {"error_class": type(exc).__name__, "error_msg": str(exc)[:200]}, dest="both")
+        _emit("installer_crashed", {"error_class": type(exc).__name__, "error_msg": str(exc)[:200]})
         send_sentry_envelope(exc, kind="both", tags={"crash_stage": "uncaught"})
         err("Crash report sent. If this keeps happening, please open an issue at:")
         err("  https://github.com/chat4000/chat4000-installer/issues")

@@ -48,13 +48,16 @@ Useful flags (all pass through `install.sh` → `installer.py`):
 
 ## Analytics
 
-Same stack as the originals: anonymous PostHog (product) + Sentry (crashes) over
-stdlib HTTPS, routed to each host's existing project so funnels stay intact.
-Beyond the per-step funnel, the merged scan emits, **per detected agent**:
-install **date** + age, the **channels/plugins** it has (names + count), and its
-**session count** + agent count. Counts and public package names only — never
-message content, prompts, credentials, or your file paths (home/username
-segments are scrubbed before send). Opt out with `CHAT4000_TELEMETRY_DISABLED=1`,
-`--no-telemetry`, or `chat4000 telemetry disable` after install.
+Anonymous PostHog (product) + Sentry (crashes) over stdlib HTTPS, to a single
+self-hosted project (`posthog.chat4000.com`). Identity is two anonymous UUIDs: a
+stable `agent_install_id` (in the agent's data dir — the analytics id) and a
+churny `env_id` (`~/.config/chat4000/install-id` — a property; its churn against
+the stable id flags a container rebuild). Beyond the per-step funnel, the merged
+scan emits, **per detected agent**: install **date** + age, the **count** of
+channels/plugins it has, and its **session count** + agent count. Counts and
+dates only — never channel names, message content, prompts, credentials, or your
+file paths (home/username segments are scrubbed before send). Opt out with
+`CHAT4000_TELEMETRY_DISABLED=1`, `--no-telemetry`, or `chat4000 telemetry
+disable` after install.
 
 Privacy policy: https://chat4000.com/privacy
