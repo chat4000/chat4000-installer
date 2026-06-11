@@ -1822,11 +1822,10 @@ def agent_success(
     qr: Optional[str],
     logpath: str,
     note: Optional[str] = None,
-    qr_ascii: Optional[str] = None,
 ) -> int:
-    qr_display = qr or "(unavailable — the code or pair link is enough)"
     code_disp = f"{code[:3]}-{code[3:]}" if (code and len(code) == 6 and code.isdigit()) else code
     pair_url = f"https://pair.chat4000.com/?code={code}" if code else None
+    qr_payload = qr or pair_url or ""
     lines = [
         "[chat4000 installer → agent]",
         "I'm the chat4000 plugin installer. The install + onboarding are done and pairing",
@@ -1835,77 +1834,49 @@ def agent_success(
         "Send your user EXACTLY TWO messages, in this order, and NOTHING after them:",
         "",
         "━━ MESSAGE 1 — a celebratory GIF, on its own. Put exactly this line and nothing",
-        "   else (image-markdown with EMPTY alt text — no caption, no word 'celebration',",
-        "   no other text). The empty ![]() makes it auto-play inline as an animation:",
+        "   else (empty alt text → auto-plays inline; no caption, no other text):",
         f"   ![]({CELEBRATION_GIF_URL})",
         "",
-        "━━ MESSAGE 2 — the pairing options. Say the installer ran, then give ALL THREE",
-        "   ways to pair, formatted nicely with icons (📱 scan · 🔢 code · 🔗 link):",
-        "  • 📱 SCAN the QR below with the chat4000 app, or",
-        "  • 🔢 TYPE the pairing code into the app, or",
-        "  • 🔗 if they're on the device to pair, just TAP the link.",
+        "━━ MESSAGE 2 — the pairing message. Use THIS exact structure, wording and icons,",
+        "   and nothing extra:",
         "",
-        f"  🔢 PAIRING CODE:  {code_disp}",
-    ]
-    if pair_url:
-        lines.append(f"  🔗 PAIR-THIS-DEVICE LINK:  {pair_url}")
-    lines += [
+        "   The installer ran successfully!!! 🎉✨🥳🎊🙌🚀",
         "",
-        "👉 You MUST show the QR below IN FULL so they can scan it — don't skip, summarize,",
-        "   or replace it with just the code/link.",
+        "   To pair the device, either:",
+        "",
+        "   🔗 Click this link if it's THIS device:",
+        f"   {pair_url}",
+        "",
+        "   🔢 If it's another device, enter this pairing code:",
+        f"   {code_disp}",
+        "",
+        "   📱 Or scan this QR with the other device:",
+        "   [the QR image — see the QR rule below]",
     ]
     if pair_url:
         lines += [
-            "👉 The pair link MUST be a REAL, TAPPABLE link (plain https:// URL or a Markdown",
-            f"   link), exactly:  {pair_url}",
-            "   NEVER wrap it in backticks / a code span / a code block — that makes it",
-            "   non-clickable monospace and defeats the purpose.",
-            f"⚠ The code in the URL is the 6 RAW DIGITS, NO dash ({code}). You DISPLAY it",
+            "",
+            "👉 The link MUST be a REAL, TAPPABLE link (plain https:// URL or Markdown link),",
+            f"   exactly:  {pair_url}  — NEVER backticks/code span (that kills the tap).",
+            f"⚠ The code in the URL is the 6 RAW DIGITS, NO dash ({code}); you DISPLAY it",
             f"   dashed ({code_disp}) but the URL stays EXACTLY {pair_url}. A dashed code in",
             "   the link is BROKEN. Never mask/star/shorten it (never 'code=***').",
         ]
-    if qr_ascii:
-        lines += ["", "  QR — show this IN FULL (scannable; paste it verbatim):", qr_ascii]
-    elif qr:
-        lines += ["", f"  QR / LINK — render this as a QR for the user:  {qr_display}"]
     lines += [
         "",
-        '   End MESSAGE 2 with: "Valid for ~5 minutes."',
+        "👉 QR: render it as an IMAGE and send it inline. DO NOT paste the QR as ASCII,",
+        "   text, or a code block — half-block ASCII does NOT line up in Telegram and",
+        "   comes out unscannable. The QR must encode EXACTLY this:",
+        f"   {qr_payload}",
         "",
-        "⛔ Do NOT send a third message. No \"installer finished\" recap, no restating the",
-        "   code/link, no note about expiry. After MESSAGE 2 you are DONE — say nothing",
-        "   more unless the user replies.",
+        "⛔ Do NOT send a third message — no recap, no restating the code/link, no expiry",
+        "   note. After MESSAGE 2 you are DONE; say nothing more unless the user replies.",
     ]
     if note:
         lines += ["", f"(FYI for you, the agent — do NOT relay to the user: {note})"]
     lines += [f"(background pairing log: {logpath})"]
     _agent_print(lines)
     return 0
-
-
-def _render_ascii_qr(uri: Optional[str], python_bins: list) -> Optional[str]:
-    """Render the pairing URI as an ASCII QR using whichever python has `qrcode`
-    (the Hermes venv ships it; system python usually doesn't). Returns the ASCII
-    block or None — best-effort. A missing lib just means the agent falls back to
-    rendering the link itself or showing the 6-digit code."""
-    if not uri:
-        return None
-    snippet = (
-        "import sys,io,qrcode\n"
-        "q=qrcode.QRCode(border=1)\n"
-        "q.add_data(sys.argv[1]); q.make(fit=True)\n"
-        "b=io.StringIO(); q.print_ascii(out=b, invert=True); sys.stdout.write(b.getvalue())\n"
-    )
-    for py in python_bins:
-        if not py:
-            continue
-        try:
-            r = subprocess.run([py, "-c", snippet, uri], capture_output=True, text=True, timeout=15)
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if r.returncode == 0 and r.stdout.strip():
-            return r.stdout.rstrip("\n")
-    return None
 
 
 def _pair_env() -> dict:
@@ -2065,8 +2036,7 @@ def install_openclaw_agent(t: dict, args) -> int:
         note = ("the OpenClaw gateway didn't auto-start — have the user run "
                 "`openclaw gateway run` (or `docker restart openclaw-gateway`) so messages flow")
     _emit("installer_pkg_installed", {"plugin_package": OPENCLAW_PKG, "source": "github", "ref": oc_ref, "mode": "agent"})
-    qr_ascii = _render_ascii_qr(qr, [shutil.which("python3"), "python3"])
-    return agent_success("OpenClaw", code, qr, logpath, note, qr_ascii=qr_ascii)
+    return agent_success("OpenClaw", code, qr, logpath, note)
 
 
 def install_hermes_agent(t: dict, args) -> int:
@@ -2115,8 +2085,7 @@ def install_hermes_agent(t: dict, args) -> int:
     note = ("once the user enters the code, pairing finishes and I auto-(re)start the Hermes gateway "
             "so it loads chat4000 and invites them — the bot may blip for a few seconds during that restart")
     _emit("installer_pkg_installed", {"plugin_ref": args.ref, "mode": "agent"})
-    qr_ascii = _render_ascii_qr(qr, [venv_python])
-    return agent_success("Hermes", code, qr, logpath, note, qr_ascii=qr_ascii)
+    return agent_success("Hermes", code, qr, logpath, note)
 
 
 def run_agent_mode(args) -> int:
