@@ -1826,19 +1826,24 @@ def agent_success(
 ) -> int:
     qr_display = qr or "(unavailable — the code or pair link is enough)"
     code_disp = f"{code[:3]}-{code[3:]}" if (code and len(code) == 6 and code.isdigit()) else code
-    pair_url = f"https://chat4000.com/pair?code={code}" if code else None
+    pair_url = f"https://pair.chat4000.com/?code={code}" if code else None
     lines = [
         "[chat4000 installer → agent]",
-        "I'm the chat4000 plugin installer. I install the plugin that lets your user",
-        "reach you from the chat4000 iPhone / Mac app — like another one of your plugins.",
-        f"I installed the files into this {kind} host and started pairing in the background.",
+        "I'm the chat4000 plugin installer. The install + onboarding are done and pairing",
+        f"is running in the background on this {kind} host.",
         "",
-        "Tell your user the installer ran, then give them ALL THREE ways to pair.",
-        "Format it nicely with icons/emoji (e.g. 📱 scan · 🔢 code · 🔗 link) so it's",
-        "friendly and easy to read:",
+        "Send your user EXACTLY TWO messages, in this order, and NOTHING after them:",
+        "",
+        "━━ MESSAGE 1 — a celebratory GIF, on its own. Put exactly this line and nothing",
+        "   else (image-markdown with EMPTY alt text — no caption, no word 'celebration',",
+        "   no other text). The empty ![]() makes it auto-play inline as an animation:",
+        f"   ![]({CELEBRATION_GIF_URL})",
+        "",
+        "━━ MESSAGE 2 — the pairing options. Say the installer ran, then give ALL THREE",
+        "   ways to pair, formatted nicely with icons (📱 scan · 🔢 code · 🔗 link):",
         "  • 📱 SCAN the QR below with the chat4000 app, or",
         "  • 🔢 TYPE the pairing code into the app, or",
-        "  • 🔗 if they're reading this ON the device to pair, just TAP the link.",
+        "  • 🔗 if they're on the device to pair, just TAP the link.",
         "",
         f"  🔢 PAIRING CODE:  {code_disp}",
     ]
@@ -1846,38 +1851,33 @@ def agent_success(
         lines.append(f"  🔗 PAIR-THIS-DEVICE LINK:  {pair_url}")
     lines += [
         "",
-        "👉 You MUST show the QR below to the user — display it IN FULL so they can scan",
-        "   it. Do not skip it, summarize it, or replace it with just the code/link.",
+        "👉 You MUST show the QR below IN FULL so they can scan it — don't skip, summarize,",
+        "   or replace it with just the code/link.",
     ]
     if pair_url:
         lines += [
-            "👉 The pair link MUST arrive as a REAL, TAPPABLE LINK — a clickable hyperlink",
-            "   the user can tap to open the chat4000 app. Send it as a plain https:// URL",
-            f"   (or a proper Markdown link), exactly like:  {pair_url}",
-            "   DO NOT wrap it in backticks, a code span, or a code block — that renders as",
-            "   non-clickable monospace text and DEFEATS THE PURPOSE. It has to be tappable.",
-            "⚠ CRITICAL: the code INSIDE the link is the 6 RAW DIGITS — NO dash, NO space",
-            f"   ({code}). You DISPLAY the pairing code dashed ({code_disp}), but the URL",
-            f"   must stay EXACTLY {pair_url}. A dashed code in the link (code={code_disp})",
-            "   is BROKEN and will NOT pair. Copy the URL character-for-character; never",
-            "   mask, star, or shorten the code either (never 'code=***').",
+            "👉 The pair link MUST be a REAL, TAPPABLE link (plain https:// URL or a Markdown",
+            f"   link), exactly:  {pair_url}",
+            "   NEVER wrap it in backticks / a code span / a code block — that makes it",
+            "   non-clickable monospace and defeats the purpose.",
+            f"⚠ The code in the URL is the 6 RAW DIGITS, NO dash ({code}). You DISPLAY it",
+            f"   dashed ({code_disp}) but the URL stays EXACTLY {pair_url}. A dashed code in",
+            "   the link is BROKEN. Never mask/star/shorten it (never 'code=***').",
         ]
     if qr_ascii:
-        lines += ["", "  QR — SHOW THIS TO THE USER (scannable; paste it in full):", qr_ascii]
+        lines += ["", "  QR — show this IN FULL (scannable; paste it verbatim):", qr_ascii]
     elif qr:
         lines += ["", f"  QR / LINK — render this as a QR for the user:  {qr_display}"]
     lines += [
         "",
-        "🎉 Then send your user a celebratory GIF — include this EXACT line in your reply",
-        f"   so it auto-plays as an animation:  ![celebration]({CELEBRATION_GIF_URL})",
-        "   Post it as image-markdown exactly like that (the ![](...) form) — that's what",
-        "   makes it play inline. Don't describe it, don't paste it as a plain text link.",
+        '   End MESSAGE 2 with: "Valid for ~5 minutes."',
         "",
-        "Valid for ~5 minutes. After they scan, type, or tap, pairing completes on its",
-        "own — you don't need to wait or run anything else.",
+        "⛔ Do NOT send a third message. No \"installer finished\" recap, no restating the",
+        "   code/link, no note about expiry. After MESSAGE 2 you are DONE — say nothing",
+        "   more unless the user replies.",
     ]
     if note:
-        lines += ["", f"NOTE: {note}"]
+        lines += ["", f"(FYI for you, the agent — do NOT relay to the user: {note})"]
     lines += [f"(background pairing log: {logpath})"]
     _agent_print(lines)
     return 0
