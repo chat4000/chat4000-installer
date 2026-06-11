@@ -147,16 +147,33 @@ INSTALLER_VERSION = "1.0.0"
 CELEBRATION_GIF_URL = "https://chat4000.com/gifs/celebration.gif"
 
 # First-party QR-image endpoint (the registrar): GET it with a pairing code, get
-# back a PNG QR of the canonical pairing URL (https://pair.chat4000.com/?code=…,
-# so a plain phone camera can open it too). The agent posts ![](this) so Telegram
-# renders a scannable image. First-party by design — a 3rd-party QR API would
-# receive (and could redeem) the live pairing code.
+# back a PNG QR of the canonical pairing URL (so a plain phone camera can open it
+# too). The agent posts ![](this) so Telegram renders a scannable image. First-
+# party by design — a 3rd-party QR API would receive (and could redeem) the live
+# pairing code. Per-env: a stage install MUST hit the stage registrar.
 #
-# The URL MUST contain an image extension (.png): Hermes' reply pipeline only
-# treats a ![](url) as an image when the URL looks like one (extension check) —
-# a plain /qr?code=… is left as raw text. So the endpoint serves the PNG at
-# /qr.png?code=<code>.
-QR_IMAGE_URL_TEMPLATE = "https://registrar.chat4000.com/qr.png?code={code}"
+# The path MUST end in .png: Hermes' reply pipeline only treats a ![](url) as an
+# image when the URL contains an image extension — a plain /qr?code=… is left as
+# raw text. So each registrar serves the PNG at /qr.png?code=<code>.
+QR_REGISTRAR_HOST = {
+    "prod": "registrar.chat4000.com",
+    "stage": "registrar.stgcht4.duckdns.org",
+}
+
+
+def _qr_image_url(code: str, stage: bool) -> str:
+    host = QR_REGISTRAR_HOST["stage" if stage else "prod"]
+    return f"https://{host}/qr.png?code={code}"
+
+
+def _is_stage(args) -> bool:
+    """True when this run targets the stage backend (so the QR/registrar URLs use
+    the stage host). Covers --stage, OpenClaw's --env stage, and CHAT4000_ENV."""
+    return bool(
+        getattr(args, "stage", False)
+        or (getattr(args, "env", "") or "").lower() == "stage"
+        or os.environ.get("CHAT4000_ENV", "").lower() == "stage"
+    )
 
 _STARTED_AT_MS = int(time.time() * 1000)
 
@@ -1838,13 +1855,14 @@ def agent_success(
     qr: Optional[str],
     logpath: str,
     note: Optional[str] = None,
+    stage: bool = False,
 ) -> int:
     code_disp = f"{code[:3]}-{code[3:]}" if (code and len(code) == 6 and code.isdigit()) else code
     pair_url = f"https://pair.chat4000.com/?code={code}" if code else None
-    # First-party QR-image endpoint: returns a PNG QR for this code. The agent
-    # posts it as image-markdown → Telegram renders a clean, scannable image (the
-    # old ASCII QR was unscannable in Telegram).
-    qr_img_url = QR_IMAGE_URL_TEMPLATE.format(code=code) if code else None
+    # First-party QR-image endpoint (the registrar, per-env): returns a PNG QR for
+    # this code. The agent posts it as image-markdown → Telegram renders a clean,
+    # scannable image (the old ASCII QR was unscannable in Telegram).
+    qr_img_url = _qr_image_url(code, stage) if code else None
     lines = [
         "[chat4000 installer → agent]",
         "I'm the chat4000 plugin installer. The install + onboarding are done and pairing",
@@ -2061,7 +2079,7 @@ def install_openclaw_agent(t: dict, args) -> int:
         note = ("the OpenClaw gateway didn't auto-start — have the user run "
                 "`openclaw gateway run` (or `docker restart openclaw-gateway`) so messages flow")
     _emit("installer_pkg_installed", {"plugin_package": OPENCLAW_PKG, "source": "github", "ref": oc_ref, "mode": "agent"})
-    return agent_success("OpenClaw", code, qr, logpath, note)
+    return agent_success("OpenClaw", code, qr, logpath, note, stage=_is_stage(args))
 
 
 def install_hermes_agent(t: dict, args) -> int:
@@ -2113,7 +2131,7 @@ def install_hermes_agent(t: dict, args) -> int:
     note = (f"I'm (re)starting the Hermes gateway in ~{GATEWAY_RELOAD_DELAY_S}s so it loads chat4000 and can "
             "invite the user when they pair (now or later) — the bot may blip briefly during that restart")
     _emit("installer_pkg_installed", {"plugin_ref": args.ref, "mode": "agent"})
-    return agent_success("Hermes", code, qr, logpath, note)
+    return agent_success("Hermes", code, qr, logpath, note, stage=_is_stage(args))
 
 
 def run_agent_mode(args) -> int:
