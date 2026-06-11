@@ -146,11 +146,12 @@ INSTALLER_VERSION = "1.0.0"
 # Telegram send_animation (auto-plays inline); .mp4 URLs are NOT picked up.
 CELEBRATION_GIF_URL = "https://chat4000.com/gifs/celebration.gif"
 
-# First-party QR-image endpoint: GET it with a pairing code, get back a PNG QR of
-# the canonical pairing payload (chat4000://pair?code=<code>). The agent posts
-# ![](this) so Telegram renders a scannable image. MUST be first-party — a
-# 3rd-party QR API would receive (and could redeem) the live pairing code.
-QR_IMAGE_URL_TEMPLATE = "https://pair.chat4000.com/qr?code={code}"
+# First-party QR-image endpoint (the registrar): GET it with a pairing code, get
+# back a PNG QR of the canonical pairing URL (https://pair.chat4000.com/?code=…,
+# so a plain phone camera can open it too). The agent posts ![](this) so Telegram
+# renders a scannable image. First-party by design — a 3rd-party QR API would
+# receive (and could redeem) the live pairing code.
+QR_IMAGE_URL_TEMPLATE = "https://registrar.chat4000.com/qr?code={code}"
 
 _STARTED_AT_MS = int(time.time() * 1000)
 
