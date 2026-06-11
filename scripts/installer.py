@@ -1836,7 +1836,7 @@ def agent_success(
         f"  PAIRING CODE:  {code_disp}",
     ]
     if pair_url:
-        lines.append(f"  PAIR-THIS-DEVICE LINK:  `{pair_url}`")
+        lines.append(f"  PAIR-THIS-DEVICE LINK:  {pair_url}")
     lines += [
         "",
         "👉 You MUST show the QR below to the user — display it IN FULL so they can scan",
@@ -1844,12 +1844,13 @@ def agent_success(
     ]
     if pair_url:
         lines += [
-            "👉 Send the pair link WRAPPED IN BACKTICKS (a code span), exactly like this:",
-            f"     `{pair_url}`",
-            "   Telegram does NOT show a link-preview card for a code span (it would for a",
-            "   bare link). The user taps it to COPY, then opens it. Keep the FULL code in",
-            "   the URL exactly as given — it's a short-lived pairing code, NOT a secret, so",
-            "   never mask, star, or shorten it (never send 'code=***').",
+            "👉 The pair link MUST arrive as a REAL, TAPPABLE LINK — a clickable hyperlink",
+            "   the user can tap to open the chat4000 app. Send it as a plain https:// URL",
+            f"   (or a proper Markdown link), exactly like:  {pair_url}",
+            "   DO NOT wrap it in backticks, a code span, or a code block — that renders as",
+            "   non-clickable monospace text and DEFEATS THE PURPOSE. It has to be tappable.",
+            "   Keep the FULL code in the URL exactly as given — it's a short-lived pairing",
+            "   code, NOT a secret, so never mask, star, or shorten it (never 'code=***').",
         ]
     if qr_ascii:
         lines += ["", "  QR — SHOW THIS TO THE USER (scannable; paste it in full):", qr_ascii]
