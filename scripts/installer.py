@@ -1396,7 +1396,8 @@ def _emit_agent_detected(t: dict) -> None:
             "layout": t.get("layout"),
             "install_date": st.get("install_date"),
             "age_days": st.get("age_days"),
-            "channels": st.get("channels"),
+            # IN1: channel NAMES intentionally dropped (privacy trim, DEC2) — only
+            # the count rides telemetry now.
             "channel_count": st.get("channel_count"),
             "session_count": st.get("session_count"),
             "agent_count": st.get("agent_count"),
@@ -1520,15 +1521,23 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
 
     hdr("🪄 Running install wizard")
     _emit("installer_handing_off_to_wizard", dest="hermes")
-    # exec so the wizard owns the tty for Ctrl-C handling during pair. Only safe
-    # for a single selected target (it replaces this process).
+    # IN2: run the wizard as a CHILD process (inherited stdio → it stays fully
+    # interactive for the QR / pairing and owns Ctrl-C), instead of exec-replacing
+    # this process. Running it as a child means we regain control on return and can
+    # record the outcome — the success/failure was previously a blind spot.
     try:
-        os.execv(f"{venv_bin}/chat4000", [f"{venv_bin}/chat4000", "wizard"])  # noqa: S606
+        wizard_rc = subprocess.run([f"{venv_bin}/chat4000", "wizard"]).returncode
     except OSError as exc:
-        err(f"Could not exec wizard: {exc}")
-        _emit("installer_failed", {"stage": "wizard_exec", "error_class": type(exc).__name__, "error_msg": str(exc)[:200]}, dest="hermes")
+        err(f"Could not run wizard: {exc}")
+        _emit("installer_failed", {"stage": "wizard", "error_class": type(exc).__name__, "error_msg": str(exc)[:200]}, dest="hermes")
         return 1
-    return 0  # unreachable after execv
+    if wizard_rc == 0:
+        ok("Wizard completed.")
+        _emit("installer_succeeded", {}, dest="hermes")
+    else:
+        err(f"Wizard exited {wizard_rc}.")
+        _emit("installer_failed", {"stage": "wizard", "exit_code": wizard_rc}, dest="hermes")
+    return wizard_rc
 
 
 def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
