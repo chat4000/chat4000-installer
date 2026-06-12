@@ -1997,12 +1997,15 @@ PAIR_EMIT_TIMEOUT = 60.0  # seconds to wait for the detached pair child to print
 # Seconds the detached gateway-reload waits before bouncing the Hermes gateway —
 # long enough for the agent to relay the code (+GIF) to the user first, since the
 # restart kills the gateway that IS the relaying agent.
-# 120s, not 30: the Hermes agent runs INSIDE the gateway, so this restart kills
-# the agent's relay turn. 30s lost the race against gpt-5.5's ~6s/call latency
-# on a ~100k-token context plus the 4.7MB GIF upload — the agent got interrupted
-# mid-relay, resumed with a 'turn interrupted' note, and RE-RAN the installer
-# (observed on hermes-test-91 and -92). The delay must outlast the whole relay.
-GATEWAY_RELOAD_DELAY_S = 120
+# Hard cap on waiting for the pairing watcher before the gateway reload fires
+# anyway: pairing codes live 300s, plus slack. The reload is EVENT-driven (when
+# the watcher exits — device redeemed or window expired), not timer-driven: the
+# Hermes agent runs INSIDE the gateway, so any fixed-delay restart races the
+# agent's user-facing relay turn and kills it mid-send. 30s lost that race on
+# hermes-test-91/92 (re-ran the installer on resume); 120s STILL lost it on
+# hermes-test-93 (message 2 never sent, turn never resumed). Only "after the
+# pairing window resolves" is guaranteed to be after the relay mattered.
+GATEWAY_RELOAD_MAX_WAIT_S = 330
 # v2 plugins print a universal https link; v1 printed a chat4000:// deep link.
 _QR_RE = re.compile(r"(chat4000://pair\?\S+|https://pair\.chat4000\.com/\?\S+)")
 _CODE_IN_URI_RE = re.compile(r"[?&]code=(\d+)")
@@ -2081,14 +2084,14 @@ def agent_success(
         "as its OWN send; WAIT for that send to complete/deliver; only THEN send",
         "MESSAGE 2 as a second, separate send. Never bundle them into one message.",
         "",
-        "⚡ IF YOU GET INTERRUPTED: a couple of minutes after this block, the agent",
-        "gateway on this machine restarts (it must, to load the chat4000 plugin). If",
-        "that restart cuts your turn and the session resumes with a note like 'your",
-        "previous turn was interrupted by a gateway restart' — NOTHING IS WRONG; the",
-        "install is STILL successful. Do NOT re-run the installer (a re-run can",
-        "invalidate the pairing code your user is typing in RIGHT NOW), do NOT run",
-        "any command. Just send whichever of the two messages you haven't sent yet,",
-        "then stop. The install command must run EXACTLY ONCE, ever.",
+        "⚡ IF YOU GET INTERRUPTED: after your user pairs (or the pairing window",
+        "ends), the agent gateway on this machine restarts — it must, to load the",
+        "chat4000 plugin. If that restart cuts your turn and the session resumes",
+        "with a note like 'your previous turn was interrupted by a gateway restart'",
+        "— NOTHING IS WRONG; the install is STILL successful. Do NOT re-run the",
+        "installer (a re-run can invalidate the pairing code your user is typing in",
+        "RIGHT NOW), do NOT run any command. Just send whichever of the two messages",
+        "you haven't sent yet, then stop. The install command runs EXACTLY ONCE, ever.",
         "",
         "═══ MESSAGE 1 — SEND THIS FIRST, BY ITSELF, before any other message: ═══",
         gif_line,
@@ -2333,14 +2336,24 @@ fi
 """
 
 
-def _spawn_detached_gateway_reload(hermes_bin: str, delay: int = GATEWAY_RELOAD_DELAY_S) -> None:
-    """Detached: after `delay`s (giving the agent time to relay the code + GIF
-    first), reload the Hermes gateway so it loads chat4000. Unconditional — the
-    gateway discovers plugins only at startup, so it must restart regardless of
-    whether/when the phone pairs, or a slow / expired / later-manual pair finds no
-    plugin loaded. The reload script lives in a temp file so its own argv never
-    contains the 'hermes gateway' pkill pattern (can't self-kill); it self-deletes."""
-    script = f"sleep {int(delay)}\n" + _hermes_gateway_reload_sh(hermes_bin)
+def _spawn_detached_gateway_reload(hermes_bin: str, max_wait: int = GATEWAY_RELOAD_MAX_WAIT_S) -> None:
+    """Detached: once the pairing watcher RESOLVES (device redeemed or the code
+    window expired; hard cap `max_wait`s), reload the Hermes gateway so it loads
+    chat4000. Event-driven, not a timer — the agent relaying to the user lives
+    inside the gateway, and every fixed delay we tried lost the race and killed
+    the relay mid-send. Unconditional after that — the gateway discovers plugins
+    only at startup, so it must restart regardless of how pairing went. The
+    reload script lives in a temp file so its own argv never contains the
+    'hermes gateway' pkill pattern (can't self-kill); it self-deletes."""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        if subprocess.run(["pgrep", "-f", "chat4000-gwreload"], capture_output=True, timeout=10).returncode == 0:
+            return  # a reload waiter from a previous run is already pending — one bounce is enough
+    wait_sh = (
+        "waited=0\n"
+        f"while pgrep -f 'chat4000 pair' >/dev/null 2>&1 && [ \"$waited\" -lt {int(max_wait)} ]; do sleep 5; waited=$((waited+5)); done\n"
+        "sleep 5\n"
+    )
+    script = wait_sh + _hermes_gateway_reload_sh(hermes_bin)
     sh_path = f"/tmp/chat4000-gwreload-{uuid.uuid4().hex[:8]}.sh"
     try:
         Path(sh_path).write_text("#!/usr/bin/env bash\n" + script + '\nrm -f "$0"\n', encoding="utf-8")
@@ -2450,9 +2463,9 @@ def install_hermes_agent(t: dict, args) -> int:
     #    relays the code first; then the gateway reloads and invites whoever pairs,
     #    now or later. (Earlier this was gated on pair-success — that left the
     #    gateway plugin-less whenever the first window lapsed.)
-    _spawn_detached_gateway_reload(f"{venv_bin}/hermes", delay=GATEWAY_RELOAD_DELAY_S)
-    note = (f"I'm (re)starting the Hermes gateway in ~{GATEWAY_RELOAD_DELAY_S}s so it loads chat4000 and can "
-            "invite the user when they pair (now or later) — the bot may blip briefly during that restart")
+    _spawn_detached_gateway_reload(f"{venv_bin}/hermes")
+    note = ("after your user pairs (or the code window ends) I restart the Hermes gateway so it "
+            "loads chat4000 — the bot may blip briefly at that moment")
     _emit("installer_pkg_installed", {"plugin_ref": hm_ref, "mode": "agent"})
     return agent_success("Hermes", code, qr, logpath, note, stage=_is_stage(args))
 
