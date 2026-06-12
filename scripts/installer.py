@@ -1469,10 +1469,13 @@ def openclaw_install_plugin(openclaw: str, ref: str, *, quiet: bool = False) -> 
     re-installs re-link the same config path instead of accumulating dead
     plugins.load.paths entries.
 
-    Returns (success, used_spec, output_tail)."""
+    Returns (success, used_spec, output_tail, error_class). error_class is None
+    on success, "HostTooOld" when the host-version preflight refused (IN6 — the
+    failure stage must be distinguishable from a generic install failure), and
+    "InstallFailed" for everything else."""
     srcdir, dl_err = _download_github_tarball(OPENCLAW_REPO_SLUG, ref)
     if not srcdir:
-        return False, None, dl_err
+        return False, None, dl_err, "InstallFailed"
 
     base = Path.home() / ".openclaw" / "chat4000-plugin-src"
     checkout = str(base / "checkout")
@@ -1481,14 +1484,14 @@ def openclaw_install_plugin(openclaw: str, ref: str, *, quiet: bool = False) -> 
         base.mkdir(parents=True, exist_ok=True)
         shutil.move(srcdir, checkout)
     except OSError as exc:
-        return False, None, f"placing the plugin checkout under {base} failed: {exc}"
+        return False, None, f"placing the plugin checkout under {base} failed: {exc}", "InstallFailed"
     finally:
         shutil.rmtree(os.path.dirname(srcdir), ignore_errors=True)
 
     too_old = _openclaw_too_old_error(openclaw, checkout, ref)
     if too_old:
         shutil.rmtree(base, ignore_errors=True)
-        return False, None, too_old
+        return False, None, too_old, "HostTooOld"
 
     link_tail = _openclaw_prepare_checkout(checkout, quiet=quiet)
     if link_tail is None:
@@ -1496,10 +1499,11 @@ def openclaw_install_plugin(openclaw: str, ref: str, *, quiet: bool = False) -> 
         # A link install exits 0 even when the plugin fails its load test; the
         # "failed to load" report in the output is the real failure signal.
         if rc == 0 and "failed to load" not in out:
-            return True, f"link:github.com/{OPENCLAW_REPO_SLUG}@{ref}", ""
+            return True, f"link:github.com/{OPENCLAW_REPO_SLUG}@{ref}", "", None
         link_tail = out[-512:]
 
-    return False, None, _scrub_secrets(link_tail.strip()) if link_tail.strip() else ""
+    tail = _scrub_secrets(link_tail.strip()) if link_tail.strip() else ""
+    return False, None, tail, "InstallFailed"
 
 
 def detect_restart_method() -> Optional[str]:
@@ -1934,6 +1938,9 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
         # enabled, and a later manual `chat4000 pair` needs chat4000 loaded.
         err(f"Pairing exited {pair_rc}. Pair again any time: {chat4000_bin} pair")
         _emit("installer_failed", {"stage": "pair", "exit_code": pair_rc})
+    else:
+        # IN7: parity with the OpenClaw flow — the interactive pair succeeded.
+        _emit("pairing_completed_via_installer", {})
 
     # 3/3 — AFTER pairing resolves: restart the gateway. Hermes has no hot-reload
     # (plugins are discovered only at startup), so this is what actually puts
@@ -1943,8 +1950,10 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
         say("Starting the gateway so it loads chat4000 — your phone will finish joining in ~15s.")
     else:
         say("Starting the gateway so it loads chat4000.")
-    if _hermes_restart_gateway(venv_bin):
+    restart_method = _hermes_restart_gateway(venv_bin)
+    if restart_method:
         ok("Gateway restarted — chat4000 is loading.")
+        _emit("installer_gateway_restarted", {"method": restart_method})  # IN7
     else:
         warn("Could not restart the Hermes gateway automatically.")
         warn(f"Restart it yourself:  {C_CYN}{venv_bin}/hermes gateway restart{C_RST}")
@@ -1980,7 +1989,7 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
     else:
         hdr(f"📦 Installing {OPENCLAW_PKG} from GitHub @{oc_ref}")
 
-    success, used_spec, output_tail = openclaw_install_plugin(openclaw_path, oc_ref)
+    success, used_spec, output_tail, fail_class = openclaw_install_plugin(openclaw_path, oc_ref)
     if not success:
         err("Installing the OpenClaw plugin from GitHub failed.")
         err("Common causes:")
@@ -1988,7 +1997,9 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
         err("  - npm missing on PATH (needed for the linked install's dependencies)")
         err(f"  - The `{oc_ref}` tag doesn't exist on github.com/{OPENCLAW_REPO_SLUG} yet")
         err("  - Permissions on the OpenClaw plugins directory")
-        _emit("installer_failed", {"stage": "plugin_install", "error_class": "InstallFailed", "error_msg": output_tail[:200] or "no output", "output_tail": output_tail, "ref": oc_ref})
+        # IN6: error_class distinguishes the host-version preflight (HostTooOld)
+        # from a generic InstallFailed.
+        _emit("installer_failed", {"stage": "plugin_install", "error_class": fail_class or "InstallFailed", "error_msg": output_tail[:200] or "no output", "output_tail": output_tail, "ref": oc_ref})
         return 1
     ok(f"chat4000 plugin ready (GitHub @{oc_ref}).")
     _emit("installer_pkg_installed", {"plugin_package": OPENCLAW_PKG, "source": "github", "ref": oc_ref, "spec": used_spec, "from_version": cur_ver, "was_installed": installed})
@@ -2170,8 +2181,19 @@ def _agent_print(lines: list) -> None:
     sys.stdout.flush()
 
 
-def agent_error(stage: str, detail: str) -> int:
+def agent_error(stage: str, detail: str, *, stage_token: Optional[str] = None, error_class: Optional[str] = None) -> int:
+    """Terse agent-addressed failure block. `stage` is the human-readable prose
+    for the relay; `stage_token` is the IN6 registry stage (detect, select_target,
+    pip_install, import_check, prepare, setup, pair, plugin_install) — when set,
+    the matching `installer_failed` terminal event fires (IN7). The crash /
+    interrupt boundary passes NO token: it already emitted installer_crashed /
+    installer_cancelled and must not double-count a terminal state."""
     detail = _scrub_secrets((detail or "").strip())[-800:] or "(no further detail)"
+    if stage_token:
+        props = {"stage": stage_token, "error_msg": detail[:200]}
+        if error_class:
+            props["error_class"] = error_class
+        _emit("installer_failed", props)
     _agent_print(
         [
             "[chat4000 installer → agent]  ❌ INSTALL FAILED — RELAY THIS NOW",
@@ -2216,6 +2238,10 @@ def agent_success(
     pair_ttl: Optional[int] = None,
     reusable: bool = False,
 ) -> int:
+    # IN7: agent-mode terminal success — install + setup + detached pair start
+    # all succeeded (the only path here). Pairing itself completes detached;
+    # the completion event is the plugin's PL4, not the installer's.
+    _emit("installer_succeeded", {})
     code_disp = f"{code[:3]}-{code[3:]}" if (code and len(code) == 6 and code.isdigit()) else code
     pair_url = f"https://pair.chat4000.com/?code={code}" if code else None
     # First-party QR-image endpoint (the registrar, per-env): returns a PNG QR for
@@ -2614,19 +2640,22 @@ def _spawn_detached_gateway_reload(hermes_bin: str, max_wait: int = GATEWAY_RELO
         )
 
 
-def _hermes_restart_gateway(venv_bin: str) -> bool:
+def _hermes_restart_gateway(venv_bin: str) -> Optional[str]:
     """Restart the Hermes gateway NOW (human flow — we don't live inside the
     gateway, so a synchronous bounce can't kill us). Prefers the native
     `hermes gateway restart` (supervisor-aware, no argv guessing), time-capped;
     only when that fails falls back to the pkill + identical-argv relaunch
     script (_hermes_gateway_reload_sh, native attempt skipped — we just tried).
-    The agent flows keep their detached, event-driven reload instead."""
+    The agent flows keep their detached, event-driven reload instead.
+
+    Returns the method that worked — "native" | "relaunch" (the IN7
+    installer_gateway_restarted prop) — or None when both failed."""
     hermes_bin = f"{venv_bin}/hermes"
     say(f"$ {hermes_bin} gateway restart")
     try:
         r = subprocess.run([hermes_bin, "gateway", "restart"], capture_output=True, text=True, timeout=90)
         if r.returncode == 0:
-            return True
+            return "native"
         out = ((r.stdout or "") + (r.stderr or "")).strip()
         warn(f"`hermes gateway restart` exited {r.returncode}{(': ' + out[:300]) if out else ''} — falling back to pkill + relaunch.")
     except subprocess.TimeoutExpired:
@@ -2642,9 +2671,9 @@ def _hermes_restart_gateway(venv_bin: str) -> bool:
     try:
         Path(sh_path).write_text("#!/usr/bin/env bash\n" + script, encoding="utf-8")
         os.chmod(sh_path, 0o700)
-        return subprocess.run(["bash", sh_path], timeout=180).returncode == 0
+        return "relaunch" if subprocess.run(["bash", sh_path], timeout=180).returncode == 0 else None
     except (OSError, subprocess.SubprocessError):
-        return False
+        return None
     finally:
         with contextlib.suppress(OSError):
             os.unlink(sh_path)
@@ -2655,9 +2684,10 @@ def install_openclaw_agent(t: dict, args) -> int:
     oc = t["bin"]
     oc_ref = args.openclaw_branch or args.ref
     # 1. Install the plugin from the GitHub ref (quiet).
-    success, _spec, tail = openclaw_install_plugin(oc, oc_ref, quiet=True)
+    success, _spec, tail, fail_class = openclaw_install_plugin(oc, oc_ref, quiet=True)
     if not success:
-        return agent_error(f"installing the OpenClaw plugin from GitHub @{oc_ref}", tail or "no output")
+        return agent_error(f"installing the OpenClaw plugin from GitHub @{oc_ref}", tail or "no output",
+                           stage_token="plugin_install", error_class=fail_class or "InstallFailed")
     # 2. Onboard the bot identity — no phone needed (--self-redeem), no pairing yet.
     setup_cmd = [oc, "chat4000", "setup", "--self-redeem", "--no-pair"]
     if args.stage:
@@ -2668,7 +2698,8 @@ def install_openclaw_agent(t: dict, args) -> int:
         setup_cmd += ["--service-token", args.service_token]
     r = subprocess.run(setup_cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        return agent_error("onboarding the plugin identity", ((r.stdout or "") + (r.stderr or "")).strip())
+        return agent_error("onboarding the plugin identity", ((r.stdout or "") + (r.stderr or "")).strip(),
+                           stage_token="setup")
     # 3. Start device pairing DETACHED and capture the code.
     pair_cmd = [oc, "chat4000", "pair"]
     if args.stage:
@@ -2683,7 +2714,7 @@ def install_openclaw_agent(t: dict, args) -> int:
     pair_cmd += _pair_flag_args(args)
     code, qr, logpath, perr = spawn_detached_pair(pair_cmd, _pair_env())
     if not code:
-        return agent_error("starting device pairing", perr or "no pairing code produced")
+        return agent_error("starting device pairing", perr or "no pairing code produced", stage_token="pair")
     # 4. (Re)start the gateway so the channel goes live. It's a separate process,
     #    so this can't kill the agent running us. Soft-fail — the code is already
     #    valid; the user just needs the gateway up for messages to flow.
@@ -2714,11 +2745,13 @@ def install_hermes_agent(t: dict, args) -> int:
         out = getattr(exc, "stderr", None) or getattr(exc, "stdout", None) or ""
         if isinstance(out, bytes):
             out = out.decode("utf-8", "ignore")
-        return agent_error(f"installing the Hermes plugin from GitHub @{hm_ref}", out or str(exc))
+        return agent_error(f"installing the Hermes plugin from GitHub @{hm_ref}", out or str(exc),
+                           stage_token="pip_install")
     # 2. Import-check.
     chk = subprocess.run([venv_python, "-c", "import chat4000_hermes_plugin"], capture_output=True, text=True)
     if chk.returncode != 0:
-        return agent_error("verifying the installed plugin imports", (chk.stderr or "").strip())
+        return agent_error("verifying the installed plugin imports", (chk.stderr or "").strip(),
+                           stage_token="import_check")
     symlink_chat4000_onto_path(venv_bin)
     # 3. Enable the plugin + onboard identity. `prepare` is pre-restart prep — it
     #    does NOT restart the gateway, so it can't kill an agent running us.
@@ -2727,7 +2760,8 @@ def install_hermes_agent(t: dict, args) -> int:
         prep_cmd.append("--stage")
     r = subprocess.run(prep_cmd, capture_output=True, text=True)
     if r.returncode != 0:
-        return agent_error("preparing the Hermes plugin (enable + onboard)", ((r.stdout or "") + (r.stderr or "")).strip())
+        return agent_error("preparing the Hermes plugin (enable + onboard)", ((r.stdout or "") + (r.stderr or "")).strip(),
+                           stage_token="prepare")
     # 4. Start device pairing DETACHED, capture the code.
     pair_cmd = [chat4000, "pair"]
     if args.stage:
@@ -2735,7 +2769,7 @@ def install_hermes_agent(t: dict, args) -> int:
     pair_cmd += _pair_flag_args(args)
     code, qr, logpath, perr = spawn_detached_pair(pair_cmd, _pair_env())
     if not code:
-        return agent_error("starting device pairing", perr or "no pairing code produced")
+        return agent_error("starting device pairing", perr or "no pairing code produced", stage_token="pair")
     # 5. PROACTIVELY (re)start the gateway so it LOADS chat4000. Hermes discovers
     #    plugins only at startup, so a gateway that booted before this install will
     #    never run chat4000 until it restarts — and this must NOT be gated on the
@@ -2821,12 +2855,14 @@ def run_agent_mode(args) -> int:
         return agent_error(
             "detecting an agent host",
             "no Hermes or OpenClaw install found on this machine. Re-run with --hermes-bin <venv/bin> or --openclaw-bin <path>.",
+            stage_token="detect",
         )
     if len(pool) > 1:
         listed = "; ".join(f"{x['kind']} {x['display']}" for x in pool)
         return agent_error(
             "choosing where to install",
             f"found {len(pool)} hosts ({listed}). Re-run with --target hermes|openclaw, or --hermes-bin/--openclaw-bin to pick one.",
+            stage_token="select_target",
         )
 
     t = pool[0]
