@@ -2165,12 +2165,29 @@ def _pair_env() -> dict:
     return env
 
 
+def _kill_stale_pair_watchers() -> None:
+    """Exactly ONE active pairing watcher per box. Re-runs are common (agents
+    retry freely) and each run spawns a detached watcher that polls the
+    registrar's /pair/status every 1.5s (40 req/min). The registrar allows 60
+    req/min per IP, so TWO concurrent watchers (80 req/min) trip the limit and
+    BOTH die with '429 M_LIMIT_EXCEEDED' — leaving the phone stuck at 'Waiting
+    for your plugin' (observed live on hermes-test-91). Old watchers are
+    worthless the moment a new code is issued; kill them before spawning."""
+    try:
+        # Matches 'chat4000 pair …' (Hermes) and 'openclaw chat4000 pair …'
+        # (OpenClaw) cmdlines; our own argv never contains this substring.
+        subprocess.run(["pkill", "-f", "chat4000 pair"], capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass  # best-effort: no pkill on the box → re-runs keep the old risk
+
+
 def spawn_detached_pair(cmd: list, env: dict) -> tuple:
     """Start the pair command DETACHED (own session, output → a /tmp log), then
     tail the log until it prints the pairing code + QR. Returns
     (code, qr_uri, logpath, error). On success the child keeps running (polling
     the registrar for the rest of its TTL) after we return — we never wait on it,
     which is the whole point: this process exits while pairing continues."""
+    _kill_stale_pair_watchers()
     logpath = f"/tmp/chat4000-pair-{uuid.uuid4().hex[:8]}.log"
     try:
         logf = open(logpath, "ab")  # noqa: SIM115  # handed to the child; we close our copy below
