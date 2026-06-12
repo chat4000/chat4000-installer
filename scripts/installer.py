@@ -1325,6 +1325,45 @@ def _openclaw_prepare_checkout(checkout: str, *, quiet: bool) -> Optional[str]:
     return None
 
 
+def _openclaw_too_old_error(openclaw: str, checkout: str, ref: str) -> Optional[str]:
+    """PREFLIGHT the host-version floor the plugin ref declares (package.json →
+    openclaw.install.minHostVersion, e.g. ">=2026.5.27" on main) against
+    `openclaw --version`, BEFORE any install attempt. Returns a human-ready
+    error when the host is too old, None when OK or undeterminable (the host
+    re-checks during install anyway — this is the friendly early error with a
+    clear remedy, not the enforcement)."""
+    try:
+        with open(os.path.join(checkout, "package.json"), encoding="utf-8") as fh:
+            pkg = json.load(fh)
+        req = ((pkg.get("openclaw") or {}).get("install") or {}).get("minHostVersion") or ""
+    except (OSError, ValueError):
+        return None
+    m_req = re.search(r"(\d+(?:\.\d+)+)", str(req))
+    if not m_req:
+        return None
+    try:
+        r = subprocess.run([openclaw, "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m_have = re.search(r"(\d+(?:\.\d+)+)", (r.stdout or "") + (r.stderr or ""))
+    if not m_have:
+        return None
+    need = [int(x) for x in m_req.group(1).split(".")]
+    have = [int(x) for x in m_have.group(1).split(".")]
+    width = max(len(need), len(have))
+    need += [0] * (width - len(need))
+    have += [0] * (width - len(have))
+    if have < need:
+        return (
+            f"this machine's OpenClaw is {m_have.group(1)}, but the plugin ref '{ref}' requires "
+            f"OpenClaw >= {m_req.group(1)} (its declared minHostVersion). The install can NEVER "
+            "succeed on this OpenClaw version. Either upgrade OpenClaw on this machine "
+            "(npm install -g openclaw@latest, then restart the gateway) or install an older "
+            "plugin ref (--openclaw-branch stable)."
+        )
+    return None
+
+
 def openclaw_install_plugin(openclaw: str, ref: str, force: bool = True, *, quiet: bool = False) -> tuple:
     """Install the OpenClaw plugin FROM ITS GITHUB REF (not the npm registry).
 
@@ -1359,6 +1398,11 @@ def openclaw_install_plugin(openclaw: str, ref: str, force: bool = True, *, quie
         return False, None, f"placing the plugin checkout under {base} failed: {exc}"
     finally:
         shutil.rmtree(os.path.dirname(srcdir), ignore_errors=True)
+
+    too_old = _openclaw_too_old_error(openclaw, checkout, ref)
+    if too_old:
+        shutil.rmtree(base, ignore_errors=True)
+        return False, None, too_old
 
     copy_tail = ""
     for form in ([openclaw, "plugins", "install"], [openclaw, "plugin", "install"]):
@@ -1713,17 +1757,18 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
         hdr("Reset mode (Hermes, destructive)")
         hermes_reset_local_state()
 
-    hdr(f"📦 Installing chat4000 plugin from {HERMES_REPO_URL}@{args.ref}")
+    hm_ref = args.hermes_branch or args.ref
+    hdr(f"📦 Installing chat4000 plugin from {HERMES_REPO_URL}@{hm_ref}")
     uv = detect_uv()
     try:
         if uv:
             ok(f"Using uv at {C_CYN}{uv}{C_RST}")
             _emit("installer_uv_detected", {"uv_path": uv})
-            hermes_install_via_uv(uv, venv_python, args.ref)
+            hermes_install_via_uv(uv, venv_python, hm_ref)
             installer_used = "uv"
         else:
             warn("uv not found — falling back to venv pip")
-            hermes_install_via_pip(venv_python, args.ref)
+            hermes_install_via_pip(venv_python, hm_ref)
             installer_used = "pip"
     except subprocess.CalledProcessError as exc:
         err(f"Install failed: {exc}")
@@ -1747,7 +1792,7 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
     )
     plugin_version = ver.stdout.strip() if ver.returncode == 0 else "unknown"
     ok(f"Installed version: {C_GRN}{plugin_version}{C_RST}")
-    _emit("installer_pkg_installed", {"installer_used": installer_used, "plugin_ref": args.ref, "plugin_version": plugin_version})
+    _emit("installer_pkg_installed", {"installer_used": installer_used, "plugin_ref": hm_ref, "plugin_version": plugin_version})
 
     symlink_chat4000_onto_path(venv_bin)
 
@@ -1797,7 +1842,7 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
 
     # Install from the GitHub tag (NOT npm). --plugin-version overrides the gh
     # ref for OpenClaw only; otherwise the shared --ref (default: stable) is used.
-    oc_ref = args.plugin_version or args.ref
+    oc_ref = args.openclaw_branch or args.ref
     installed, cur_ver, _latest, _newer = detect_plugin_state(openclaw_path)
     if installed:
         hdr(f"⬆️  Reinstalling {OPENCLAW_PKG} from GitHub @{oc_ref}  {C_DIM}(have {cur_ver}){C_RST}")
@@ -2197,7 +2242,7 @@ def _spawn_detached_gateway_reload(hermes_bin: str, delay: int = GATEWAY_RELOAD_
 def install_openclaw_agent(t: dict, args) -> int:
     use_agent_distinct_id("openclaw")  # BA5
     oc = t["bin"]
-    oc_ref = args.plugin_version or args.ref
+    oc_ref = args.openclaw_branch or args.ref
     # 1. Install the plugin from the GitHub ref (quiet).
     success, _spec, tail = openclaw_install_plugin(oc, oc_ref, force=True, quiet=True)
     if not success:
@@ -2244,18 +2289,19 @@ def install_hermes_agent(t: dict, args) -> int:
     venv_bin = t["venv_bin"]
     venv_python = t["venv_python"]
     chat4000 = f"{venv_bin}/chat4000"
+    hm_ref = args.hermes_branch or args.ref
     # 1. Install the plugin from the GitHub ref (quiet).
     uv = detect_uv()
     try:
         if uv:
-            hermes_install_via_uv(uv, venv_python, args.ref, capture=True)
+            hermes_install_via_uv(uv, venv_python, hm_ref, capture=True)
         else:
-            hermes_install_via_pip(venv_python, args.ref, capture=True)
+            hermes_install_via_pip(venv_python, hm_ref, capture=True)
     except subprocess.CalledProcessError as exc:
         out = getattr(exc, "stderr", None) or getattr(exc, "stdout", None) or ""
         if isinstance(out, bytes):
             out = out.decode("utf-8", "ignore")
-        return agent_error(f"installing the Hermes plugin from GitHub @{args.ref}", out or str(exc))
+        return agent_error(f"installing the Hermes plugin from GitHub @{hm_ref}", out or str(exc))
     # 2. Import-check.
     chk = subprocess.run([venv_python, "-c", "import chat4000_hermes_plugin"], capture_output=True, text=True)
     if chk.returncode != 0:
@@ -2287,7 +2333,7 @@ def install_hermes_agent(t: dict, args) -> int:
     _spawn_detached_gateway_reload(f"{venv_bin}/hermes", delay=GATEWAY_RELOAD_DELAY_S)
     note = (f"I'm (re)starting the Hermes gateway in ~{GATEWAY_RELOAD_DELAY_S}s so it loads chat4000 and can "
             "invite the user when they pair (now or later) — the bot may blip briefly during that restart")
-    _emit("installer_pkg_installed", {"plugin_ref": args.ref, "mode": "agent"})
+    _emit("installer_pkg_installed", {"plugin_ref": hm_ref, "mode": "agent"})
     return agent_success("Hermes", code, qr, logpath, note, stage=_is_stage(args))
 
 
@@ -2387,12 +2433,13 @@ def main() -> int:
     parser.add_argument("--no-wizard", action="store_true", help="(hermes) install only, don't run the wizard")
     parser.add_argument("--ref", default=DEFAULT_REF, help=f"GitHub tag/branch/SHA to install for BOTH hosts (default: {DEFAULT_REF})")
     parser.add_argument("--branch", default=None, metavar="NAME", help="install the plugin from this GitHub branch (both hosts) — alias for --ref <branch>")
+    parser.add_argument("--hermes-branch", default=None, metavar="NAME", help="GitHub branch/tag/SHA of the HERMES plugin repo — overrides --branch/--ref for Hermes only")
     parser.add_argument("--latest", action="store_true", help=f"install the LATEST code (the repo's default branch '{LATEST_REF}') instead of the '{DEFAULT_REF}' tag")
     # OpenClaw flow
     parser.add_argument("--no-pair", action="store_true", help="(openclaw) install + restart only, don't pair")
     parser.add_argument("--no-restart", action="store_true", help="(openclaw) install only, don't touch the gateway")
     parser.add_argument("--force", action="store_true", help="(openclaw) force-reinstall in place (gh installs are always forced)")
-    parser.add_argument("--plugin-version", default=None, metavar="REF", help="(openclaw) override the GitHub ref for OpenClaw only (tag/branch/SHA)")
+    parser.add_argument("--openclaw-branch", "--plugin-version", dest="openclaw_branch", default=None, metavar="NAME", help="GitHub branch/tag/SHA of the OPENCLAW plugin repo — overrides --branch/--ref for OpenClaw only (--plugin-version is the legacy alias)")
     parser.add_argument("--env", default=None, metavar="NAME", help="(openclaw) backend environment: prod | stage")
     parser.add_argument("--service-token", default=None, metavar="TOKEN", help="(openclaw) registrar SERVICE_TOKEN for self-onboard")
     # Common
