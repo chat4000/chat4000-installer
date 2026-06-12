@@ -2069,34 +2069,76 @@ def agent_success(
         "they should see next, so please deliver it precisely as written below — that",
         "is the best UX you can give them.",
         "",
-        "THE CONTRACT — your output is EXACTLY two messages, once each, in this order:",
-        "  1. MESSAGE 1 (the GIF) — the FIRST thing that appears in the chat.",
-        "  2. MESSAGE 2 (the pairing text) — sent only AFTER MESSAGE 1 has gone out.",
-        "Then you produce NOTHING ELSE about this install — not now, not in any LATER",
-        "turn, not in heartbeats, not in status/'unfinished tool' checks — until the",
-        "USER asks. ANY other output about this run, at ANY time, is a FAILURE.",
-        "You are a RELAY, not a reporter: no narration, no summaries, no verification,",
-        "no terminal commands, no log inspection, no talk about yourself or your tools.",
-        "",
-        "HOW TO GET THE ORDER RIGHT (you have gotten this wrong on real runs): the GIF",
-        "is a LARGE file and delivers SLOWLY. If you fire both sends back-to-back, the",
-        "platform delivers MESSAGE 2 first and you FAIL the order. So: send MESSAGE 1",
-        "as its OWN send; WAIT for that send to complete/deliver; only THEN send",
-        "MESSAGE 2 as a second, separate send. Never bundle them into one message.",
-        "",
+    ]
+    if kind == "Hermes":
+        # Hermes mechanics: one agent turn = ONE final reply; the gateway then
+        # splits image-markdown out of it and sends GIF → text → QR in markdown
+        # order. There is no way to send twice — an agent that replies with just
+        # the GIF "to send the rest later" has ended its turn and lost MESSAGE 2
+        # forever (happened live on hermes-test-94).
+        lines += [
+            "THE CONTRACT — send EXACTLY ONE reply, with BOTH parts in it, in order:",
+            "  1. The reply's FIRST LINE: the GIF image markdown (MESSAGE 1 below).",
+            "  2. Immediately after it: MESSAGE 2's exact text (ends with the QR image).",
+            "Your platform splits that single reply into GIF → text → QR for the user.",
+            "When your reply ends, your turn is OVER — you CANNOT send anything later.",
+            "After this one reply you produce NOTHING ELSE about this install — not in",
+            "any later turn, heartbeat, or status/'unfinished tool' check — until the",
+            "USER asks. ANY other output about this run, at ANY time, is a FAILURE.",
+            "You are a RELAY, not a reporter: no narration, no summaries, no verification,",
+            "no terminal commands, no log inspection, no talk about yourself or your tools.",
+            "",
+            "⚠ ONE REPLY, EVERYTHING IN IT — you have failed this on a real run: the",
+            "agent's ENTIRE reply was just the GIF line; it ended its turn planning to",
+            "'send the pairing message next'. There IS no next — the turn was over and",
+            "the user NEVER received the pairing code. The GIF alone is a FAILURE.",
+            "MESSAGE 2 goes in the SAME reply, directly under the GIF line.",
+            "",
+        ]
+    else:
+        lines += [
+            "THE CONTRACT — your output is EXACTLY two messages, once each, in this order:",
+            "  1. MESSAGE 1 (the GIF) — the FIRST thing that appears in the chat.",
+            "  2. MESSAGE 2 (the pairing text) — sent only AFTER MESSAGE 1 has gone out.",
+            "Then you produce NOTHING ELSE about this install — not now, not in any LATER",
+            "turn, not in heartbeats, not in status/'unfinished tool' checks — until the",
+            "USER asks. ANY other output about this run, at ANY time, is a FAILURE.",
+            "You are a RELAY, not a reporter: no narration, no summaries, no verification,",
+            "no terminal commands, no log inspection, no talk about yourself or your tools.",
+            "",
+            "HOW TO GET THE ORDER RIGHT (you have gotten this wrong on real runs): the GIF",
+            "is a LARGE file and delivers SLOWLY. If you fire both sends back-to-back, the",
+            "platform delivers MESSAGE 2 first and you FAIL the order. So: send MESSAGE 1",
+            "as its OWN send; WAIT for that send to complete/deliver; only THEN send",
+            "MESSAGE 2 as a second, separate send. Never bundle them into one message.",
+            "",
+        ]
+    lines += [
         "⚡ IF YOU GET INTERRUPTED: after your user pairs (or the pairing window",
         "ends), the agent gateway on this machine restarts — it must, to load the",
         "chat4000 plugin. If that restart cuts your turn and the session resumes",
         "with a note like 'your previous turn was interrupted by a gateway restart'",
         "— NOTHING IS WRONG; the install is STILL successful. Do NOT re-run the",
         "installer (a re-run can invalidate the pairing code your user is typing in",
-        "RIGHT NOW), do NOT run any command. Just send whichever of the two messages",
-        "you haven't sent yet, then stop. The install command runs EXACTLY ONCE, ever.",
+        "RIGHT NOW), do NOT run any command. Relay anything not yet relayed, then",
+        "stop. The install command runs EXACTLY ONCE, ever.",
         "",
-        "═══ MESSAGE 1 — SEND THIS FIRST, BY ITSELF, before any other message: ═══",
-        gif_line,
-        "",
-        "═══ MESSAGE 2 — send SECOND. Send exactly this text + structure: ═══",
+    ]
+    if kind == "Hermes":
+        lines += [
+            "═══ MESSAGE 1 — the FIRST LINE of your single reply: ═══",
+            gif_line,
+            "",
+            "═══ MESSAGE 2 — the REST of the SAME reply. Exactly this text + structure: ═══",
+        ]
+    else:
+        lines += [
+            "═══ MESSAGE 1 — SEND THIS FIRST, BY ITSELF, before any other message: ═══",
+            gif_line,
+            "",
+            "═══ MESSAGE 2 — send SECOND. Send exactly this text + structure: ═══",
+        ]
+    lines += [
         "The installer ran successfully!!! 🎉✨🥳🎊🙌🚀",
         "",
         "To pair the device, either:",
@@ -2162,6 +2204,10 @@ def agent_success(
         "   ❌ Do NOT send the pairing message (MESSAGE 2) before the GIF (MESSAGE 1). The",
         "      GIF MUST be the first message in the chat. If any text went out before the",
         "      GIF, you got the order WRONG.",
+        "   ❌ Do NOT deliver the GIF alone and stop. On a real run the agent's entire",
+        "      output was \"![](https://chat4000.com/gifs/celebration.gif)\" — and the",
+        "      user got a dancing GIF and NO pairing code, ever. GIF without MESSAGE 2",
+        "      = FAILURE.",
         "   ❌ Do NOT also write the QR url as text — post ONLY the ![](url) image.",
         "   ❌ Do NOT append a trailing offer like \"If that code expired, tell me and I'll",
         "      rerun the install.\"",
