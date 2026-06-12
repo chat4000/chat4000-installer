@@ -6,13 +6,15 @@ instance, reports what it found, lets you choose where to install when there's
 more than one, then installs the plugin with the right toolchain for that host:
 
   • Hermes   → pip/uv git-install from the gh `stable` tag into Hermes' venv,
-               then `chat4000 wizard`
+               then the installer itself drives setup + pairing (R4):
+               `chat4000 prepare` → `chat4000 pair` → gateway restart
   • OpenClaw → download the GitHub tarball for the ref, extract it, then
-               `openclaw plugins install <dir>` — falling back to a linked
-               dev-checkout install (`--link`) when the host refuses TS-only
-               sources (OpenClaw rejects git npm-specs, and this isn't on the
-               npm registry) — then
-               `openclaw chat4000 setup --self-redeem` + gateway restart
+               ALWAYS a linked dev-checkout install
+               (`openclaw plugins install --link <dir>`) — the repo ships
+               TS-only source, isn't on the npm registry, and OpenClaw rejects
+               both git npm-specs and TS-only copy installs — then
+               `openclaw chat4000 setup --self-redeem --no-pair` →
+               `openclaw chat4000 pair` → gateway restart
 
 Runs in the system Python (stdlib only) — no third-party deps, because the
 `rich`/SDK code only exists AFTER the plugin is installed.
@@ -68,7 +70,6 @@ PostHog events fired by this file (ONE self-hosted project, IN4/INF5):
   - installer_openclaw_detected          {openclaw_version, openclaw_path}
   - installer_pkg_installed              {...}
   - installer_gateway_restarted          {method}            (openclaw)
-  - installer_handing_off_to_wizard      (hermes)
   - installer_handing_off_to_setup       {paired}            (openclaw)
   - installer_succeeded / installer_failed / installer_cancelled / installer_crashed
 """
@@ -1453,26 +1454,22 @@ def _openclaw_too_old_error(openclaw: str, checkout: str, ref: str) -> Optional[
     return None
 
 
-def openclaw_install_plugin(openclaw: str, ref: str, force: bool = True, *, quiet: bool = False) -> tuple:
-    """Install the OpenClaw plugin FROM ITS GITHUB REF (not the npm registry).
+def openclaw_install_plugin(openclaw: str, ref: str, *, quiet: bool = False) -> tuple:
+    """Install the OpenClaw plugin FROM ITS GITHUB REF (not the npm registry),
+    ALWAYS as a LINKED (dev-checkout) install.
 
     OpenClaw rejects git npm-specs outright ("unsupported npm spec: git refs
-    are not allowed"), so the ref's GitHub tarball is downloaded and extracted
-    locally, then installed in two attempts:
+    are not allowed") and its COPY install refuses TS-only sources (this repo
+    ships no compiled dist/), so the one shape that works everywhere is: fetch
+    the ref's GitHub tarball, make the checkout runnable
+    (_openclaw_prepare_checkout: telemetry-DSN codegen + npm deps), then
+    `plugins install --link <dir>` — the host's dev-checkout mode, which loads
+    TS source directly. Link mode references the directory in place forever,
+    so the checkout lives at a STABLE path under ~/.openclaw — stable so
+    re-installs re-link the same config path instead of accumulating dead
+    plugins.load.paths entries.
 
-      1. COPY install (`plugins install --force <dir>`, canonical then legacy
-         CLI form) — works once the repo ships compiled dist/ output; newer
-         hosts refuse TS-only sources here.
-      2. LINK install (`plugins install --link <dir>`) — the host's dev-checkout
-         mode, which loads TS source directly; the checkout is first made
-         runnable by _openclaw_prepare_checkout. Link mode references the
-         directory in place forever, so the checkout lives at a STABLE path
-         under ~/.openclaw — stable so re-installs re-link the same config
-         path instead of accumulating dead plugins.load.paths entries.
-
-    Returns (success, used_spec, output_tail) — the tail leads with the FIRST
-    failure (the canonical copy attempt): later fallback noise like the legacy
-    form's "unknown command 'plugin'" must not mask the real error."""
+    Returns (success, used_spec, output_tail)."""
     srcdir, dl_err = _download_github_tarball(OPENCLAW_REPO_SLUG, ref)
     if not srcdir:
         return False, None, dl_err
@@ -1493,17 +1490,6 @@ def openclaw_install_plugin(openclaw: str, ref: str, force: bool = True, *, quie
         shutil.rmtree(base, ignore_errors=True)
         return False, None, too_old
 
-    copy_tail = ""
-    for form in ([openclaw, "plugins", "install"], [openclaw, "plugin", "install"]):
-        cmd = list(form) + (["--force"] if force else []) + [checkout]
-        rc, out = _run_streaming(cmd, quiet=quiet)
-        if rc == 0:
-            # Copied into ~/.openclaw/extensions — the source isn't referenced.
-            shutil.rmtree(base, ignore_errors=True)
-            return True, f"tarball:github.com/{OPENCLAW_REPO_SLUG}@{ref}", ""
-        if not copy_tail:
-            copy_tail = out[-512:]
-
     link_tail = _openclaw_prepare_checkout(checkout, quiet=quiet)
     if link_tail is None:
         rc, out = _run_streaming([openclaw, "plugins", "install", "--link", checkout], quiet=quiet)
@@ -1513,10 +1499,7 @@ def openclaw_install_plugin(openclaw: str, ref: str, force: bool = True, *, quie
             return True, f"link:github.com/{OPENCLAW_REPO_SLUG}@{ref}", ""
         link_tail = out[-512:]
 
-    detail = copy_tail.strip()
-    if link_tail.strip():
-        detail += "\n\nlink-mode fallback then failed with:\n" + link_tail.strip()
-    return False, None, _scrub_secrets(detail.strip()) if detail.strip() else ""
+    return False, None, _scrub_secrets(link_tail.strip()) if link_tail.strip() else ""
 
 
 def detect_restart_method() -> Optional[str]:
@@ -1830,6 +1813,18 @@ def select_targets(targets: list, args) -> Optional[list]:
 # ─── Per-kind install flows ───────────────────────────────────────────────
 
 
+def _pair_flag_args(args) -> list:
+    """--ttl/--reusable pass-through for EVERY `pair` invocation (all four
+    flows). Both plugin CLIs use the same flag names, so one builder serves
+    Hermes (`chat4000 pair`) and OpenClaw (`openclaw chat4000 pair`) alike."""
+    flags: list = []
+    if getattr(args, "pair_ttl", None):
+        flags += ["--ttl", str(args.pair_ttl)]
+    if getattr(args, "reusable", False):
+        flags.append("--reusable")
+    return flags
+
+
 def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
     use_agent_distinct_id("hermes")  # BA5: events from here on use this target's agent_install_id
     venv_bin = t["venv_bin"]
@@ -1885,33 +1880,80 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
 
     symlink_chat4000_onto_path(venv_bin)
 
-    if args.no_wizard or not interactive:
-        if not interactive:
-            warn("Multiple targets selected — skipping the interactive wizard for this one.")
-        else:
-            warn("Skipping wizard (--no-wizard).")
-        print(f"  Pair it any time:  {C_CYN}{venv_bin}/chat4000 wizard{C_RST}")
-        return 0
+    chat4000_bin = f"{venv_bin}/chat4000"
 
-    hdr("🪄 Running install wizard")
-    _emit("installer_handing_off_to_wizard")
-    # IN2: run the wizard as a CHILD process (inherited stdio → it stays fully
-    # interactive for the QR / pairing and owns Ctrl-C), instead of exec-replacing
-    # this process. Running it as a child means we regain control on return and can
-    # record the outcome — the success/failure was previously a blind spot.
+    if not interactive:
+        warn("Multiple targets selected — skipping interactive setup + pairing for this one.")
+        print(f"  Set up + pair it any time:  {C_CYN}{chat4000_bin} prepare && {chat4000_bin} pair{C_RST}")
+        return 0
+    if args.no_wizard:
+        # R4: the wizard handoff is gone — the installer drives setup + pairing
+        # itself now, so this flag changes nothing. Still accepted (docs
+        # reference it), but it's a no-op alias of the new default.
+        warn("--no-wizard is deprecated and now a no-op: there is no wizard handoff anymore — the installer runs setup + pairing itself.")
+
+    # 1/3 — `chat4000 prepare`: the FULL plugin setup (protocol C.6) — enable the
+    # plugin in the Hermes config, onboard the bot, ensure the plugin's one user,
+    # and create the space + control room + invites. Streamed live so the human
+    # sees each step; entirely non-interactive by design.
+    hdr("🔑 Setting up the plugin (bot + user + rooms)")
+    prep_cmd = [chat4000_bin, "prepare"]
+    if args.stage:
+        prep_cmd.append("--stage")
+    prep_rc, _prep_out = _run_streaming(prep_cmd, quiet=False)
+    if prep_rc != 0:
+        err(f"Setup (chat4000 prepare) exited {prep_rc}.")
+        _emit("installer_failed", {"stage": "prepare", "exit_code": prep_rc})
+        return prep_rc
+
+    # 2/3 — `chat4000 pair`: INTERACTIVE (inherited stdio) so the human sees the
+    # QR + code and the watcher's live feedback. Pair-first, restart after — the
+    # same ordering as the agent flow: restarting first would tear the QR away
+    # mid-scan, since the restart below is what bounces the gateway.
+    hdr("📱 Pairing your device")
+    print(f"{C_DIM}Scan the QR with the chat4000 iOS/macOS app. Ctrl-C to skip pairing.{C_RST}\n")
+    pair_cmd = [chat4000_bin, "pair"]
+    if args.stage:
+        pair_cmd.append("--stage")
+    pair_cmd += _pair_flag_args(args)
     try:
-        wizard_rc = subprocess.run([f"{venv_bin}/chat4000", "wizard"]).returncode
+        pair_rc = subprocess.run(pair_cmd).returncode
+    except KeyboardInterrupt:
+        print()
+        warn("Pairing cancelled. Finish any time:")
+        print(f"  {C_CYN}{chat4000_bin} pair{C_RST}  (then restart your Hermes gateway so it loads chat4000)")
+        _emit("installer_cancelled", {"stage": "pair"})
+        return 130
     except OSError as exc:
-        err(f"Could not run wizard: {exc}")
-        _emit("installer_failed", {"stage": "wizard", "error_class": type(exc).__name__, "error_msg": str(exc)[:200]})
+        err(f"Could not run pairing: {exc}")
+        _emit("installer_failed", {"stage": "pair", "error_class": type(exc).__name__, "error_msg": str(exc)[:200]})
         return 1
-    if wizard_rc == 0:
-        ok("Wizard completed.")
-        _emit("installer_succeeded", {})
+    if pair_rc != 0:
+        # Pairing resolved unhappily (expired window, registrar error, …). The
+        # gateway restart below still has to happen — the plugin is installed and
+        # enabled, and a later manual `chat4000 pair` needs chat4000 loaded.
+        err(f"Pairing exited {pair_rc}. Pair again any time: {chat4000_bin} pair")
+        _emit("installer_failed", {"stage": "pair", "exit_code": pair_rc})
+
+    # 3/3 — AFTER pairing resolves: restart the gateway. Hermes has no hot-reload
+    # (plugins are discovered only at startup), so this is what actually puts
+    # chat4000 in the running agent.
+    hdr("🔁 Restarting the Hermes gateway")
+    if pair_rc == 0:
+        say("Starting the gateway so it loads chat4000 — your phone will finish joining in ~15s.")
     else:
-        err(f"Wizard exited {wizard_rc}.")
-        _emit("installer_failed", {"stage": "wizard", "exit_code": wizard_rc})
-    return wizard_rc
+        say("Starting the gateway so it loads chat4000.")
+    if _hermes_restart_gateway(venv_bin):
+        ok("Gateway restarted — chat4000 is loading.")
+    else:
+        warn("Could not restart the Hermes gateway automatically.")
+        warn(f"Restart it yourself:  {C_CYN}{venv_bin}/hermes gateway restart{C_RST}")
+        _emit("installer_failed", {"stage": "gateway_restart", "error_class": "RestartUnavailable", "error_msg": "hermes native restart and pkill+relaunch both failed"})
+        return 1
+    if pair_rc == 0:
+        ok("All set — your device is paired and chat4000 is live.")
+        _emit("installer_succeeded", {})
+    return pair_rc
 
 
 def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
@@ -1938,12 +1980,12 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
     else:
         hdr(f"📦 Installing {OPENCLAW_PKG} from GitHub @{oc_ref}")
 
-    success, used_spec, output_tail = openclaw_install_plugin(openclaw_path, oc_ref, force=True)
+    success, used_spec, output_tail = openclaw_install_plugin(openclaw_path, oc_ref)
     if not success:
         err("Installing the OpenClaw plugin from GitHub failed.")
         err("Common causes:")
         err("  - GitHub / network unreachable from this host (proxy / offline)")
-        err(f"  - This OpenClaw's `plugins install` doesn't accept git specs — try `{openclaw_path} --help`")
+        err("  - npm missing on PATH (needed for the linked install's dependencies)")
         err(f"  - The `{oc_ref}` tag doesn't exist on github.com/{OPENCLAW_REPO_SLUG} yet")
         err("  - Permissions on the OpenClaw plugins directory")
         _emit("installer_failed", {"stage": "plugin_install", "error_class": "InstallFailed", "error_msg": output_tail[:200] or "no output", "output_tail": output_tail, "ref": oc_ref})
@@ -1951,8 +1993,11 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
     ok(f"chat4000 plugin ready (GitHub @{oc_ref}).")
     _emit("installer_pkg_installed", {"plugin_package": OPENCLAW_PKG, "source": "github", "ref": oc_ref, "spec": used_spec, "from_version": cur_ver, "was_installed": installed})
 
-    # Onboard + pair.
-    setup_cmd = [openclaw_path, "chat4000", "setup", "--self-redeem"]
+    # Setup, then pair — TWO invocations (R4): `setup` now does the FULL plugin
+    # setup (protocol C.6 — bot onboard + user/ensure + rooms + invites) with no
+    # device involved, and pairing is the installer's own step so the --pair-ttl/
+    # --reusable flags reach the `pair` CLI (setup doesn't accept them).
+    setup_cmd = [openclaw_path, "chat4000", "setup", "--self-redeem", "--no-pair"]
     if args.stage:
         setup_cmd.append("--stage")
     elif args.env:
@@ -1961,31 +2006,51 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
         setup_cmd += ["--service-token", args.service_token]
 
     do_pair = interactive and not args.no_pair
-    if not do_pair:
-        setup_cmd.append("--no-pair")
-        hdr("🔑 Onboarding the plugin's Matrix identity")
-        if not interactive:
-            warn("Multiple targets selected — onboarding identity only (pair each later).")
-        _emit("installer_handing_off_to_setup", {"paired": False})
-    else:
-        hdr("📱 Onboarding + pairing a device")
-        print(f"{C_DIM}Scan the QR with the chat4000 iOS/macOS app. Ctrl-C to cancel.{C_RST}\n")
-        _emit("installer_handing_off_to_setup", {"paired": True})
+    hdr("🔑 Setting up the plugin (bot + user + rooms)")
+    if not interactive:
+        warn("Multiple targets selected — setting up identity only (pair each later).")
+    _emit("installer_handing_off_to_setup", {"paired": do_pair})
     try:
-        pair_rc = subprocess.run(setup_cmd).returncode
+        setup_rc = subprocess.run(setup_cmd).returncode
     except KeyboardInterrupt:
         warn("Onboarding cancelled.")
         _emit("installer_cancelled", {"stage": "setup"})
         return 130
-    if pair_rc != 0:
-        err(f"Setup exited {pair_rc}.")
+    if setup_rc != 0:
+        err(f"Setup exited {setup_rc}.")
         err("If this is a token error, pass --service-token <TOKEN> and select --env prod|stage.")
-        _emit("installer_failed", {"stage": "setup", "exit_code": pair_rc})
-        return pair_rc
+        _emit("installer_failed", {"stage": "setup", "exit_code": setup_rc})
+        return setup_rc
     if not do_pair:
-        ok("Identity onboarded. Pair a device any time with:")
+        ok("Identity + rooms ready. Pair a device any time with:")
         print(f"  {C_CYN}{openclaw_path} chat4000 pair{C_RST}")
     else:
+        # Pair INTERACTIVELY (inherited stdio) so the human sees the QR + code
+        # and the watcher's live feedback. Pair-first, restart after — same
+        # ordering as the agent flow.
+        hdr("📱 Pairing a device")
+        print(f"{C_DIM}Scan the QR with the chat4000 iOS/macOS app. Ctrl-C to cancel.{C_RST}\n")
+        pair_cmd = [openclaw_path, "chat4000", "pair"]
+        if args.stage:
+            pair_cmd.append("--stage")
+        elif args.env:
+            pair_cmd += ["--env", args.env]
+        if args.service_token:
+            # setup persists provisioning.url but NOT the token, and `pair`
+            # talks to the registrar itself (same reason as the agent flow).
+            pair_cmd += ["--service-token", args.service_token]
+        pair_cmd += _pair_flag_args(args)
+        try:
+            pair_rc = subprocess.run(pair_cmd).returncode
+        except KeyboardInterrupt:
+            warn("Pairing cancelled. Pair a device any time with:")
+            print(f"  {C_CYN}{openclaw_path} chat4000 pair{C_RST}")
+            _emit("installer_cancelled", {"stage": "pair"})
+            return 130
+        if pair_rc != 0:
+            err(f"Pairing exited {pair_rc}. Pair again any time: {openclaw_path} chat4000 pair")
+            _emit("installer_failed", {"stage": "pair", "exit_code": pair_rc})
+            return pair_rc
         _emit("pairing_completed_via_installer", {})
 
     # (Re)start gateway.
@@ -2132,6 +2197,15 @@ def agent_error(stage: str, detail: str) -> int:
     return 1
 
 
+def _ttl_human(seconds: int) -> str:
+    """'604800 seconds (7 days)' style — for the relay block's lifetime note."""
+    for unit, name in ((86400, "day"), (3600, "hour"), (60, "minute")):
+        if seconds >= unit and seconds % unit == 0:
+            n = seconds // unit
+            return f"{seconds} seconds ({n} {name}{'s' if n != 1 else ''})"
+    return f"{seconds} seconds"
+
+
 def agent_success(
     kind: str,
     code: str,
@@ -2139,6 +2213,8 @@ def agent_success(
     logpath: str,
     note: Optional[str] = None,
     stage: bool = False,
+    pair_ttl: Optional[int] = None,
+    reusable: bool = False,
 ) -> int:
     code_disp = f"{code[:3]}-{code[3:]}" if (code and len(code) == 6 and code.isdigit()) else code
     pair_url = f"https://pair.chat4000.com/?code={code}" if code else None
@@ -2247,6 +2323,25 @@ def agent_success(
         f"  pairing code dashed as {code_disp}. Never alter the code inside the link.",
         "• Post the QR as image-markdown ![](url) so it renders as an image. Do NOT also",
         "  write the QR url as plain text — the image only.",
+    ]
+    # Wording guard: a custom --pair-ttl / --reusable changes the code's REAL
+    # lifetime, and the agent must never imply the usual single-use 5-minute
+    # window when that isn't true. Conditional, so default runs stay
+    # byte-identical (the relay wording above is battle-tuned — don't touch it).
+    if reusable:
+        life = _ttl_human(pair_ttl) if pair_ttl else "the server's default lifetime (normally 5 minutes)"
+        lines += [
+            "• Code lifetime: this code is REUSABLE — it can be redeemed many times until",
+            f"  it expires, each redeem adding another device, and it lives {life}.",
+            "  If you say anything about expiry, say THAT — never imply a single-use",
+            "  5-minute code.",
+        ]
+    elif pair_ttl:
+        lines += [
+            f"• Code lifetime: this code lives {_ttl_human(pair_ttl)} (custom --pair-ttl),",
+            "  not the usual 5 minutes. If you say anything about expiry, use that lifetime.",
+        ]
+    lines += [
         "",
         "⛔ STOP after MESSAGE 2. The following are ALL FORBIDDEN — you have actually done",
         "   every one of these on past runs; do NOT do any of them again:",
@@ -2442,21 +2537,34 @@ def spawn_detached_pair(cmd: list, env: dict) -> tuple:
     return (None, None, logpath, f"pairing didn't print a code within {int(PAIR_EMIT_TIMEOUT)}s (log: {logpath})")
 
 
-def _hermes_gateway_reload_sh(hermes_bin: str) -> str:
+def _hermes_gateway_reload_sh(hermes_bin: str, *, try_native: bool = True) -> str:
     """Shell that makes the gateway load chat4000: Hermes has no hot-reload, so a
-    gateway that booted BEFORE chat4000 was enabled must restart to pick it up. We
-    capture the running gateway's EXACT argv from /proc and relaunch it identically
-    (the live gateway runs as `hermes gateway`, NOT `hermes gateway run`, so we
-    don't guess the command — the wizard's run-only grep is the bug that left it
-    unrestarted), detached so it outlives us. If a supervisor respawns it first, we
-    don't double-start. Run from a temp file (see _spawn_detached_gateway_reload)
-    so the match pattern never appears in the caller's own argv → pkill can't
-    kill the reloader itself."""
+    gateway that booted BEFORE chat4000 was enabled must restart to pick it up.
+    The native `hermes gateway restart` is preferred (supervisor-aware, no argv
+    guessing; time-capped so a hung restart can't stall the reload) — but only
+    AFTER capturing the running gateway's EXACT argv from /proc, so the fallback
+    can still relaunch identically if the native path half-dies. The fallback
+    pkills and relaunches that captured argv (the live gateway runs as `hermes
+    gateway`, NOT `hermes gateway run`, so we don't guess the command — the
+    wizard's run-only grep is the bug that left it unrestarted), detached so it
+    outlives us. If a supervisor respawns it first, we don't double-start.
+    `try_native=False` skips the native attempt (the human flow already tried it
+    from Python before falling back here). Run from a temp file (see
+    _spawn_detached_gateway_reload) so the match pattern never appears in the
+    caller's own argv → pkill can't kill the reloader itself."""
     hb = shlex.quote(hermes_bin)
+    native = ""
+    if try_native:
+        native = f"""if command -v timeout >/dev/null 2>&1; then
+  timeout 60 {hb} gateway restart >/dev/null 2>&1 && exit 0
+else
+  {hb} gateway restart >/dev/null 2>&1 && exit 0
+fi
+"""
     return f"""sleep 3
 gpid=$(pgrep -f 'hermes gateway' 2>/dev/null | head -n1)
 if [ -n "$gpid" ] && [ -r "/proc/$gpid/cmdline" ]; then cp "/proc/$gpid/cmdline" /tmp/chat4000-gw-argv.bin 2>/dev/null; fi
-pkill -9 -f 'hermes gateway' 2>/dev/null || true
+{native}pkill -9 -f 'hermes gateway' 2>/dev/null || true
 for _ in $(seq 1 12); do pgrep -f 'hermes gateway' >/dev/null 2>&1 || break; sleep 1; done
 sleep 2
 if pgrep -f 'hermes gateway' >/dev/null 2>&1; then exit 0; fi
@@ -2506,12 +2614,48 @@ def _spawn_detached_gateway_reload(hermes_bin: str, max_wait: int = GATEWAY_RELO
         )
 
 
+def _hermes_restart_gateway(venv_bin: str) -> bool:
+    """Restart the Hermes gateway NOW (human flow — we don't live inside the
+    gateway, so a synchronous bounce can't kill us). Prefers the native
+    `hermes gateway restart` (supervisor-aware, no argv guessing), time-capped;
+    only when that fails falls back to the pkill + identical-argv relaunch
+    script (_hermes_gateway_reload_sh, native attempt skipped — we just tried).
+    The agent flows keep their detached, event-driven reload instead."""
+    hermes_bin = f"{venv_bin}/hermes"
+    say(f"$ {hermes_bin} gateway restart")
+    try:
+        r = subprocess.run([hermes_bin, "gateway", "restart"], capture_output=True, text=True, timeout=90)
+        if r.returncode == 0:
+            return True
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        warn(f"`hermes gateway restart` exited {r.returncode}{(': ' + out[:300]) if out else ''} — falling back to pkill + relaunch.")
+    except subprocess.TimeoutExpired:
+        warn("`hermes gateway restart` timed out — falling back to pkill + relaunch.")
+    except OSError as exc:
+        warn(f"`hermes gateway restart` unavailable ({exc}) — falling back to pkill + relaunch.")
+    # Fallback: the argv-capture pkill+relaunch script, run SYNCHRONOUSLY from a
+    # temp file — a `bash -c` would put the 'hermes gateway' pkill pattern into
+    # the reloader's own argv and it would kill itself (the temp-file trick from
+    # _spawn_detached_gateway_reload, same reason).
+    script = _hermes_gateway_reload_sh(hermes_bin, try_native=False)
+    sh_path = f"/tmp/chat4000-gwreload-{uuid.uuid4().hex[:8]}.sh"
+    try:
+        Path(sh_path).write_text("#!/usr/bin/env bash\n" + script, encoding="utf-8")
+        os.chmod(sh_path, 0o700)
+        return subprocess.run(["bash", sh_path], timeout=180).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(sh_path)
+
+
 def install_openclaw_agent(t: dict, args) -> int:
     use_agent_distinct_id("openclaw")  # BA5
     oc = t["bin"]
     oc_ref = args.openclaw_branch or args.ref
     # 1. Install the plugin from the GitHub ref (quiet).
-    success, _spec, tail = openclaw_install_plugin(oc, oc_ref, force=True, quiet=True)
+    success, _spec, tail = openclaw_install_plugin(oc, oc_ref, quiet=True)
     if not success:
         return agent_error(f"installing the OpenClaw plugin from GitHub @{oc_ref}", tail or "no output")
     # 2. Onboard the bot identity — no phone needed (--self-redeem), no pairing yet.
@@ -2536,6 +2680,7 @@ def install_openclaw_agent(t: dict, args) -> int:
         # the registrar itself — without this it dies with "Missing registrar
         # SERVICE_TOKEN" even right after a successful setup.
         pair_cmd += ["--service-token", args.service_token]
+    pair_cmd += _pair_flag_args(args)
     code, qr, logpath, perr = spawn_detached_pair(pair_cmd, _pair_env())
     if not code:
         return agent_error("starting device pairing", perr or "no pairing code produced")
@@ -2548,7 +2693,8 @@ def install_openclaw_agent(t: dict, args) -> int:
         note = ("the OpenClaw gateway didn't auto-start — have the user run "
                 "`openclaw gateway run` (or `docker restart openclaw-gateway`) so messages flow")
     _emit("installer_pkg_installed", {"plugin_package": OPENCLAW_PKG, "source": "github", "ref": oc_ref, "mode": "agent"})
-    return agent_success("OpenClaw", code, qr, logpath, note, stage=_is_stage(args))
+    return agent_success("OpenClaw", code, qr, logpath, note, stage=_is_stage(args),
+                         pair_ttl=args.pair_ttl, reusable=args.reusable)
 
 
 def install_hermes_agent(t: dict, args) -> int:
@@ -2586,6 +2732,7 @@ def install_hermes_agent(t: dict, args) -> int:
     pair_cmd = [chat4000, "pair"]
     if args.stage:
         pair_cmd.append("--stage")
+    pair_cmd += _pair_flag_args(args)
     code, qr, logpath, perr = spawn_detached_pair(pair_cmd, _pair_env())
     if not code:
         return agent_error("starting device pairing", perr or "no pairing code produced")
@@ -2601,7 +2748,8 @@ def install_hermes_agent(t: dict, args) -> int:
     note = ("after your user pairs (or the code window ends) I restart the Hermes gateway so it "
             "loads chat4000 — the bot may blip briefly at that moment")
     _emit("installer_pkg_installed", {"plugin_ref": hm_ref, "mode": "agent"})
-    return agent_success("Hermes", code, qr, logpath, note, stage=_is_stage(args))
+    return agent_success("Hermes", code, qr, logpath, note, stage=_is_stage(args),
+                         pair_ttl=args.pair_ttl, reusable=args.reusable)
 
 
 def run_agent_mode(args) -> int:
@@ -2710,7 +2858,7 @@ def main() -> int:
     parser.add_argument("--hermes-bin", default=None, metavar="PATH", help="use this Hermes venv-bin dir directly (contains python + hermes)")
     parser.add_argument("--openclaw-bin", default=None, metavar="PATH", help="use this openclaw executable directly")
     # Hermes flow
-    parser.add_argument("--no-wizard", action="store_true", help="(hermes) install only, don't run the wizard")
+    parser.add_argument("--no-wizard", action="store_true", help="(hermes, DEPRECATED no-op) the wizard handoff is gone — the installer always drives setup + pairing itself now")
     parser.add_argument("--ref", default=DEFAULT_REF, help=f"GitHub tag/branch/SHA to install for BOTH hosts (default: {DEFAULT_REF})")
     parser.add_argument("--branch", default=None, metavar="NAME", help="install the plugin from this GitHub branch (both hosts) — alias for --ref <branch>")
     parser.add_argument("--hermes-branch", default=None, metavar="NAME", help="GitHub branch/tag/SHA of the HERMES plugin repo — overrides --branch/--ref for Hermes only")
@@ -2726,6 +2874,8 @@ def main() -> int:
     parser.add_argument("--reset", action="store_true", help="wipe local key + ack store for the chosen target (destructive)")
     parser.add_argument("--uninstall", action="store_true", help="remove the plugin from the chosen target")
     parser.add_argument("--stage", action="store_true", help="use the chat4000 stage servers")
+    parser.add_argument("--pair-ttl", dest="pair_ttl", type=int, default=None, metavar="SECONDS", help="pairing-code lifetime in seconds, up to 63072000 (the 2-year cap; default: server config, normally 300). A long-lived code is a standing credential — prefer the shortest TTL that works")
+    parser.add_argument("--reusable", action="store_true", help="make the pairing code REUSABLE: it can be redeemed many times until it expires, each redeem adding another device (fleet enrollment; default codes are single-use)")
     parser.add_argument("--no-telemetry", action="store_true", help="disable PostHog + Sentry for this run")
     parser.add_argument("--installer-ref", default=None, help="(internal) ref install.sh fetched this installer from")
     parser.add_argument("--verbose", action="store_true", help="echo every subprocess command")
