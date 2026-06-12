@@ -1997,8 +1997,14 @@ PAIR_EMIT_TIMEOUT = 60.0  # seconds to wait for the detached pair child to print
 # Seconds the detached gateway-reload waits before bouncing the Hermes gateway —
 # long enough for the agent to relay the code (+GIF) to the user first, since the
 # restart kills the gateway that IS the relaying agent.
-GATEWAY_RELOAD_DELAY_S = 30
-_QR_RE = re.compile(r"(chat4000://pair\?\S+)")
+# 120s, not 30: the Hermes agent runs INSIDE the gateway, so this restart kills
+# the agent's relay turn. 30s lost the race against gpt-5.5's ~6s/call latency
+# on a ~100k-token context plus the 4.7MB GIF upload — the agent got interrupted
+# mid-relay, resumed with a 'turn interrupted' note, and RE-RAN the installer
+# (observed on hermes-test-91 and -92). The delay must outlast the whole relay.
+GATEWAY_RELOAD_DELAY_S = 120
+# v2 plugins print a universal https link; v1 printed a chat4000:// deep link.
+_QR_RE = re.compile(r"(chat4000://pair\?\S+|https://pair\.chat4000\.com/\?\S+)")
 _CODE_IN_URI_RE = re.compile(r"[?&]code=(\d+)")
 _CODE_LINE_RE = re.compile(r"[Pp]airing code:\s*([0-9][0-9 ]{3,})")
 
@@ -2074,6 +2080,15 @@ def agent_success(
         "platform delivers MESSAGE 2 first and you FAIL the order. So: send MESSAGE 1",
         "as its OWN send; WAIT for that send to complete/deliver; only THEN send",
         "MESSAGE 2 as a second, separate send. Never bundle them into one message.",
+        "",
+        "⚡ IF YOU GET INTERRUPTED: a couple of minutes after this block, the agent",
+        "gateway on this machine restarts (it must, to load the chat4000 plugin). If",
+        "that restart cuts your turn and the session resumes with a note like 'your",
+        "previous turn was interrupted by a gateway restart' — NOTHING IS WRONG; the",
+        "install is STILL successful. Do NOT re-run the installer (a re-run can",
+        "invalidate the pairing code your user is typing in RIGHT NOW), do NOT run",
+        "any command. Just send whichever of the two messages you haven't sent yet,",
+        "then stop. The install command must run EXACTLY ONCE, ever.",
         "",
         "═══ MESSAGE 1 — SEND THIS FIRST, BY ITSELF, before any other message: ═══",
         gif_line,
@@ -2182,12 +2197,57 @@ def _kill_stale_pair_watchers() -> None:
         pass  # best-effort: no pkill on the box → re-runs keep the old risk
 
 
+def _reuse_live_pair() -> Optional[tuple]:
+    """If a pairing watcher is ALREADY running with a still-fresh code, hand back
+    THAT code instead of spawning (and killing) anything. Agents re-run the
+    installer (e.g. after the gateway restart interrupts their relay turn), and
+    a re-run must not invalidate the code the user may be typing into their
+    phone right now. Fresh = log younger than 180s (codes live 300s)."""
+    try:
+        r = subprocess.run(["pgrep", "-f", "chat4000 pair"], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return None
+    except (OSError, subprocess.SubprocessError):
+        return None
+    try:
+        logs = sorted(Path("/tmp").glob("chat4000-pair-*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not logs:
+            return None
+        newest = logs[0]
+        if time.time() - newest.stat().st_mtime > 180:
+            return None
+        text = newest.read_text(errors="ignore")
+    except OSError:
+        return None
+    if "Pairing failed" in text or "expired" in text:
+        return None
+    qr = None
+    qm = _QR_RE.search(text)
+    if qm:
+        qr = qm.group(1).rstrip(").,")
+    code = None
+    if qr:
+        cm = _CODE_IN_URI_RE.search(qr)
+        if cm:
+            code = cm.group(1)
+    if not code:
+        lm = _CODE_LINE_RE.search(text)
+        if lm:
+            code = lm.group(1).replace(" ", "")
+    if code:
+        return (code, qr, str(newest), None)
+    return None
+
+
 def spawn_detached_pair(cmd: list, env: dict) -> tuple:
     """Start the pair command DETACHED (own session, output → a /tmp log), then
     tail the log until it prints the pairing code + QR. Returns
     (code, qr_uri, logpath, error). On success the child keeps running (polling
     the registrar for the rest of its TTL) after we return — we never wait on it,
     which is the whole point: this process exits while pairing continues."""
+    reused = _reuse_live_pair()
+    if reused:
+        return reused
     _kill_stale_pair_watchers()
     logpath = f"/tmp/chat4000-pair-{uuid.uuid4().hex[:8]}.log"
     try:
