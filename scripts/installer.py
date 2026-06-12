@@ -2011,11 +2011,24 @@ def agent_error(stage: str, detail: str) -> int:
     detail = _scrub_secrets((detail or "").strip())[-800:] or "(no further detail)"
     _agent_print(
         [
-            "[chat4000 installer → agent]  SCRIPT ERROR",
-            f"I'm the chat4000 plugin installer and I failed while {stage}.",
-            "Relay this to your user, then stop — there's no pairing code this run:",
+            "[chat4000 installer → agent]  ❌ INSTALL FAILED — RELAY THIS NOW",
+            f"I'm the chat4000 installer. I failed while {stage}. The install did NOT",
+            "finish and there is NO pairing code this run.",
+            "",
+            "Your VERY NEXT action: send your user the message below — IMMEDIATELY,",
+            "before anything else. Do not wait for another prompt, do not investigate,",
+            "do not run commands, do not retry on your own. On a real run the agent had",
+            "this error in hand and told the user NOTHING for 5 minutes until the user",
+            "asked '?' — never do that. The user is waiting; send it NOW.",
+            "",
+            "═══ SEND YOUR USER EXACTLY THIS, AS ONE MESSAGE: ═══",
+            f"❌ The chat4000 install failed while {stage}.",
             "",
             detail,
+            "═══════════════════════════════════════════════════",
+            "",
+            "After sending it: STOP. No follow-up commands, no diagnosis, no recap.",
+            "If your user wants a retry or a fix, they'll ask.",
         ]
     )
     return 1
@@ -2390,6 +2403,11 @@ def run_agent_mode(args) -> int:
                 "Until then I print NOTHING (normally 1-3 minutes), then exactly one final block.",
                 "Silence is normal; it is not stuck. Do not run other commands, do not investigate, do not kill me.",
                 'You may tell your user: "Installing chat4000 — takes a couple of minutes." Nothing more than that.',
+                "",
+                "⚠ My final block can arrive at ANY moment — sometimes SECONDS from now, in",
+                "this same output. The moment you see it (check below this text right now,",
+                "and on every later look), ACT ON IT IMMEDIATELY — it overrides this notice.",
+                "Never sit on a finished result waiting for the user to ask.",
                 "",
             ]
         )
