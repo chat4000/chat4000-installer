@@ -8,8 +8,10 @@ more than one, then installs the plugin with the right toolchain for that host:
   • Hermes   → pip/uv git-install from the gh `stable` tag into Hermes' venv,
                then `chat4000 wizard`
   • OpenClaw → download the GitHub tarball for the ref, extract it, then
-               `openclaw plugins install <extracted dir>` (OpenClaw rejects git
-               npm-specs, and this isn't on the npm registry), then
+               `openclaw plugins install <dir>` — falling back to a linked
+               dev-checkout install (`--link`) when the host refuses TS-only
+               sources (OpenClaw rejects git npm-specs, and this isn't on the
+               npm registry) — then
                `openclaw chat4000 setup --self-redeem` + gateway restart
 
 Runs in the system Python (stdlib only) — no third-party deps, because the
@@ -1268,43 +1270,120 @@ def _download_github_tarball(slug: str, ref: str) -> tuple:
         return None, f"extracting the GitHub tarball failed: {exc}"
 
 
+def _run_streaming(cmd: list, *, quiet: bool, cwd: Optional[str] = None) -> tuple:
+    """Run cmd with stdout+stderr merged, echoing lines unless quiet.
+    Returns (returncode, full_output)."""
+    say(f"$ {' '.join(cmd)}")
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, cwd=cwd)
+    buf: list = []
+    if proc.stdout is not None:
+        for line in proc.stdout:
+            if not quiet:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+            buf.append(line)
+    return proc.wait(), "".join(buf)
+
+
+def _openclaw_prepare_checkout(checkout: str, *, quiet: bool) -> Optional[str]:
+    """Make a raw git-tarball checkout loadable as a LINKED (dev-mode) plugin.
+    Returns an error string on failure, None on success.
+
+    Two things a tarball lacks vs the published npm package:
+      1. src/telemetry-dsn.generated.ts — gitignored; the plugin's own publish
+         script writes it at packaging time from ~/.config/chat4000/sentry-dsn
+         (and writes an EMPTY DSN when that file is absent). We seed that file
+         with our DSN — same Sentry project the published plugin ships — then
+         run the plugin's own prepare step, so a branch install reports crashes
+         like a release would and the codegen logic stays in ONE repo.
+      2. node_modules — the runtime npm dependencies the TS source imports."""
+    gen = os.path.join(checkout, "src", "telemetry-dsn.generated.ts")
+    prep = os.path.join(checkout, "scripts", "publish_npm.py")
+    if not os.path.exists(gen) and os.path.exists(prep):
+        dsn_copy = Path.home() / ".config" / "chat4000" / "sentry-dsn"
+        try:
+            if not dsn_copy.exists():
+                dsn_copy.parent.mkdir(parents=True, exist_ok=True)
+                dsn_copy.write_text(SENTRY_DSN + "\n", encoding="utf-8")
+        except OSError:
+            pass  # prepare degrades to an empty DSN — the install still works
+        rc, out = _run_streaming([sys.executable, prep, "--prepare-only", "--from-file"], quiet=quiet, cwd=checkout)
+        if rc != 0:
+            return f"the plugin's prepare step (publish_npm.py --prepare-only) failed: {out[-512:]}"
+    try:
+        with open(os.path.join(checkout, "package.json"), encoding="utf-8") as fh:
+            has_deps = bool(json.load(fh).get("dependencies"))
+    except (OSError, ValueError):
+        has_deps = False
+    if has_deps and not os.path.isdir(os.path.join(checkout, "node_modules")):
+        npm = shutil.which("npm")
+        if not npm:
+            return "npm not found on PATH — needed to install the plugin's npm dependencies for a linked (dev) install"
+        rc, out = _run_streaming([npm, "install", "--omit=dev", "--no-audit", "--no-fund"], quiet=quiet, cwd=checkout)
+        if rc != 0:
+            return f"npm install of the plugin's dependencies failed: {out[-512:]}"
+    return None
+
+
 def openclaw_install_plugin(openclaw: str, ref: str, force: bool = True, *, quiet: bool = False) -> tuple:
     """Install the OpenClaw plugin FROM ITS GITHUB REF (not the npm registry).
 
-    OpenClaw rejects git npm-specs outright, so: download the ref's GitHub
-    tarball, extract it, and install the extracted DIRECTORY (the CLI copies it
-    into ~/.openclaw/extensions, so the temp source is deleted afterwards).
-    Tries the canonical `plugins install` then the legacy `plugin install` CLI
-    form. Returns (success, used_spec, output_tail) — tail is from the FIRST
-    (canonical) failing attempt: the legacy form's failure is usually just
-    "unknown command 'plugin'" noise that would mask the real error."""
+    OpenClaw rejects git npm-specs outright ("unsupported npm spec: git refs
+    are not allowed"), so the ref's GitHub tarball is downloaded and extracted
+    locally, then installed in two attempts:
+
+      1. COPY install (`plugins install --force <dir>`, canonical then legacy
+         CLI form) — works once the repo ships compiled dist/ output; newer
+         hosts refuse TS-only sources here.
+      2. LINK install (`plugins install --link <dir>`) — the host's dev-checkout
+         mode, which loads TS source directly; the checkout is first made
+         runnable by _openclaw_prepare_checkout. Link mode references the
+         directory in place forever, so the checkout lives at a STABLE path
+         under ~/.openclaw — stable so re-installs re-link the same config
+         path instead of accumulating dead plugins.load.paths entries.
+
+    Returns (success, used_spec, output_tail) — the tail leads with the FIRST
+    failure (the canonical copy attempt): later fallback noise like the legacy
+    form's "unknown command 'plugin'" must not mask the real error."""
     srcdir, dl_err = _download_github_tarball(OPENCLAW_REPO_SLUG, ref)
     if not srcdir:
         return False, None, dl_err
-    cmd_forms = [
-        [openclaw, "plugins", "install"],   # canonical (2026.4+)
-        [openclaw, "plugin", "install"],    # legacy
-    ]
-    first_tail = ""
+
+    base = Path.home() / ".openclaw" / "chat4000-plugin-src"
+    checkout = str(base / "checkout")
     try:
-        for form in cmd_forms:
-            cmd = list(form) + (["--force"] if force else []) + [srcdir]
-            say(f"$ {' '.join(cmd)}")
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-            buf: list = []
-            if proc.stdout is not None:
-                for line in proc.stdout:
-                    if not quiet:
-                        sys.stdout.write(line)
-                        sys.stdout.flush()
-                    buf.append(line)
-            if proc.wait() == 0:
-                return True, f"tarball:github.com/{OPENCLAW_REPO_SLUG}@{ref}", ""
-            if not first_tail:
-                first_tail = "".join(buf)[-512:]
+        shutil.rmtree(base, ignore_errors=True)
+        base.mkdir(parents=True, exist_ok=True)
+        shutil.move(srcdir, checkout)
+    except OSError as exc:
+        return False, None, f"placing the plugin checkout under {base} failed: {exc}"
     finally:
         shutil.rmtree(os.path.dirname(srcdir), ignore_errors=True)
-    return False, None, _scrub_secrets(first_tail) if first_tail else ""
+
+    copy_tail = ""
+    for form in ([openclaw, "plugins", "install"], [openclaw, "plugin", "install"]):
+        cmd = list(form) + (["--force"] if force else []) + [checkout]
+        rc, out = _run_streaming(cmd, quiet=quiet)
+        if rc == 0:
+            # Copied into ~/.openclaw/extensions — the source isn't referenced.
+            shutil.rmtree(base, ignore_errors=True)
+            return True, f"tarball:github.com/{OPENCLAW_REPO_SLUG}@{ref}", ""
+        if not copy_tail:
+            copy_tail = out[-512:]
+
+    link_tail = _openclaw_prepare_checkout(checkout, quiet=quiet)
+    if link_tail is None:
+        rc, out = _run_streaming([openclaw, "plugins", "install", "--link", checkout], quiet=quiet)
+        # A link install exits 0 even when the plugin fails its load test; the
+        # "failed to load" report in the output is the real failure signal.
+        if rc == 0 and "failed to load" not in out:
+            return True, f"link:github.com/{OPENCLAW_REPO_SLUG}@{ref}", ""
+        link_tail = out[-512:]
+
+    detail = copy_tail.strip()
+    if link_tail.strip():
+        detail += "\n\nlink-mode fallback then failed with:\n" + link_tail.strip()
+    return False, None, _scrub_secrets(detail.strip()) if detail.strip() else ""
 
 
 def detect_restart_method() -> Optional[str]:
@@ -2140,6 +2219,11 @@ def install_openclaw_agent(t: dict, args) -> int:
         pair_cmd.append("--stage")
     elif args.env:
         pair_cmd += ["--env", args.env]
+    if args.service_token:
+        # setup persists provisioning.url but NOT the token, and `pair` talks to
+        # the registrar itself — without this it dies with "Missing registrar
+        # SERVICE_TOKEN" even right after a successful setup.
+        pair_cmd += ["--service-token", args.service_token]
     code, qr, logpath, perr = spawn_detached_pair(pair_cmd, _pair_env())
     if not code:
         return agent_error("starting device pairing", perr or "no pairing code produced")
