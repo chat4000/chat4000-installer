@@ -1355,11 +1355,12 @@ def _openclaw_too_old_error(openclaw: str, checkout: str, ref: str) -> Optional[
     have += [0] * (width - len(have))
     if have < need:
         return (
-            f"this machine's OpenClaw is {m_have.group(1)}, but the plugin ref '{ref}' requires "
-            f"OpenClaw >= {m_req.group(1)} (its declared minHostVersion). The install can NEVER "
-            "succeed on this OpenClaw version. Either upgrade OpenClaw on this machine "
-            "(npm install -g openclaw@latest, then restart the gateway) or install an older "
-            "plugin ref (--openclaw-branch stable)."
+            f"😢💔 Sad news… this machine's OpenClaw is {m_have.group(1)}, but the chat4000 "
+            f"plugin needs OpenClaw >= {m_req.group(1)}. 😞⛔\n"
+            "The install can NEVER succeed on this OpenClaw version. 🥺\n"
+            "The fix: upgrade OpenClaw on this machine 🛠️\n"
+            "(npm install -g openclaw@latest, then restart the gateway)\n"
+            "…then run the install again. 🙏✨"
         )
     return None
 
