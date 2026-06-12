@@ -792,29 +792,27 @@ def _infer_agent_caller(proc_root: str = "/proc", start_pid: Optional[int] = Non
     sometimes forget --agent — then the run falls into the interactive human
     wizard and hangs forever on its prompts. As a fallback we walk the parent
     chain in /proc looking for a gateway process; finding one means an agent
-    launched us and we can flip to agent mode on our own. Linux-only (no /proc
-    on macOS/BSD → None), capped at ~20 hops, and wrapped so it can NEVER
-    raise — a failed inference must not break a normal human run.
+    launched us and we can flip to agent mode on our own. On macOS/BSD (no
+    procfs) the walk happens via `ps` instead (_infer_agent_caller_ps). Capped
+    at ~20 hops, and wrapped so it can NEVER raise — a failed inference must
+    not break a normal human run.
 
     `proc_root` / `start_pid` are overridable so tests can point this at a
     fake /proc tree instead of the live one.
     """
     try:
         if not os.path.isdir(proc_root):
-            return None  # macOS / BSD: no procfs, nothing to walk
+            # macOS / BSD: no procfs — climb via `ps` instead.
+            return _infer_agent_caller_ps(start_pid)
         pid = start_pid if start_pid is not None else os.getppid()
         for _ in range(20):  # real ancestries are far shorter; cap just in case
             if pid <= 1:
                 return None  # hit init/kernel without finding a gateway
             with open(f"{proc_root}/{pid}/cmdline", "rb") as f:
                 argv = [a.decode(errors="ignore") for a in f.read().split(b"\0") if a]
-            joined = " ".join(argv)
-            if "hermes gateway" in joined:
-                return "hermes"
-            if "openclaw-gateway" in joined or (
-                argv and os.path.basename(argv[0]) == "openclaw" and "gateway" in argv
-            ):
-                return "openclaw"
+            kind = _match_agent_argv(argv)
+            if kind:
+                return kind
             # Next ancestor: the "PPid:" line of /proc/<pid>/status.
             ppid = None
             with open(f"{proc_root}/{pid}/status", encoding="utf-8", errors="ignore") as f:
@@ -826,6 +824,45 @@ def _infer_agent_caller(proc_root: str = "/proc", start_pid: Optional[int] = Non
                 return None
             pid = ppid
     except (OSError, ValueError):
+        return None
+    return None
+
+
+def _match_agent_argv(argv: list) -> Optional[str]:
+    """Shared ancestor-cmdline matching for both walk flavors."""
+    joined = " ".join(argv)
+    if "hermes gateway" in joined:
+        return "hermes"
+    if "openclaw-gateway" in joined or (
+        argv and os.path.basename(argv[0]) == "openclaw" and "gateway" in argv
+    ):
+        return "openclaw"
+    return None
+
+
+def _infer_agent_caller_ps(start_pid: Optional[int] = None) -> Optional[str]:
+    """macOS/BSD twin of the /proc walk: climb the parent chain by asking
+    `ps -o ppid=,command= -p <pid>` per ancestor. Same matching, same 20-hop
+    cap, and like its sibling it can NEVER raise."""
+    try:
+        pid = start_pid if start_pid is not None else os.getppid()
+        for _ in range(20):
+            if pid <= 1:
+                return None
+            r = subprocess.run(
+                ["ps", "-o", "ppid=,command=", "-p", str(pid)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r.returncode != 0:
+                return None
+            parts = r.stdout.strip().split(None, 1)
+            if len(parts) < 2:
+                return None
+            kind = _match_agent_argv(parts[1].split())
+            if kind:
+                return kind
+            pid = int(parts[0])
+    except (OSError, ValueError, subprocess.SubprocessError):
         return None
     return None
 
