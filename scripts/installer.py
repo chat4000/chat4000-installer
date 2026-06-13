@@ -2419,26 +2419,25 @@ def agent_success(
         # the GIF "to send the rest later" has ended its turn and lost MESSAGE 2
         # forever (happened live on hermes-test-94).
         lines += [
-            "THE CONTRACT — send EXACTLY ONE reply containing THREE separate blocks, in",
-            "this order. Your platform splits them into THREE SEPARATE MESSAGES and sends",
-            "them one after another — GIF → text → QR:",
-            "  1. The reply's FIRST LINE: the GIF image markdown (MESSAGE 1 below).",
-            "  2. Then MESSAGE 2's exact text (the link + code).",
-            "  3. Then, on its OWN line, the QR image markdown (MESSAGE 3 below).",
-            "The GIF and the QR are SEPARATE images — each on its own line, each becomes",
-            "its own image message. Never fold the QR into the text, never drop it.",
-            "When your reply ends, your turn is OVER — you CANNOT send anything later.",
-            "After this one reply you produce NOTHING ELSE about this install — not in",
+            "THE CONTRACT — send the user THREE things as THREE SEPARATE messages, one",
+            "after another, in this order, pausing ONE TO TWO SECONDS between each send:",
+            "  1. MESSAGE 1 — the GIF image (send it, by itself, FIRST).",
+            "  2. MESSAGE 2 — the pairing text (link + code), about 1-2 seconds later.",
+            "  3. MESSAGE 3 — the QR image, about 1-2 seconds after that.",
+            "",
+            "❌ DO NOT put the GIF, the text, and the QR in ONE message. Sending them as a",
+            "single combined message is a MISTAKE — it is NOT what the user wants. The QR",
+            "must arrive as its OWN image message, never as `![](...)` text sitting under",
+            "the GIF. Three things → three separate messages → a second or two apart. Always.",
+            "",
+            "You must send ALL THREE — do NOT send only the GIF and stop. On a real run the",
+            "agent's entire output was just the GIF and the user never got the code: that is",
+            "a FAILURE. All three go out, each as its own message, in order.",
+            "After all three are sent you produce NOTHING ELSE about this install — not in",
             "any later turn, heartbeat, or status/'unfinished tool' check — until the",
             "USER asks. ANY other output about this run, at ANY time, is a FAILURE.",
             "You are a RELAY, not a reporter: no narration, no summaries, no verification,",
             "no terminal commands, no log inspection, no talk about yourself or your tools.",
-            "",
-            "⚠ ONE REPLY, ALL THREE BLOCKS IN IT — you have failed this on a real run: the",
-            "agent's ENTIRE reply was just the GIF line; it ended its turn planning to",
-            "'send the pairing message next'. There IS no next — the turn was over and",
-            "the user NEVER received the pairing code. The GIF alone is a FAILURE.",
-            "MESSAGE 2 and MESSAGE 3 go in the SAME reply, below the GIF line.",
             "",
         ]
     else:
@@ -2490,10 +2489,10 @@ def agent_success(
             "",
         ]
         lines += [
-            "═══ MESSAGE 1 — the FIRST LINE of your single reply: ═══",
+            "═══ MESSAGE 1 — send this FIRST, by itself, before anything else: ═══",
             gif_line,
             "",
-            "═══ MESSAGE 2 — the REST of the SAME reply. Exactly this text + structure: ═══",
+            "═══ MESSAGE 2 — send SECOND (~1-2s later). Exactly this text + structure: ═══",
         ]
     else:
         lines += [
@@ -2596,6 +2595,10 @@ def agent_success(
         "      user got a dancing GIF and NO pairing code, ever. GIF without MESSAGE 2",
         "      = FAILURE.",
         "   ❌ Do NOT also write the QR url as text — post ONLY the ![](url) image.",
+        "   ❌ Do NOT cram the GIF, the text, and the QR into ONE message. They are THREE",
+        "      separate messages, sent one after another ~1-2 seconds apart. One combined",
+        "      message (GIF + text + QR together) is a MISTAKE and is NOT what the user",
+        "      wants — the QR ends up as raw text instead of a scannable image.",
         "   ❌ Do NOT append a trailing offer like \"If that code expired, tell me and I'll",
         "      rerun the install.\"",
         "",
