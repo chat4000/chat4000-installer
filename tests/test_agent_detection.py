@@ -234,5 +234,92 @@ class TestAgentRunMarker(unittest.TestCase):
         self.assertIn("DO NOT run the install command again", printed["text"])
 
 
+class TestOpenclawGatewayServing(unittest.TestCase):
+    """BUG 3: reuse an already-serving gateway instead of a false health-fail."""
+
+    def test_lost_port_detects_address_in_use(self):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+            f.write("...\nError: listen EADDRINUSE: address already in use :::18789\n")
+            path = f.name
+        try:
+            self.assertTrue(installer._foreground_gateway_lost_port(path))
+        finally:
+            os.unlink(path)
+
+    def test_lost_port_false_on_clean_log(self):
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".log", delete=False) as f:
+            f.write("[gateway] ready\nstarting channels and sidecars\n")
+            path = f.name
+        try:
+            self.assertFalse(installer._foreground_gateway_lost_port(path))
+        finally:
+            os.unlink(path)
+
+    def test_lost_port_false_on_missing_log(self):
+        self.assertFalse(installer._foreground_gateway_lost_port("/nonexistent/x.log"))
+
+    def _run_serving_probe(self, *, status_rc, status_out, hello_ok):
+        """Drive _openclaw_gateway_serving_chat4000 with mocked status + log."""
+        import tempfile
+
+        orig_run = installer.subprocess.run
+        orig_home = installer._openclaw_home
+
+        class _R:
+            returncode = status_rc
+            stdout = status_out
+            stderr = ""
+
+        def fake_run(cmd, *a, **k):
+            if cmd[1:] == ["gateway", "status"]:
+                return _R()
+            return orig_run(cmd, *a, **k)
+
+        with tempfile.TemporaryDirectory() as td:
+            logdir = Path(td) / "plugins" / "chat4000" / "logs"
+            logdir.mkdir(parents=True)
+            if hello_ok is not None:
+                (logdir / "runtime.log").write_text(
+                    "runtime.hello_ok\n" if hello_ok else "still connecting\n"
+                )
+            installer.subprocess.run = fake_run
+            installer._openclaw_home = lambda: Path(td)
+            try:
+                return installer._openclaw_gateway_serving_chat4000()
+            finally:
+                installer.subprocess.run = orig_run
+                installer._openclaw_home = orig_home
+
+    def test_serving_true_when_status_ok_and_hello_ok(self):
+        self.assertTrue(
+            self._run_serving_probe(status_rc=0, status_out="gateway connected", hello_ok=True)
+        )
+
+    def test_serving_false_when_status_ok_but_no_hello_ok(self):
+        # Gateway up but chat4000 not loaded yet (fresh install) → must restart.
+        self.assertFalse(
+            self._run_serving_probe(status_rc=0, status_out="gateway connected", hello_ok=False)
+        )
+
+    def test_serving_false_when_status_disabled(self):
+        self.assertFalse(
+            self._run_serving_probe(status_rc=0, status_out="service disabled", hello_ok=True)
+        )
+
+    def test_serving_false_when_status_nonzero(self):
+        self.assertFalse(
+            self._run_serving_probe(status_rc=1, status_out="", hello_ok=True)
+        )
+
+    def test_serving_false_when_no_runtime_log(self):
+        self.assertFalse(
+            self._run_serving_probe(status_rc=0, status_out="gateway connected", hello_ok=None)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -1626,9 +1626,28 @@ def restart_gateway(method: str) -> bool:
             warn(out.strip()[:500])
         return False
     if method == "foreground":
+        # BUG3: a gateway already up and SERVING chat4000 must be REUSED, not
+        # bounced into a port collision that we then mis-report as failure. The
+        # old foreground path did `pkill -9 -f 'openclaw gateway run'` then spawned
+        # a fresh `openclaw gateway run`. But the running gateway was launched as
+        # bare `openclaw` (NOT `openclaw gateway run`), so the pkill matched
+        # nothing, the old gateway kept port 18789, the new one died with "address
+        # in use", and chat4000 (already live on the OLD gateway) never re-emitted
+        # hello_ok → a 120s timeout reported FAILURE for a perfectly healthy
+        # gateway. Conservative fix: only short-circuit on POSITIVE evidence that
+        # a gateway is already serving chat4000; a genuinely dead gateway still
+        # gets (re)started below.
+        if _openclaw_gateway_serving_chat4000():
+            say("A gateway is already up and serving chat4000 — reusing it (no restart needed).")
+            return True
         log_path = "/tmp/openclaw-gateway.log"
-        with contextlib.suppress(OSError, subprocess.SubprocessError):
-            subprocess.run(["pkill", "-9", "-f", "openclaw gateway run"], capture_output=True, timeout=5)
+        # Kill BOTH argv shapes the gateway can present: the documented
+        # `openclaw gateway run` AND the renamed `openclaw-gateway` process.title
+        # (per OpenClaw's per-command process rename). We deliberately do NOT
+        # pkill bare `openclaw` broadly — that could match the agent host itself.
+        for pat in ("openclaw gateway run", "openclaw-gateway"):
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                subprocess.run(["pkill", "-9", "-f", pat], capture_output=True, timeout=5)
         time.sleep(1)
         try:
             logf = open(log_path, "ab")
@@ -1638,11 +1657,64 @@ def restart_gateway(method: str) -> bool:
             )
             say(f"Started gateway in background. Log: {C_CYN}{log_path}{C_RST}")
             time.sleep(4)
+            # If our spawn lost a port-18789 race to a gateway that's actually
+            # serving chat4000, that's success, not failure — reuse it.
+            if _foreground_gateway_lost_port(log_path) and _openclaw_gateway_serving_chat4000():
+                say("Existing gateway already holds the port and is serving chat4000 — reusing it.")
+                return True
             return True
         except (OSError, subprocess.SubprocessError) as exc:
             warn(f"Could not start gateway: {exc}")
             return False
     return False
+
+
+def _foreground_gateway_lost_port(log_path: str) -> bool:
+    """Did the foreground gateway we just spawned fail to bind port 18789 because
+    another gateway already holds it? Reads the tail of its log for the
+    address-in-use / already-running signatures OpenClaw emits on a port
+    collision. Best-effort: a missing/unreadable log returns False."""
+    try:
+        tail = Path(log_path).read_text(errors="ignore")[-4000:].lower()
+    except OSError:
+        return False
+    return any(
+        sig in tail
+        for sig in ("address already in use", "eaddrinuse", "already running", "port 18789")
+    )
+
+
+def _openclaw_gateway_serving_chat4000() -> bool:
+    """POSITIVE-evidence probe: is a gateway already up AND serving the chat4000
+    channel? Two independent signals, BOTH required to avoid a false positive:
+
+      1. `openclaw gateway status` reports a live/connected gateway (rc 0 with
+         non-empty status, and not a 'disabled'/'not running' message), and
+      2. the chat4000 runtime log shows `runtime.hello_ok` — the same handshake
+         marker wait_for_chat4000_connected keys on — meaning the chat4000
+         channel actually connected through that gateway.
+
+    Conservative by design: a gateway that's up but has NOT loaded chat4000 yet
+    (e.g. it predates a fresh install) yields signal 1 but not 2, so we return
+    False and the caller (re)starts it — exactly what a fresh install needs."""
+    openclaw = shutil.which("openclaw") or "openclaw"
+    status_ok = False
+    try:
+        r = subprocess.run([openclaw, "gateway", "status"], capture_output=True, text=True, timeout=8)
+        out = ((r.stdout or "") + (r.stderr or "")).lower()
+        if r.returncode == 0 and out.strip() and not any(
+            bad in out for bad in ("service disabled", "not running", "not installed", "no gateway")
+        ):
+            status_ok = True
+    except (OSError, subprocess.SubprocessError):
+        return False
+    if not status_ok:
+        return False
+    runtime_log = _openclaw_home() / "plugins" / "chat4000" / "logs" / "runtime.log"
+    try:
+        return "runtime.hello_ok" in runtime_log.read_text(errors="ignore")
+    except OSError:
+        return False
 
 
 def openclaw_reset_local_state() -> None:
