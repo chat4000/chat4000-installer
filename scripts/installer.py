@@ -787,21 +787,61 @@ def detect_uv() -> Optional[str]:
     return None
 
 
+def _infer_agent_from_env(environ: Optional[dict] = None) -> Optional[str]:
+    """Detect an agent caller from a distinctive ENV VAR the runtime injects
+    into the subprocess it spawns for its autonomous shell/exec tool.
+
+    This is the PRIMARY, most-robust agent-mode signal — far stronger than the
+    argv/ancestry walk below, which is now only a fallback. An explicit env var
+    set by the runtime on the tool subprocess is deterministic: it does not
+    depend on the gateway's argv shape, on procfs being readable, or on the
+    process tree surviving a docker/session-manager re-parent.
+
+    OpenClaw: its agent exec/bash tool sets `OPENCLAW_SHELL=exec` on every
+    subprocess it spawns for the agent's autonomous shell tool. (Verified in
+    OpenClaw source `src/agents/bash-tools.exec-runtime.ts`, which builds the
+    child env as `{ ...env, OPENCLAW_SHELL: "exec" }`.) Crucially the value is
+    discriminating: a HUMAN at the TUI gets `OPENCLAW_SHELL=tui-local` and an
+    ACP client subprocess gets `acp-client` — neither is the autonomous agent
+    tool, so we match ONLY the exact value "exec". That gives us a clean
+    positive for "the OpenClaw AGENT ran me" without false-positiving on a human
+    who simply uses OpenClaw's interactive shell or the `openclaw` CLI directly.
+
+    Assumption (documented): the env-var name/value contract above is treated as
+    OpenClaw's stable signal. If a future OpenClaw renames it, the argv/ancestry
+    fallback below still covers the case — so a rename degrades, it doesn't break.
+
+    `environ` is overridable so tests can pass a fake environment.
+    """
+    env = environ if environ is not None else os.environ
+    try:
+        if env.get("OPENCLAW_SHELL") == "exec":
+            return "openclaw"
+    except (AttributeError, TypeError):
+        return None
+    return None
+
+
 def _infer_agent_caller(proc_root: str = "/proc", start_pid: Optional[int] = None) -> Optional[str]:
     """Best-effort guess of which agent host (if any) spawned this process.
 
     Why: agents (Hermes / OpenClaw) run the installer via their exec tools and
     sometimes forget --agent — then the run falls into the interactive human
-    wizard and hangs forever on its prompts. As a fallback we walk the parent
-    chain in /proc looking for a gateway process; finding one means an agent
-    launched us and we can flip to agent mode on our own. On macOS/BSD (no
-    procfs) the walk happens via `ps` instead (_infer_agent_caller_ps). Capped
-    at ~20 hops, and wrapped so it can NEVER raise — a failed inference must
-    not break a normal human run.
+    wizard and hangs forever on its prompts. The PRIMARY signal is an env var
+    the runtime injects into the tool subprocess (_infer_agent_from_env). As a
+    SECONDARY fallback we walk the parent chain in /proc looking for a gateway
+    process; finding one means an agent launched us and we can flip to agent
+    mode on our own. On macOS/BSD (no procfs) the walk happens via `ps` instead
+    (_infer_agent_caller_ps). Capped at ~20 hops, and wrapped so it can NEVER
+    raise — a failed inference must not break a normal human run.
 
     `proc_root` / `start_pid` are overridable so tests can point this at a
     fake /proc tree instead of the live one.
     """
+    # Primary: explicit env-var signal (deterministic; no argv/procfs dependency).
+    from_env = _infer_agent_from_env()
+    if from_env:
+        return from_env
     try:
         if not os.path.isdir(proc_root):
             # macOS / BSD: no procfs — climb via `ps` instead.
@@ -831,14 +871,43 @@ def _infer_agent_caller(proc_root: str = "/proc", start_pid: Optional[int] = Non
 
 
 def _match_agent_argv(argv: list) -> Optional[str]:
-    """Shared ancestor-cmdline matching for both walk flavors."""
+    """Shared ancestor-cmdline matching for both walk flavors.
+
+    This is the FALLBACK signal (the env var in _infer_agent_from_env is
+    primary). It recognizes the OpenClaw gateway in the shapes it actually
+    presents to `ps` / `/proc/<pid>/cmdline`:
+
+      • `openclaw gateway run ...`         — the documented launch command
+      • process.title `openclaw-gateway`   — OpenClaw renames the live process
+        to `<cliName>-<subcommand>` (e.g. "openclaw-gateway") via its
+        per-command preaction hook, so the gateway daemon shows up with that
+        single-token argv[0] and NO separate "gateway" arg.
+      • bare `openclaw` (argv == ["openclaw"]) — observed on a live container:
+        the running gateway daemon presented argv[0]=="openclaw" with no
+        sub-args at all (process.title set to "openclaw" before the per-command
+        rename, or a stripped argv). We treat a SOLE-element `openclaw` argv as
+        the gateway: a human invoking the CLI for anything real carries
+        sub-args (`openclaw plugins ...`, `openclaw chat4000 ...`), so an argv
+        that is exactly `["openclaw"]` with nothing else is the daemon, not an
+        interactive human command. Conservative: we do NOT match a multi-token
+        `openclaw <something-else>` here unless it contains "gateway".
+    """
     joined = " ".join(argv)
     if "hermes gateway" in joined:
         return "hermes"
-    if "openclaw-gateway" in joined or (
-        argv and os.path.basename(argv[0]) == "openclaw" and "gateway" in argv
-    ):
+    if not argv:
+        return None
+    base0 = os.path.basename(argv[0])
+    # `openclaw-gateway` (renamed daemon) as a token anywhere in the ancestry.
+    if "openclaw-gateway" in joined:
         return "openclaw"
+    if base0 == "openclaw":
+        # `openclaw gateway [run]` — explicit gateway subcommand.
+        if "gateway" in argv:
+            return "openclaw"
+        # Sole-element bare `openclaw` daemon (no sub-args) — the live-box shape.
+        if len(argv) == 1:
+            return "openclaw"
     return None
 
 
