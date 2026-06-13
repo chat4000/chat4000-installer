@@ -2240,6 +2240,16 @@ PAIR_EMIT_TIMEOUT = 60.0  # seconds to wait for the detached pair child to print
 # hermes-test-93 (message 2 never sent, turn never resumed). Only "after the
 # pairing window resolves" is guaranteed to be after the relay mattered.
 GATEWAY_RELOAD_MAX_WAIT_S = 330
+# BUG2: agent-mode "install already ran in this window" guard. After pairing
+# succeeds the detached gateway reload bounces the gateway; if that restart cuts
+# the Hermes agent's relay turn, Hermes AUTO-RESUMES the turn and the agent
+# re-runs the curl|bash install command. The live-pair reuse (_reuse_live_pair)
+# already stops a *new code* from being issued, but the whole install still
+# re-ran. This marker lets a second agent-mode invocation SHORT-CIRCUIT: if a
+# fresh marker from this window exists, reuse the live pairing info (or print a
+# clear "already ran" message) and exit 0 — no second setup/pair/restart.
+AGENT_RUN_MARKER = "/tmp/chat4000-agent-install.marker"
+AGENT_RUN_MARKER_TTL_S = 600  # 10 min: covers the relay + restart + auto-resume window
 # v2 plugins print a universal https link; v1 printed a chat4000:// deep link.
 _QR_RE = re.compile(r"(chat4000://pair\?\S+|https://pair\.chat4000\.com/\?\S+)")
 _CODE_IN_URI_RE = re.compile(r"[?&]code=(\d+)")
@@ -2374,17 +2384,32 @@ def agent_success(
             "",
         ]
     lines += [
-        "⚡ IF YOU GET INTERRUPTED: after your user pairs (or the pairing window",
-        "ends), the agent gateway on this machine restarts — it must, to load the",
-        "chat4000 plugin. If that restart cuts your turn and the session resumes",
-        "with a note like 'your previous turn was interrupted by a gateway restart'",
-        "— NOTHING IS WRONG; the install is STILL successful. Do NOT re-run the",
+        "⚡ I AM ABOUT TO RESTART THE AGENT GATEWAY ON THIS MACHINE — it must restart",
+        "to load the chat4000 plugin (it happens after your user pairs, or when the",
+        "pairing window ends). That restart MAY INTERRUPT YOUR CURRENT TURN mid-send.",
+        "If your turn is cut and the session later resumes — with or without a note",
+        "like 'your previous turn was interrupted by a gateway restart' — NOTHING IS",
+        "WRONG; the install ALREADY SUCCEEDED. When you resume: do NOT re-run the",
         "installer (a re-run can invalidate the pairing code your user is typing in",
-        "RIGHT NOW), do NOT run any command. Relay anything not yet relayed, then",
-        "stop. The install command runs EXACTLY ONCE, ever.",
+        "RIGHT NOW), do NOT run any command. Just relay anything you hadn't relayed",
+        "yet, then stop. The install command runs EXACTLY ONCE, ever.",
         "",
     ]
     if kind == "Hermes":
+        # Hermes specifically AUTO-RESUMES an interrupted turn, and on real runs
+        # the resumed turn re-ran the curl|bash install command — so call this out
+        # loudly here. (A /tmp guard now also short-circuits such a re-run, but the
+        # agent must not rely on it; the contract is still "run exactly once".)
+        lines += [
+            "‼ HERMES-SPECIFIC — YOUR INTERRUPTED TURN WILL AUTO-RESUME. On real Hermes",
+            "  runs the gateway restart cut the relay turn, Hermes automatically resumed",
+            "  it, and the agent then RE-RAN the curl|bash install command — redoing the",
+            "  whole install. DO NOT DO THAT. When your turn auto-resumes after the",
+            "  restart: the install is DONE. Do NOT run the install command again, do NOT",
+            "  run any terminal command. Only finish relaying the pairing message (the GIF",
+            "  + the code/link/QR) if you hadn't already, then stop.",
+            "",
+        ]
         lines += [
             "═══ MESSAGE 1 — the FIRST LINE of your single reply: ═══",
             gif_line,
@@ -2858,6 +2883,86 @@ def install_hermes_agent(t: dict, args) -> int:
                          pair_ttl=args.pair_ttl, reusable=args.reusable)
 
 
+def _write_agent_run_marker() -> None:
+    """BUG2: record that an agent-mode install just ran, so a re-invocation in
+    the same window (Hermes auto-resuming an interrupted relay turn) can detect
+    it and short-circuit. Stores our pid + start time as JSON. Best-effort:
+    a failed write must never break the install."""
+    payload = {"pid": os.getpid(), "ts": int(time.time())}
+    with contextlib.suppress(OSError, TypeError, ValueError):
+        Path(AGENT_RUN_MARKER).write_text(json.dumps(payload), encoding="utf-8")
+
+
+def _fresh_agent_run_marker() -> Optional[dict]:
+    """Return the marker dict if a PRIOR agent-mode install left a still-fresh
+    marker (within AGENT_RUN_MARKER_TTL_S), else None. Robust to stale markers:
+    a marker older than the TTL is ignored AND removed. We do NOT gate on pid
+    liveness — the original installer process exits almost immediately (pairing
+    runs detached), so its pid is normally already gone by the time a re-run
+    arrives; the TTL is the real freshness signal here."""
+    try:
+        raw = Path(AGENT_RUN_MARKER).read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+        ts = int(data.get("ts", 0))
+    except (ValueError, TypeError, AttributeError):
+        # Corrupt marker — treat as absent and clean it up.
+        with contextlib.suppress(OSError):
+            Path(AGENT_RUN_MARKER).unlink()
+        return None
+    if time.time() - ts > AGENT_RUN_MARKER_TTL_S:
+        with contextlib.suppress(OSError):
+            Path(AGENT_RUN_MARKER).unlink()  # stale: let this run proceed normally
+        return None
+    return data
+
+
+def _agent_already_ran_short_circuit() -> Optional[int]:
+    """BUG2: if a fresh agent-run marker exists, this is a re-invocation inside
+    the same install window (almost always Hermes auto-resuming a relay turn the
+    gateway restart interrupted). Do NOT redo setup/pairing/gateway-restart.
+    Instead reuse the still-live pairing code (so the user keeps the SAME code
+    they may be typing in right now) and re-emit the success block, or — if the
+    live code is gone — print a clear "already ran, do NOT re-run" note. Returns
+    an exit code to return from run_agent_mode, or None to proceed normally."""
+    marker = _fresh_agent_run_marker()
+    if not marker:
+        return None
+    _emit("installer_agent_rerun_suppressed", {"age_s": int(time.time() - int(marker.get("ts", 0)))})
+    reused = _reuse_live_pair()
+    if reused:
+        code, qr, logpath, note = reused
+        carry = ("a previous run in THIS window already installed + started pairing; "
+                 "reusing that live code. Do NOT re-run the install command.")
+        note = f"{note + ' ' if note else ''}{carry}"
+        # Re-emit the exact relay block with the SAME live code. We don't know
+        # the original host kind here; the pairing-code/QR text is identical for
+        # both, so the OpenClaw branch wording (two separate sends) is the safe
+        # generic choice. stage is irrelevant — the live code/QR already encode it.
+        return agent_success("OpenClaw", code, qr, logpath, note)
+    # No live code to reuse (window lapsed): tell the agent plainly and stop.
+    _agent_print(
+        [
+            "[chat4000 installer → agent]  ✅ Already done — do NOT re-run.",
+            "",
+            "A chat4000 install ALREADY ran on this machine in the last few minutes",
+            "(this is almost certainly your relay turn auto-resuming after the gateway",
+            "restart interrupted it — that is EXPECTED and means the install SUCCEEDED).",
+            "The install command runs EXACTLY ONCE. Running it again would redo setup,",
+            "issue a NEW pairing code, and could invalidate the one your user is typing",
+            "in RIGHT NOW.",
+            "",
+            "DO NOT run the install command again. DO NOT run any terminal command.",
+            "If you have NOT yet relayed the pairing code/link/QR to your user, relay",
+            "the one from your earlier turn now, then stop. Otherwise: relay NOTHING and",
+            "stop — your user already has everything they need.",
+        ]
+    )
+    return 0
+
+
 def run_agent_mode(args) -> int:
     """`--agent`: terse, machine-addressed install for an agent caller."""
     # Dedicated, easy-to-funnel marker that this run was agent-driven (every other
@@ -2866,6 +2971,14 @@ def run_agent_mode(args) -> int:
     _emit("installer_started", {"env": os.environ.get("CHAT4000_ENV", "production")})
     if args.uninstall or args.reset:
         return agent_error("starting", "--uninstall / --reset aren't supported in --agent mode; run the installer normally for those.")
+
+    if not args.scan_only:
+        # BUG2: short-circuit a re-invocation inside the same install window
+        # (Hermes auto-resuming a relay turn the gateway restart interrupted).
+        sc = _agent_already_ran_short_circuit()
+        if sc is not None:
+            return sc
+        _write_agent_run_marker()
 
     if not args.scan_only:
         # Printed IMMEDIATELY, before any slow work. OpenClaw's exec tool yields

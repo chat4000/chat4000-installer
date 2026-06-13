@@ -171,5 +171,68 @@ class TestInferAgentCallerProcWalk(unittest.TestCase):
                 os.environ["OPENCLAW_SHELL"] = old
 
 
+class TestAgentRunMarker(unittest.TestCase):
+    """BUG 2: the /tmp 'install already ran in this window' guard."""
+
+    def setUp(self):
+        import tempfile
+
+        self._td = tempfile.TemporaryDirectory()
+        self._orig = installer.AGENT_RUN_MARKER
+        installer.AGENT_RUN_MARKER = str(Path(self._td.name) / "marker")
+
+    def tearDown(self):
+        installer.AGENT_RUN_MARKER = self._orig
+        self._td.cleanup()
+
+    def test_no_marker_returns_none(self):
+        self.assertIsNone(installer._fresh_agent_run_marker())
+
+    def test_fresh_marker_detected(self):
+        installer._write_agent_run_marker()
+        m = installer._fresh_agent_run_marker()
+        self.assertIsNotNone(m)
+        self.assertEqual(m["pid"], os.getpid())
+
+    def test_stale_marker_ignored_and_removed(self):
+        import json
+        import time as _t
+
+        old_ts = int(_t.time()) - (installer.AGENT_RUN_MARKER_TTL_S + 60)
+        Path(installer.AGENT_RUN_MARKER).write_text(json.dumps({"pid": 1, "ts": old_ts}))
+        self.assertIsNone(installer._fresh_agent_run_marker())
+        # Stale marker must be cleaned up so the next run proceeds normally.
+        self.assertFalse(Path(installer.AGENT_RUN_MARKER).exists())
+
+    def test_corrupt_marker_ignored_and_removed(self):
+        Path(installer.AGENT_RUN_MARKER).write_text("not json at all {{{")
+        self.assertIsNone(installer._fresh_agent_run_marker())
+        self.assertFalse(Path(installer.AGENT_RUN_MARKER).exists())
+
+    def test_short_circuit_none_when_no_marker(self):
+        # No marker → no short-circuit → install proceeds (returns None).
+        self.assertIsNone(installer._agent_already_ran_short_circuit())
+
+    def test_short_circuit_when_fresh_marker_no_live_pair(self):
+        # Fresh marker but no live pairing code → prints "already done", exit 0.
+        installer._write_agent_run_marker()
+        orig_reuse = installer._reuse_live_pair
+        orig_emit = installer._emit
+        printed = {}
+        orig_print = installer._agent_print
+        installer._reuse_live_pair = lambda: None
+        installer._emit = lambda *a, **k: None
+        installer._agent_print = lambda lines: printed.update(text="\n".join(lines))
+        try:
+            rc = installer._agent_already_ran_short_circuit()
+        finally:
+            installer._reuse_live_pair = orig_reuse
+            installer._emit = orig_emit
+            installer._agent_print = orig_print
+        self.assertEqual(rc, 0)
+        self.assertIn("Already done", printed["text"])
+        self.assertIn("DO NOT run the install command again", printed["text"])
+
+
 if __name__ == "__main__":
     unittest.main()
