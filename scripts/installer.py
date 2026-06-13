@@ -2419,10 +2419,14 @@ def agent_success(
         # the GIF "to send the rest later" has ended its turn and lost MESSAGE 2
         # forever (happened live on hermes-test-94).
         lines += [
-            "THE CONTRACT — send EXACTLY ONE reply, with BOTH parts in it, in order:",
+            "THE CONTRACT — send EXACTLY ONE reply containing THREE separate blocks, in",
+            "this order. Your platform splits them into THREE SEPARATE MESSAGES and sends",
+            "them one after another — GIF → text → QR:",
             "  1. The reply's FIRST LINE: the GIF image markdown (MESSAGE 1 below).",
-            "  2. Immediately after it: MESSAGE 2's exact text (ends with the QR image).",
-            "Your platform splits that single reply into GIF → text → QR for the user.",
+            "  2. Then MESSAGE 2's exact text (the link + code).",
+            "  3. Then, on its OWN line, the QR image markdown (MESSAGE 3 below).",
+            "The GIF and the QR are SEPARATE images — each on its own line, each becomes",
+            "its own image message. Never fold the QR into the text, never drop it.",
             "When your reply ends, your turn is OVER — you CANNOT send anything later.",
             "After this one reply you produce NOTHING ELSE about this install — not in",
             "any later turn, heartbeat, or status/'unfinished tool' check — until the",
@@ -2430,18 +2434,22 @@ def agent_success(
             "You are a RELAY, not a reporter: no narration, no summaries, no verification,",
             "no terminal commands, no log inspection, no talk about yourself or your tools.",
             "",
-            "⚠ ONE REPLY, EVERYTHING IN IT — you have failed this on a real run: the",
+            "⚠ ONE REPLY, ALL THREE BLOCKS IN IT — you have failed this on a real run: the",
             "agent's ENTIRE reply was just the GIF line; it ended its turn planning to",
             "'send the pairing message next'. There IS no next — the turn was over and",
             "the user NEVER received the pairing code. The GIF alone is a FAILURE.",
-            "MESSAGE 2 goes in the SAME reply, directly under the GIF line.",
+            "MESSAGE 2 and MESSAGE 3 go in the SAME reply, below the GIF line.",
             "",
         ]
     else:
         lines += [
-            "THE CONTRACT — your output is EXACTLY two messages, once each, in this order:",
-            "  1. MESSAGE 1 (the GIF) — the FIRST thing that appears in the chat.",
+            "THE CONTRACT — your output is EXACTLY THREE messages, once each, in this",
+            "order, and each is a SEPARATE send with about ONE SECOND between sends:",
+            "  1. MESSAGE 1 (the GIF image) — the FIRST thing that appears in the chat.",
             "  2. MESSAGE 2 (the pairing text) — sent only AFTER MESSAGE 1 has gone out.",
+            "  3. MESSAGE 3 (the QR image) — sent only AFTER MESSAGE 2 has gone out.",
+            "The GIF and the QR are SEPARATE images — each is its OWN send, never folded",
+            "into the text and never bundled with each other.",
             "Then you produce NOTHING ELSE about this install — not now, not in any LATER",
             "turn, not in heartbeats, not in status/'unfinished tool' checks — until the",
             "USER asks. ANY other output about this run, at ANY time, is a FAILURE.",
@@ -2449,10 +2457,11 @@ def agent_success(
             "no terminal commands, no log inspection, no talk about yourself or your tools.",
             "",
             "HOW TO GET THE ORDER RIGHT (you have gotten this wrong on real runs): the GIF",
-            "is a LARGE file and delivers SLOWLY. If you fire both sends back-to-back, the",
-            "platform delivers MESSAGE 2 first and you FAIL the order. So: send MESSAGE 1",
-            "as its OWN send; WAIT for that send to complete/deliver; only THEN send",
-            "MESSAGE 2 as a second, separate send. Never bundle them into one message.",
+            "is a LARGE file and delivers SLOWLY. If you fire sends back-to-back, a later",
+            "message can arrive first and you FAIL the order. So send each as its OWN send",
+            "and WAIT ABOUT ONE SECOND for it to deliver before the next: MESSAGE 1 (GIF),",
+            "wait ~1s; MESSAGE 2 (text), wait ~1s; MESSAGE 3 (QR image). Never bundle two",
+            "of them into one message.",
             "",
         ]
     lines += [
@@ -2505,9 +2514,6 @@ def agent_success(
         "",
         "🔢 If it's another device, enter this pairing code:",
         f"{code_disp}",
-        "",
-        "📱 Or scan this QR with the other device:",
-        qr_line,
         "═══════════════════════════════════════════════════════════",
         "",
         "Quiet formatting rules for MESSAGE 2 (apply them, don't show them to the user):",
@@ -2536,7 +2542,14 @@ def agent_success(
         ]
     lines += [
         "",
-        "⛔ STOP after MESSAGE 2. The following are ALL FORBIDDEN — you have actually done",
+        "═══ MESSAGE 3 — the QR, sent LAST as its OWN image, SEPARATE from the GIF: ═══",
+        "📱 Or scan this QR with the other device:",
+        qr_line,
+        "═══════════════════════════════════════════════════════════",
+        "• MESSAGE 3 is its OWN image send — post ONLY the ![](url) QR image. Do NOT write",
+        "  the QR url as plain text, and do NOT merge the QR into MESSAGE 2's text.",
+        "",
+        "⛔ STOP after MESSAGE 3. The following are ALL FORBIDDEN — you have actually done",
         "   every one of these on past runs; do NOT do any of them again:",
         "",
         "   ❌ Do NOT run ANY terminal command or tool about this install — not now,",
@@ -2588,8 +2601,8 @@ def agent_success(
         "   ❌ Do NOT append a trailing offer like \"If that code expired, tell me and I'll",
         "      rerun the install.\"",
         "",
-        "   After you send MESSAGE 2, you send NOTHING ELSE — in this turn OR any later",
-        "   one — about this install, until the USER asks. Your job ended at MESSAGE 2.",
+        "   After you send MESSAGE 3, you send NOTHING ELSE — in this turn OR any later",
+        "   one — about this install, until the USER asks. Your job ended at MESSAGE 3.",
     ]
     if note:
         lines += ["", f"(FYI for you only — do NOT relay this and do NOT act on it: {note})"]
