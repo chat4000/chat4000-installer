@@ -157,7 +157,8 @@ CELEBRATION_GIF_URL = "https://chat4000.com/gifs/celebration.gif"
 #
 # The path MUST end in .png: Hermes' reply pipeline only treats a ![](url) as an
 # image when the URL contains an image extension — a plain /qr?code=… is left as
-# raw text. So each registrar serves the PNG at /qr.png?code=<code>.
+# raw text. So each registrar serves the PNG at GET /codes/<code>/qr.png (the
+# .png suffix is significant — protocol.md C.3.4).
 QR_REGISTRAR_HOST = {
     "prod": "registrar.chat4000.com",
     "stage": "registrar.stgcht4.duckdns.org",
@@ -166,7 +167,7 @@ QR_REGISTRAR_HOST = {
 
 def _qr_image_url(code: str, stage: bool) -> str:
     host = QR_REGISTRAR_HOST["stage" if stage else "prod"]
-    return f"https://{host}/qr.png?code={code}"
+    return f"https://{host}/codes/{code}/qr.png"
 
 
 def _is_stage(args) -> bool:
@@ -2442,11 +2443,13 @@ def _pair_env() -> dict:
 def _kill_stale_pair_watchers() -> None:
     """Exactly ONE active pairing watcher per box. Re-runs are common (agents
     retry freely) and each run spawns a detached watcher that polls the
-    registrar's /pair/status every 1.5s (40 req/min). The registrar allows 60
-    req/min per IP, so TWO concurrent watchers (80 req/min) trip the limit and
-    BOTH die with '429 M_LIMIT_EXCEEDED' — leaving the phone stuck at 'Waiting
-    for your plugin' (observed live on hermes-test-91). Old watchers are
-    worthless the moment a new code is issued; kill them before spawning."""
+    registrar's GET /codes/{code} every 1.5s (40 req/min). The registrar's
+    per-IP status limit is STATUS_RATE_PER_MIN (default 180/min, ~3/s), with
+    headroom for a few concurrent watchers — but stacking watchers from repeated
+    re-runs still risks tripping '429 M_LIMIT_EXCEEDED' and leaving the phone
+    stuck at 'Waiting for your plugin' (observed live on hermes-test-91 under the
+    old limit). Old watchers are worthless the moment a new code is issued; kill
+    them before spawning."""
     try:
         # Matches 'chat4000 pair …' (Hermes) and 'openclaw chat4000 pair …'
         # (OpenClaw) cmdlines; our own argv never contains this substring.
