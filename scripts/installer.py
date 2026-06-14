@@ -1033,10 +1033,13 @@ def collect_openclaw_stats(openclaw_path: str) -> dict:
     except OSError:
         pass
 
-    # Channels / plugins: prefer the CLI, fall back to the plugins dir.
-    names = _openclaw_plugins_via_cli(openclaw_path)
-    if names is None:
-        names = _openclaw_plugins_via_dir(home)
+    # Channels = the agent's configured MESSAGING channels: the keys of the
+    # top-level `channels` map in openclaw.json — mirroring the Hermes config.yaml
+    # channel count (so both agents report the SAME kind of number, ~1 for a
+    # chat4000 install). NOT `openclaw plugins list`: that lists OpenClaw's ~96
+    # stock EXTENSION plugins (the wrong universe), and its large JSON object also
+    # tripped the old text parser into counting every line (bogus thousands).
+    names = _openclaw_channels(home)
     if names is not None:
         stats["channels"] = names[:50]
         stats["channel_count"] = len(names)
@@ -1048,68 +1051,41 @@ def collect_openclaw_stats(openclaw_path: str) -> dict:
     return stats
 
 
-def _openclaw_plugins_via_cli(openclaw_path: str) -> Optional[list]:
-    for cmd in (
-        [openclaw_path, "plugins", "list", "--json"],
-        [openclaw_path, "plugins", "list"],
-    ):
+def _openclaw_channels(home: Path) -> Optional[list]:
+    """Configured MESSAGING channels for an OpenClaw — the keys of the top-level
+    `channels` map in openclaw.json (the chat4000 plugin writes `channels.chat4000`).
+    This mirrors the Hermes config.yaml `channels` count so both agents report the
+    same kind of number (~1 for a chat4000 install).
+
+    Deliberately NOT `openclaw plugins list`: that lists OpenClaw's ~96 stock
+    EXTENSION plugins (active-memory, providers, …), which is a different universe
+    from messaging channels; its large `{registry, plugins[]}` JSON object also
+    tripped the previous text parser into counting every output line (the bogus
+    thousands). Config path resolution matches OpenClaw (CONFIG_PATH override;
+    openclaw.json with the legacy clawdbot.json fallback).
+
+    Returns the channel-name list, [] when the config exists but has no channels,
+    or None when no readable config is found (channel_count stays unknown)."""
+    explicit = (os.environ.get("OPENCLAW_CONFIG_PATH") or "").strip()
+    candidates = (
+        [Path(explicit).expanduser()]
+        if explicit
+        else [home / "openclaw.json", home / "clawdbot.json"]
+    )
+    for cfg_path in candidates:
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
-        except (OSError, subprocess.SubprocessError):
-            continue
-        out = (r.stdout or "").strip()
-        if r.returncode != 0 or not out:
-            continue
-        # JSON form?
-        start = out.find("[")
-        obj_start = out.find("{")
-        with contextlib.suppress(ValueError, TypeError):
-            if start >= 0:
-                data = json.loads(out[start:])
-                names = [_plugin_name(x) for x in data]
-                names = [n for n in names if n]
-                if names:
-                    return names
-            elif obj_start >= 0:
-                data = json.loads(out[obj_start:])
-                if isinstance(data, dict):
-                    plugins = data.get("plugins", data)
-                    if isinstance(plugins, dict):
-                        return list(plugins.keys())
-                    if isinstance(plugins, list):
-                        names = [n for n in (_plugin_name(x) for x in plugins) if n]
-                        if names:
-                            return names
-        # Plain text: one plugin per line, strip bullets/status decorations.
-        names = []
-        for line in out.splitlines():
-            t = line.strip().lstrip("•-*◦ ").strip()
-            t = t.split()[0] if t else ""
-            if t and not t.lower().startswith(("name", "plugin", "installed", "no ")):
-                names.append(t)
-        if names:
-            return names
-    return None
-
-
-def _plugin_name(x) -> Optional[str]:
-    if isinstance(x, str):
-        return x.strip() or None
-    if isinstance(x, dict):
-        for k in ("name", "id", "package", "pkg"):
-            v = x.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-    return None
-
-
-def _openclaw_plugins_via_dir(home: Path) -> Optional[list]:
-    pdir = home / "plugins"
-    try:
-        if pdir.is_dir():
-            return [d.name for d in pdir.iterdir() if d.is_dir() and not d.name.startswith(".")]
-    except OSError:
-        pass
+            if not cfg_path.is_file():
+                continue
+            cfg = json.loads(cfg_path.read_text(errors="ignore"))
+        except (OSError, ValueError):
+            return None  # config present but unreadable/unparseable — don't guess
+        if isinstance(cfg, dict):
+            channels = cfg.get("channels")
+            if isinstance(channels, dict):
+                return [str(k) for k in channels.keys()]
+            if isinstance(channels, list):
+                return [str(c) for c in channels]
+            return []  # parsed, no channels configured yet
     return None
 
 
