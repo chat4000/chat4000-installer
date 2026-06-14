@@ -1567,14 +1567,95 @@ def detect_restart_method() -> Optional[str]:
     openclaw = shutil.which("openclaw") or "openclaw"
     try:
         r = subprocess.run([openclaw, "gateway", "status"], capture_output=True, text=True, timeout=5)
-        out = (r.stdout or "") + (r.stderr or "")
-        if "service disabled" in out.lower() or "service is not installed" in out.lower():
+        out = ((r.stdout or "") + (r.stderr or "")).lower()
+        # F1: a box whose service is disabled/uninstalled must go straight to
+        # foreground. The old check only matched the literal "service disabled"
+        # substring, but OpenClaw 2026.6.6 prints "Service: systemd user
+        # (disabled)" — no match — so it wrongly chose "openclaw-supervised" and
+        # `gateway restart` no-oped (rc 0, nothing restarted). Match the
+        # disabled/uninstalled signals the host actually emits.
+        if any(sig in out for sig in (
+            "service disabled", "service is not installed", "(disabled)",
+            "not installed", "not running",
+        )):
             return "foreground"
         if r.returncode == 0 and out.strip():
             return "openclaw-supervised"
     except (OSError, subprocess.SubprocessError):
         pass
     return "foreground"
+
+
+def _openclaw_gateway_lock_dir() -> Path:
+    """The dir where OpenClaw drops its gateway lockfile(s): /tmp/openclaw-<uid>.
+    OpenClaw keys this on the REAL uid of the process that started the gateway,
+    which is the same uid we run as, so os.getuid() is the right anchor. Falls
+    back to scanning /tmp for any openclaw-* dir if the uid-named one is absent
+    (defensive — different uid, or a host that names it differently)."""
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    primary = Path(f"/tmp/openclaw-{uid}")
+    if primary.is_dir():
+        return primary
+    # Defensive fallback: first /tmp/openclaw-* dir that holds a gateway lock.
+    with contextlib.suppress(OSError):
+        for cand in sorted(Path("/tmp").glob("openclaw-*")):
+            if cand.is_dir() and any(cand.glob("gateway.*.lock")):
+                return cand
+    return primary
+
+
+def _openclaw_gateway_pid() -> Optional[int]:
+    """The PID of the running OpenClaw gateway, read from its authoritative
+    lockfile. OpenClaw writes /tmp/openclaw-<uid>/gateway.<hash>.lock containing
+    JSON like {"pid":N,...}. This is argv-independent: the live gateway runs as
+    bare `openclaw` (not `openclaw gateway run`), so pkill-by-argv misses it but
+    the lockfile pid never lies. Returns None when no live gateway lock exists.
+
+    Only returns a pid that is actually alive — a stale lock (process gone) reads
+    as no gateway, which is exactly right for a fresh-install path."""
+    lock_dir = _openclaw_gateway_lock_dir()
+    best: Optional[int] = None
+    with contextlib.suppress(OSError):
+        for lock in sorted(lock_dir.glob("gateway.*.lock")):
+            with contextlib.suppress(OSError, ValueError, json.JSONDecodeError):
+                data = json.loads(lock.read_text(errors="ignore") or "{}")
+                pid = int(data.get("pid", 0))
+                if pid > 0 and _pid_alive(pid):
+                    best = pid
+    return best
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is this pid a live process? `kill -0` (signal 0) probes without killing."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # exists but owned by another uid
+    except OSError:
+        return False
+
+
+def _kill_openclaw_gateway() -> Optional[int]:
+    """Kill the running OpenClaw gateway and return the pid we killed (or None if
+    none was running). PRIMARY kill is by the authoritative lockfile pid (F4) —
+    the only thing that reliably matches a bare-`openclaw` gateway. The argv
+    patterns stay as a SECONDARY sweep for any gateway that does present the
+    documented argv shapes."""
+    killed = _openclaw_gateway_pid()
+    if killed is not None:
+        say(f"Killing running OpenClaw gateway (pid {killed}, from lockfile).")
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.kill(killed, 9)
+    # Secondary: argv-shape sweep for any gateway presenting a documented argv.
+    for pat in ("openclaw gateway run", "openclaw-gateway"):
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(["pkill", "-9", "-f", pat], capture_output=True, timeout=5)
+    return killed
 
 
 def restart_gateway(method: str) -> bool:
@@ -1590,40 +1671,40 @@ def restart_gateway(method: str) -> bool:
             return False
         return True
     if method == "openclaw-supervised":
+        # F1/F2: `openclaw gateway restart` on a disabled-service box prints
+        # "Gateway service disabled." and EXITS 0 WITHOUT restarting anything —
+        # so rc 0 is NOT proof of a restart. We verify, and route any
+        # disabled/no-restart signal to the foreground path (which kills the old
+        # gateway by pid and verifies a new one came up).
+        pre_pid = _openclaw_gateway_pid()
         say(f"$ {openclaw} gateway restart")
         r = subprocess.run([openclaw, "gateway", "restart"], capture_output=True, text=True)
-        out = (r.stdout or "") + (r.stderr or "")
-        if "service disabled" in out.lower():
+        out = ((r.stdout or "") + (r.stderr or "")).lower()
+        if any(sig in out for sig in ("service disabled", "(disabled)", "not installed", "not running")):
             warn("Gateway service is not installed under a supervisor — starting in foreground.")
             return restart_gateway("foreground")
-        if r.returncode == 0:
+        if r.returncode != 0:
+            if out.strip():
+                warn(out.strip()[:500])
+            return restart_gateway("foreground")
+        # rc 0 — but VERIFY a real restart happened (pid changed / a live gateway
+        # exists), because the supervised command lies on a disabled box.
+        if _verify_gateway_restarted(pre_pid):
             return True
-        if out.strip():
-            warn(out.strip()[:500])
-        return False
+        warn("Supervised restart reported success but no new gateway appeared — forcing a foreground restart.")
+        return restart_gateway("foreground")
     if method == "foreground":
-        # BUG3: a gateway already up and SERVING chat4000 must be REUSED, not
-        # bounced into a port collision that we then mis-report as failure. The
-        # old foreground path did `pkill -9 -f 'openclaw gateway run'` then spawned
-        # a fresh `openclaw gateway run`. But the running gateway was launched as
-        # bare `openclaw` (NOT `openclaw gateway run`), so the pkill matched
-        # nothing, the old gateway kept port 18789, the new one died with "address
-        # in use", and chat4000 (already live on the OLD gateway) never re-emitted
-        # hello_ok → a 120s timeout reported FAILURE for a perfectly healthy
-        # gateway. Conservative fix: only short-circuit on POSITIVE evidence that
-        # a gateway is already serving chat4000; a genuinely dead gateway still
-        # gets (re)started below.
-        if _openclaw_gateway_serving_chat4000():
-            say("A gateway is already up and serving chat4000 — reusing it (no restart needed).")
-            return True
+        # F3/F4 + META: FORCE a real restart on every (re)install. We no longer
+        # short-circuit on "a gateway is already serving chat4000" — on an UPGRADE
+        # that is ALWAYS true (the old gateway serves the OLD code), and reusing it
+        # means the new code never loads and the version-poller never starts. The
+        # right move is to KILL the old gateway by its authoritative lockfile pid
+        # (F4), spawn a fresh one, then VERIFY a NEW gateway (different pid) is up.
+        # Killing the old one first also removes the port-18789 collision that the
+        # BUG3 reuse short-circuit existed to dodge — so the false-failure path is
+        # gone without the short-circuit.
         log_path = "/tmp/openclaw-gateway.log"
-        # Kill BOTH argv shapes the gateway can present: the documented
-        # `openclaw gateway run` AND the renamed `openclaw-gateway` process.title
-        # (per OpenClaw's per-command process rename). We deliberately do NOT
-        # pkill bare `openclaw` broadly — that could match the agent host itself.
-        for pat in ("openclaw gateway run", "openclaw-gateway"):
-            with contextlib.suppress(OSError, subprocess.SubprocessError):
-                subprocess.run(["pkill", "-9", "-f", pat], capture_output=True, timeout=5)
+        pre_pid = _kill_openclaw_gateway()
         time.sleep(1)
         try:
             logf = open(log_path, "ab")
@@ -1632,65 +1713,34 @@ def restart_gateway(method: str) -> bool:
                 stdout=logf, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
             )
             say(f"Started gateway in background. Log: {C_CYN}{log_path}{C_RST}")
-            time.sleep(4)
-            # If our spawn lost a port-18789 race to a gateway that's actually
-            # serving chat4000, that's success, not failure — reuse it.
-            if _foreground_gateway_lost_port(log_path) and _openclaw_gateway_serving_chat4000():
-                say("Existing gateway already holds the port and is serving chat4000 — reusing it.")
-                return True
-            return True
         except (OSError, subprocess.SubprocessError) as exc:
             warn(f"Could not start gateway: {exc}")
             return False
+        # META: a restart we can't prove is a FAILURE. Confirm a NEW gateway (pid
+        # differs from the one we killed) is actually live before claiming success.
+        if _verify_gateway_restarted(pre_pid):
+            return True
+        warn("Started a gateway but could not confirm a NEW gateway process came up — restart not verified.")
+        return False
     return False
 
 
-def _foreground_gateway_lost_port(log_path: str) -> bool:
-    """Did the foreground gateway we just spawned fail to bind port 18789 because
-    another gateway already holds it? Reads the tail of its log for the
-    address-in-use / already-running signatures OpenClaw emits on a port
-    collision. Best-effort: a missing/unreadable log returns False."""
-    try:
-        tail = Path(log_path).read_text(errors="ignore")[-4000:].lower()
-    except OSError:
-        return False
-    return any(
-        sig in tail
-        for sig in ("address already in use", "eaddrinuse", "already running", "port 18789")
-    )
+def _verify_gateway_restarted(pre_pid: Optional[int], timeout: float = 30.0) -> bool:
+    """META verification: prove a NEW gateway is live after a (re)start.
 
-
-def _openclaw_gateway_serving_chat4000() -> bool:
-    """POSITIVE-evidence probe: is a gateway already up AND serving the chat4000
-    channel? Two independent signals, BOTH required to avoid a false positive:
-
-      1. `openclaw gateway status` reports a live/connected gateway (rc 0 with
-         non-empty status, and not a 'disabled'/'not running' message), and
-      2. the chat4000 runtime log shows `runtime.hello_ok` — the same handshake
-         marker wait_for_chat4000_connected keys on — meaning the chat4000
-         channel actually connected through that gateway.
-
-    Conservative by design: a gateway that's up but has NOT loaded chat4000 yet
-    (e.g. it predates a fresh install) yields signal 1 but not 2, so we return
-    False and the caller (re)starts it — exactly what a fresh install needs."""
-    openclaw = shutil.which("openclaw") or "openclaw"
-    status_ok = False
-    try:
-        r = subprocess.run([openclaw, "gateway", "status"], capture_output=True, text=True, timeout=8)
-        out = ((r.stdout or "") + (r.stderr or "")).lower()
-        if r.returncode == 0 and out.strip() and not any(
-            bad in out for bad in ("service disabled", "not running", "not installed", "no gateway")
-        ):
-            status_ok = True
-    except (OSError, subprocess.SubprocessError):
-        return False
-    if not status_ok:
-        return False
-    runtime_log = _openclaw_home() / "plugins" / "chat4000" / "logs" / "runtime.log"
-    try:
-        return "runtime.hello_ok" in runtime_log.read_text(errors="ignore")
-    except OSError:
-        return False
+    Success requires a gateway lockfile pid that is BOTH alive AND different from
+    `pre_pid` (the pid we killed/observed before restarting). On a fresh install
+    pre_pid is None, so any new live pid counts. If the pid never changes (or
+    never appears) within `timeout`, the restart did NOT happen — return False so
+    the caller reports failure instead of a phantom success. Polls every 1s."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        cur = _openclaw_gateway_pid()
+        if cur is not None and cur != pre_pid:
+            say(f"New gateway is live (pid {cur}).")
+            return True
+        time.sleep(1)
+    return False
 
 
 def openclaw_reset_local_state() -> None:
@@ -2818,6 +2868,31 @@ def _spawn_detached_gateway_reload(hermes_bin: str, max_wait: int = GATEWAY_RELO
         )
 
 
+def _hermes_gateway_alive() -> bool:
+    """Is a Hermes gateway process live? Mirrors the kill side, which targets
+    `hermes gateway` via pgrep -f, so the same pattern is the authoritative
+    'did it come back' signal. (Hermes, unlike OpenClaw, writes no pid lockfile
+    we can read, so argv is the signal we have.)"""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        r = subprocess.run(["pgrep", "-f", "hermes gateway"], capture_output=True, timeout=8)
+        return r.returncode == 0
+    return False
+
+
+def _verify_hermes_gateway_back(timeout: float = 30.0) -> bool:
+    """META verification mirror for Hermes: after a (re)start, confirm a gateway
+    process is actually live again. Both the native `hermes gateway restart` and
+    the pkill+relaunch fallback can report 'done' on an unsupervised box while
+    nothing came back up — so a restart we can't observe is treated as a FAILURE.
+    Polls every 1s up to `timeout`."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _hermes_gateway_alive():
+            return True
+        time.sleep(1)
+    return False
+
+
 def _hermes_restart_gateway(venv_bin: str) -> Optional[str]:
     """Restart the Hermes gateway NOW (human flow — we don't live inside the
     gateway, so a synchronous bounce can't kill us). Prefers the native
@@ -2826,6 +2901,11 @@ def _hermes_restart_gateway(venv_bin: str) -> Optional[str]:
     script (_hermes_gateway_reload_sh, native attempt skipped — we just tried).
     The agent flows keep their detached, event-driven reload instead.
 
+    Every path that reports success is VERIFIED: a gateway process must actually
+    be live again (META — neither the native command nor the relaunch can claim a
+    restart that didn't happen, which on an unsupervised box would otherwise pass
+    silently).
+
     Returns the method that worked — "native" | "relaunch" (the IN7
     installer_gateway_restarted prop) — or None when both failed."""
     hermes_bin = f"{venv_bin}/hermes"
@@ -2833,9 +2913,12 @@ def _hermes_restart_gateway(venv_bin: str) -> Optional[str]:
     try:
         r = subprocess.run([hermes_bin, "gateway", "restart"], capture_output=True, text=True, timeout=90)
         if r.returncode == 0:
-            return "native"
-        out = ((r.stdout or "") + (r.stderr or "")).strip()
-        warn(f"`hermes gateway restart` exited {r.returncode}{(': ' + out[:300]) if out else ''} — falling back to pkill + relaunch.")
+            if _verify_hermes_gateway_back():
+                return "native"
+            warn("`hermes gateway restart` returned 0 but no gateway came back — falling back to pkill + relaunch.")
+        else:
+            out = ((r.stdout or "") + (r.stderr or "")).strip()
+            warn(f"`hermes gateway restart` exited {r.returncode}{(': ' + out[:300]) if out else ''} — falling back to pkill + relaunch.")
     except subprocess.TimeoutExpired:
         warn("`hermes gateway restart` timed out — falling back to pkill + relaunch.")
     except OSError as exc:
@@ -2849,12 +2932,18 @@ def _hermes_restart_gateway(venv_bin: str) -> Optional[str]:
     try:
         Path(sh_path).write_text("#!/usr/bin/env bash\n" + script, encoding="utf-8")
         os.chmod(sh_path, 0o700)
-        return "relaunch" if subprocess.run(["bash", sh_path], timeout=180).returncode == 0 else None
+        if subprocess.run(["bash", sh_path], timeout=180).returncode != 0:
+            return None
     except (OSError, subprocess.SubprocessError):
         return None
     finally:
         with contextlib.suppress(OSError):
             os.unlink(sh_path)
+    # META: verify the relaunch actually produced a live gateway.
+    if _verify_hermes_gateway_back():
+        return "relaunch"
+    warn("pkill + relaunch ran but no Hermes gateway is live — restart not verified.")
+    return None
 
 
 def install_openclaw_agent(t: dict, args) -> int:
