@@ -2056,39 +2056,52 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
     # QR + code and the watcher's live feedback. Pair-first, restart after — the
     # same ordering as the agent flow: restarting first would tear the QR away
     # mid-scan, since the restart below is what bounces the gateway.
-    hdr("📱 Pairing your device")
-    print(f"{C_DIM}Scan the QR with the chat4000 iOS/macOS app. Ctrl-C to skip pairing.{C_RST}\n")
-    pair_cmd = [chat4000_bin, "pair"]
-    if args.stage:
-        pair_cmd.append("--stage")
-    pair_cmd += _pair_flag_args(args)
-    try:
-        pair_rc = subprocess.run(pair_cmd).returncode
-    except KeyboardInterrupt:
-        print()
-        warn("Pairing cancelled. Finish any time:")
-        print(f"  {C_CYN}{chat4000_bin} pair{C_RST}  (then restart your Hermes gateway so it loads chat4000)")
-        _emit("installer_cancelled", {"stage": "pair"})
-        return 130
-    except OSError as exc:
-        err(f"Could not run pairing: {exc}")
-        _emit("installer_failed", {"stage": "pair", "error_class": type(exc).__name__, "error_msg": str(exc)[:200]})
-        return 1
-    if pair_rc != 0:
-        # Pairing resolved unhappily (expired window, registrar error, …). The
-        # gateway restart below still has to happen — the plugin is installed and
-        # enabled, and a later manual `chat4000 pair` needs chat4000 loaded.
-        err(f"Pairing exited {pair_rc}. Pair again any time: {chat4000_bin} pair")
-        _emit("installer_failed", {"stage": "pair", "exit_code": pair_rc})
+    #
+    # --no-pair (UPGRADE invocation, e.g. a resident plugin's version-poller
+    # refreshing itself) skips pairing entirely but STILL restarts the gateway
+    # below so the freshly-installed plugin code is loaded and running. Mirrors
+    # the OpenClaw gate (do_pair = interactive and not args.no_pair).
+    do_pair = not args.no_pair
+    if not do_pair:
+        # pair_rc = 0 keeps the "restart, then report success" branches below on
+        # their happy path — there's no failed pairing here, just an upgrade.
+        pair_rc = 0
+        ok("Plugin refreshed (--no-pair). Pair a device any time with:")
+        print(f"  {C_CYN}{chat4000_bin} pair{C_RST}")
     else:
-        # IN7: parity with the OpenClaw flow — the interactive pair succeeded.
-        _emit("pairing_completed_via_installer", {})
+        hdr("📱 Pairing your device")
+        print(f"{C_DIM}Scan the QR with the chat4000 iOS/macOS app. Ctrl-C to skip pairing.{C_RST}\n")
+        pair_cmd = [chat4000_bin, "pair"]
+        if args.stage:
+            pair_cmd.append("--stage")
+        pair_cmd += _pair_flag_args(args)
+        try:
+            pair_rc = subprocess.run(pair_cmd).returncode
+        except KeyboardInterrupt:
+            print()
+            warn("Pairing cancelled. Finish any time:")
+            print(f"  {C_CYN}{chat4000_bin} pair{C_RST}  (then restart your Hermes gateway so it loads chat4000)")
+            _emit("installer_cancelled", {"stage": "pair"})
+            return 130
+        except OSError as exc:
+            err(f"Could not run pairing: {exc}")
+            _emit("installer_failed", {"stage": "pair", "error_class": type(exc).__name__, "error_msg": str(exc)[:200]})
+            return 1
+        if pair_rc != 0:
+            # Pairing resolved unhappily (expired window, registrar error, …). The
+            # gateway restart below still has to happen — the plugin is installed and
+            # enabled, and a later manual `chat4000 pair` needs chat4000 loaded.
+            err(f"Pairing exited {pair_rc}. Pair again any time: {chat4000_bin} pair")
+            _emit("installer_failed", {"stage": "pair", "exit_code": pair_rc})
+        else:
+            # IN7: parity with the OpenClaw flow — the interactive pair succeeded.
+            _emit("pairing_completed_via_installer", {})
 
     # 3/3 — AFTER pairing resolves: restart the gateway. Hermes has no hot-reload
     # (plugins are discovered only at startup), so this is what actually puts
     # chat4000 in the running agent.
     hdr("🔁 Restarting the Hermes gateway")
-    if pair_rc == 0:
+    if do_pair and pair_rc == 0:
         say("Starting the gateway so it loads chat4000 — your phone will finish joining in ~15s.")
     else:
         say("Starting the gateway so it loads chat4000.")
@@ -2101,7 +2114,13 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
         warn(f"Restart it yourself:  {C_CYN}{venv_bin}/hermes gateway restart{C_RST}")
         _emit("installer_failed", {"stage": "gateway_restart", "error_class": "RestartUnavailable", "error_msg": "hermes native restart and pkill+relaunch both failed"})
         return 1
-    if pair_rc == 0:
+    if not do_pair:
+        # UPGRADE invocation: plugin refreshed + gateway restarted, no device. The
+        # running gateway now has the new plugin code loaded — a resident
+        # version-poller can run. Done.
+        ok("Upgrade complete — chat4000 plugin refreshed and the gateway is running.")
+        _emit("installer_succeeded", {})
+    elif pair_rc == 0:
         ok("All set — your device is paired and chat4000 is live.")
         _emit("installer_succeeded", {})
     return pair_rc
@@ -3171,7 +3190,7 @@ def main() -> int:
     parser.add_argument("--hermes-branch", default=None, metavar="NAME", help="GitHub branch/tag/SHA of the HERMES plugin repo — overrides --branch/--ref for Hermes only")
     parser.add_argument("--latest", action="store_true", help=f"install the LATEST code (the repo's default branch '{LATEST_REF}') instead of the '{DEFAULT_REF}' tag")
     # OpenClaw flow
-    parser.add_argument("--no-pair", action="store_true", help="(openclaw) install + restart only, don't pair")
+    parser.add_argument("--no-pair", action="store_true", help="install + restart only, don't pair (UPGRADE invocation; both hosts)")
     parser.add_argument("--no-restart", action="store_true", help="(openclaw) install only, don't touch the gateway")
     parser.add_argument("--force", action="store_true", help="(openclaw) force-reinstall in place (gh installs are always forced)")
     parser.add_argument("--openclaw-branch", "--plugin-version", dest="openclaw_branch", default=None, metavar="NAME", help="GitHub branch/tag/SHA of the OPENCLAW plugin repo — overrides --branch/--ref for OpenClaw only (--plugin-version is the legacy alias)")
