@@ -733,7 +733,7 @@ def _openclaw_version(path: str) -> str:
         out = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10)
         blob = (out.stdout or out.stderr).strip()
         line = blob.splitlines()[0] if blob else "unknown"
-        m = re.search(r"\b(\d+\.\d+\.\d+\S*)", line)
+        m = re.search(r"\b(\d+\.\d+\.\d+[\w.+-]*)", line)
         return m.group(1) if m else line
     except (OSError, subprocess.SubprocessError):
         return "unknown"
@@ -1144,7 +1144,7 @@ def collect_hermes_stats(venv_bin: str) -> dict:
             out = subprocess.run([str(hermes_bin), "--version"], capture_output=True, text=True, timeout=10)
             blob = (out.stdout or out.stderr).strip()
             if blob:
-                m = re.search(r"\b(\d+\.\d+\.\d+\S*)", blob.splitlines()[0])
+                m = re.search(r"\b(\d+\.\d+\.\d+[\w.+-]*)", blob.splitlines()[0])
                 stats["agent_version"] = m.group(1) if m else blob.splitlines()[0]
         except (OSError, subprocess.SubprocessError):
             pass
