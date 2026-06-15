@@ -1662,10 +1662,87 @@ def _kill_openclaw_gateway() -> Optional[int]:
     return killed
 
 
-# How long to "see" whether a supervisor (systemd Restart=always, etc.) revives
-# the gateway we just killed before we relaunch it ourselves. Mirrors the Hermes
-# fallback's respawn-watch window.
-GATEWAY_RESPAWN_GRACE_S = 8.0
+# After killing the gateway we must decide whether a SUPERVISOR (systemd
+# Restart=always, supervisord, docker policy) is bringing it back. A supervisor
+# re-spawns the killed PROCESS within ~1-2s, but the new OpenClaw gateway can take
+# ~30-60s to boot and write its lockfile. The old fixed 8s lockfile-only wait timed
+# out before that, so we wrongly started our OWN gateway alongside the supervisor's
+# — a ~5-minute double gateway (observed on a clean supervisord box). So we split
+# the wait:
+#   SUPERVISOR_RESPAWN_DETECT_S — short window to SEE a supervisor re-spawn a process
+#       at all (or the lockfile flip, for fast supervisors). No sign in this window →
+#       nothing is supervising → start the gateway ourselves immediately (no long
+#       stall on a pure-foreground box).
+#   GATEWAY_RESPAWN_GRACE_S — long window, used ONLY once a supervisor's re-spawn is
+#       seen, to let that revival finish booting and write its lockfile before we
+#       hand off. Lengthened from 8s so a slow supervisord revival is no longer
+#       missed (which is what caused the double gateway).
+SUPERVISOR_RESPAWN_DETECT_S = 12.0
+GATEWAY_RESPAWN_GRACE_S = 75.0
+
+
+def _pid_is_zombie(pid: int) -> bool:
+    """True if pid is a zombie (defunct) — it still exists but is dead awaiting reap.
+    Read from /proc/<pid>/stat: the single state char follows the final ')'. Matters
+    on a non-reaping PID 1 (our test harness's `sleep`), where killed gateways linger
+    as defunct `openclaw` and would otherwise read as a live re-spawn."""
+    with contextlib.suppress(OSError, IndexError):
+        stat = Path(f"/proc/{pid}/stat").read_text(errors="ignore")
+        return stat.rsplit(")", 1)[1].split()[0] == "Z"
+    return False
+
+
+def _other_openclaw_process_alive(exclude_pid: Optional[int]) -> bool:
+    """Is there a LIVE (non-zombie) `openclaw` process other than exclude_pid? This
+    is the early signal that a SUPERVISOR re-spawned the gateway PROCESS right after
+    we killed it — seen within ~1-2s, long before the new gateway writes its
+    lockfile. Zombies are excluded so unreaped corpses don't read as a live respawn."""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        r = subprocess.run(["pgrep", "-x", "openclaw"], capture_output=True, text=True, timeout=5)
+        for tok in (r.stdout or "").split():
+            with contextlib.suppress(ValueError):
+                pid = int(tok)
+                if pid != exclude_pid and _pid_alive(pid) and not _pid_is_zombie(pid):
+                    return True
+    return False
+
+
+def _await_supervisor_revival(pre_pid: int) -> bool:
+    """After killing the gateway (pre_pid), decide whether a SUPERVISOR is bringing it
+    back. Returns True if a supervisor revived it — the caller must then NOT start its
+    own gateway (starting one anyway was the double-gateway bug). Returns False if
+    nothing is supervising, so the caller starts the gateway itself.
+
+    Phase A (short, SUPERVISOR_RESPAWN_DETECT_S): poll for either the new lockfile pid
+      (fast supervisors) OR a freshly re-spawned `openclaw` process (the signal a
+      supervisor exists, seen well before the lockfile). No sign → nothing supervising
+      → return False at once (no long stall on a foreground box).
+    Phase B (long, GATEWAY_RESPAWN_GRACE_S): a supervisor IS reviving — wait for its
+      gateway to finish booting and write a new lockfile pid, then hand off."""
+    detect_deadline = time.time() + SUPERVISOR_RESPAWN_DETECT_S
+    supervisor_seen = False
+    while time.time() < detect_deadline:
+        cur = _openclaw_gateway_pid()
+        if cur is not None and cur != pre_pid:
+            say(f"A supervisor revived the gateway (pid {cur}) — nothing more to do.")
+            return True
+        if _other_openclaw_process_alive(pre_pid):
+            supervisor_seen = True
+            break
+        time.sleep(1)
+    if not supervisor_seen:
+        return False  # nothing is supervising — caller starts the gateway itself.
+    say("A supervisor is re-spawning the gateway — waiting for it to finish booting…")
+    grace_deadline = time.time() + GATEWAY_RESPAWN_GRACE_S
+    while time.time() < grace_deadline:
+        cur = _openclaw_gateway_pid()
+        if cur is not None and cur != pre_pid:
+            say(f"A supervisor revived the gateway (pid {cur}) — nothing more to do.")
+            return True
+        time.sleep(1)
+    warn("A supervisor re-spawned the gateway but it never wrote a live lockfile in "
+         "time — starting one ourselves as a fallback.")
+    return False
 
 
 def _docker_gateway_alive(docker: str) -> bool:
@@ -1760,16 +1837,15 @@ def restart_gateway(method: str) -> bool:
     #    pkill-by-argv sweep ONLY as a secondary defensive mop-up.
     _kill_openclaw_gateway()
 
-    # 4. SEE: poll the lockfile up to GRACE seconds. A live pid != pre_pid means a
-    #    supervisor (systemd Restart=always, etc.) revived it — SUCCESS, hands off.
-    if pre_pid is not None:
-        deadline = time.time() + GATEWAY_RESPAWN_GRACE_S
-        while time.time() < deadline:
-            cur = _openclaw_gateway_pid()
-            if cur is not None and cur != pre_pid:
-                say(f"A supervisor revived the gateway (pid {cur}) — nothing more to do.")
-                return True
-            time.sleep(1)
+    # 4. SEE if a SUPERVISOR is bringing the gateway back. It re-spawns the killed
+    #    PROCESS within ~1-2s but the new gateway can take ~30-60s to boot and write
+    #    its lockfile; the old fixed 8s lockfile-only wait timed out before that and
+    #    we wrongly started our OWN gateway alongside the supervisor's (a ~5-min
+    #    double gateway). _await_supervisor_revival detects the fast process re-spawn,
+    #    then waits the long grace for the lockfile — and only returns False (→ we
+    #    start our own) if NO supervisor appears (so foreground isn't stalled).
+    if pre_pid is not None and _await_supervisor_revival(pre_pid):
+        return True
 
     # 5. No supervisor revived it within GRACE — start one in the foreground
     #    ourselves, then VERIFY a NEW gateway (different pid) is live. F3/F4 + META:
