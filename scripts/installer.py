@@ -3208,9 +3208,18 @@ def run_agent_mode(args) -> int:
     if args.uninstall or args.reset:
         return agent_error("starting", "--uninstall / --reset aren't supported in --agent mode; run the installer normally for those.")
 
-    if not args.scan_only:
-        # BUG2: short-circuit a re-invocation inside the same install window
-        # (Hermes auto-resuming a relay turn the gateway restart interrupted).
+    # BUG2 guard applies ONLY to PAIRING installs. Its whole purpose is to stop an
+    # agent re-running an interactive install and issuing a NEW pairing code while
+    # the user is mid-typing the old one (it reuses the live code instead). A
+    # --no-pair UPGRADE invocation — the resident version-poller's install — has NO
+    # pairing code to protect and is safe to re-run, so it must NEVER be
+    # short-circuited by the marker. Letting the marker block it was the real bug
+    # behind the poller failures: the poller-launched installer exits without
+    # upgrading, so the venv never changes and the poller re-fires every tick
+    # (Hermes spam) or stops for good on the old version (OpenClaw stuck). Skip
+    # both the check AND the marker write for --no-pair so upgrades stay outside
+    # the marker mechanism entirely (pairing installs still get full protection).
+    if not args.scan_only and not args.no_pair:
         sc = _agent_already_ran_short_circuit()
         if sc is not None:
             return sc
