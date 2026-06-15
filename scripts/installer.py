@@ -2433,6 +2433,21 @@ GATEWAY_RELOAD_MAX_WAIT_S = 330
 # clear "already ran" message) and exit 0 — no second setup/pair/restart.
 AGENT_RUN_MARKER = "/tmp/chat4000-agent-install.marker"
 AGENT_RUN_MARKER_TTL_S = 600  # 10 min: covers the relay + restart + auto-resume window
+
+# TEST-ONLY escape hatch for the 10-min double-run marker above. When this env var
+# is set truthy on a machine, run_agent_mode skips the guard entirely (no check, no
+# write), so a fast test loop (stage 60s poll, sub-10-min upgrade cycles) is never
+# throttled by the marker. UNSET in any real deployment: there the guard stays on
+# for ALL installs — including --no-pair upgrades — preserving the "don't reinstall
+# again within 10 min" safety. Never set this on a production box.
+NO_DOUBLE_RUN_GUARD_ENV = "CHAT4000_NO_DOUBLE_RUN_GUARD"
+
+
+def _double_run_guard_disabled() -> bool:
+    """True only when the test-only CHAT4000_NO_DOUBLE_RUN_GUARD env var is set
+    truthy. Used to bypass the BUG2 double-run marker on test boxes; in production
+    the var is unset and the marker is always honoured."""
+    return os.environ.get(NO_DOUBLE_RUN_GUARD_ENV, "").strip().lower() in ("1", "true", "yes", "on")
 # v2 plugins print a universal https link; v1 printed a chat4000:// deep link.
 _QR_RE = re.compile(r"(chat4000://pair\?\S+|https://pair\.chat4000\.com/\?\S+)")
 _CODE_IN_URI_RE = re.compile(r"[?&]code=(\d+)")
@@ -3208,18 +3223,16 @@ def run_agent_mode(args) -> int:
     if args.uninstall or args.reset:
         return agent_error("starting", "--uninstall / --reset aren't supported in --agent mode; run the installer normally for those.")
 
-    # BUG2 guard applies ONLY to PAIRING installs. Its whole purpose is to stop an
-    # agent re-running an interactive install and issuing a NEW pairing code while
-    # the user is mid-typing the old one (it reuses the live code instead). A
-    # --no-pair UPGRADE invocation — the resident version-poller's install — has NO
-    # pairing code to protect and is safe to re-run, so it must NEVER be
-    # short-circuited by the marker. Letting the marker block it was the real bug
-    # behind the poller failures: the poller-launched installer exits without
-    # upgrading, so the venv never changes and the poller re-fires every tick
-    # (Hermes spam) or stops for good on the old version (OpenClaw stuck). Skip
-    # both the check AND the marker write for --no-pair so upgrades stay outside
-    # the marker mechanism entirely (pairing installs still get full protection).
-    if not args.scan_only and not args.no_pair:
+    # BUG2 double-run guard (the 10-min marker): stops an agent re-running an
+    # install and issuing a NEW pairing code while the user is mid-typing the old
+    # one. It applies to ALL installs — pairing AND --no-pair upgrades — so a
+    # deployment keeps the "can't reinstall again within 10 min" throttle (the
+    # power to stop a too-frequent reinstall). In production this never wrongly
+    # blocks an upgrade: the poll cadence there is hourly, far outside the 10-min
+    # window. The ONLY bypass is the TEST-ONLY env var (see _double_run_guard_disabled):
+    # set it on a test box and the guard is skipped so a fast 60s stage loop can
+    # upgrade on a sub-10-min cycle. Unset in any real deployment → guard always on.
+    if not args.scan_only and not _double_run_guard_disabled():
         sc = _agent_already_ran_short_circuit()
         if sc is not None:
             return sc
