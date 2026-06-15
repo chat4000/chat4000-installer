@@ -34,6 +34,24 @@ set -euo pipefail
 REF="${CHAT4000_INSTALL_REF:-main}"
 REPO_RAW="https://raw.githubusercontent.com/chat4000/chat4000-installer/${REF}"
 
+# ── Always-on debug log ──────────────────────────────────────────────────────
+# Leave a full forensic trace on disk for EVERY run, no matter how we were
+# launched. The chat4000 version-poller (inside the plugin) runs this installer
+# DETACHED with stdout/stderr discarded (stdio:"ignore"), so when an auto-upgrade
+# silently fails there is normally nothing to look at. Tee the whole pipeline —
+# this bootstrap AND the Python installer it execs into (which inherits these
+# fds) — into a timestamped /tmp file. Best-effort: only engage if /tmp is
+# writable, and never let logging setup abort an install.
+CHAT4000_INSTALLER_LOG="${CHAT4000_INSTALLER_LOG:-/tmp/chat4000-installer-$(date +%Y%m%d-%H%M%S)-$$.log}"
+export CHAT4000_INSTALLER_LOG
+if : > "$CHAT4000_INSTALLER_LOG" 2>/dev/null; then
+  exec > >(tee -a "$CHAT4000_INSTALLER_LOG") 2>&1
+  # Tell installer.py the pipeline is already tee'd so it doesn't double-write.
+  export CHAT4000_BOOT_TEE=1
+  printf '[install.sh] %s pid=%s ref=%s argv: %s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$REF" "$*"
+fi
+
 # Find a usable Python interpreter (≥ 3.8).
 find_python() {
   for cand in python3.13 python3.12 python3.11 python3.10 python3.9 python3.8 python3 python; do

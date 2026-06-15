@@ -3411,7 +3411,78 @@ def main() -> int:
     return rc
 
 
+_TMP_LOG_PATH: Optional[str] = None
+
+
+class _Tee:
+    """Mirror a text stream (stdout/stderr) to a second file object. Used only
+    for the always-on /tmp debug log when the installer is invoked as a bare
+    Python process (i.e. install.sh did NOT already tee the pipeline). Logging
+    must never break an install, so every write is best-effort and only the
+    expected stream errors (OSError) are swallowed; everything else delegates to
+    the wrapped stream so TTY-dependent rendering (isatty, fileno) is unchanged."""
+
+    def __init__(self, stream, fileobj) -> None:
+        self._stream = stream
+        self._file = fileobj
+
+    def write(self, data: str) -> int:
+        with contextlib.suppress(OSError, ValueError):
+            self._stream.write(data)
+        with contextlib.suppress(OSError, ValueError):
+            self._file.write(data)
+            self._file.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        for t in (self._stream, self._file):
+            with contextlib.suppress(OSError, ValueError):
+                t.flush()
+
+    def isatty(self) -> bool:
+        try:
+            return bool(self._stream.isatty())
+        except (OSError, ValueError, AttributeError):
+            return False
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def _setup_tmp_debug_log() -> None:
+    """Guarantee a full debug trace lands on disk for EVERY run, so an
+    auto-upgrade launched by the version-poller with stdout/stderr discarded is
+    still diagnosable. install.sh tees the whole pipeline (bash + this Python,
+    via inherited fds) and sets CHAT4000_BOOT_TEE=1 — in that case our output is
+    ALREADY in CHAT4000_INSTALLER_LOG, so we only stamp a start marker and avoid
+    double-writing. Run as a bare `python installer.py` (no bootstrap), we set up
+    our own tee. Best-effort throughout; never raises."""
+    global _TMP_LOG_PATH
+    path = os.environ.get("CHAT4000_INSTALLER_LOG") or (
+        f"/tmp/chat4000-installer-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.log"
+    )
+    _TMP_LOG_PATH = path
+    # Always append a one-line "python started" marker DIRECTLY to the file (not
+    # through stdout) so we can always tell the Python stage ran, even if a tee
+    # upstream died with the discarded stdout.
+    with contextlib.suppress(OSError, ValueError):
+        with open(path, "a", encoding="utf-8", errors="replace") as f:
+            f.write(
+                f"[installer.py] started {time.strftime('%Y-%m-%dT%H:%M:%S')} "
+                f"pid={os.getpid()} argv={sys.argv[1:]}\n"
+            )
+    if os.environ.get("CHAT4000_BOOT_TEE") == "1":
+        return  # install.sh already mirrors bash+python into `path`.
+    try:
+        f = open(path, "a", buffering=1, encoding="utf-8", errors="replace")
+    except OSError:
+        return
+    sys.stdout = _Tee(sys.stdout, f)
+    sys.stderr = _Tee(sys.stderr, f)
+
+
 def _entry() -> int:
+    _setup_tmp_debug_log()
     try:
         return main()
     except KeyboardInterrupt:
