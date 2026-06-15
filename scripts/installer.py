@@ -3512,23 +3512,32 @@ def main() -> int:
 _TMP_LOG_PATH: Optional[str] = None
 
 
-class _Tee:
-    """Mirror a text stream (stdout/stderr) to a second file object. Used only
-    for the always-on /tmp debug log when the installer is invoked as a bare
-    Python process (i.e. install.sh did NOT already tee the pipeline). Logging
-    must never break an install, so every write is best-effort and only the
-    expected stream errors (OSError) are swallowed; everything else delegates to
-    the wrapped stream so TTY-dependent rendering (isatty, fileno) is unchanged."""
+# Strip ANSI escape sequences (colors, cursor moves, spinner control) so the
+# on-disk debug log is clean readable text even while the terminal gets full color.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 
-    def __init__(self, stream, fileobj) -> None:
+
+class _Tee:
+    """Mirror a text stream (stdout/stderr) to a second file object. This is the
+    app-layer dual-write path: the installer keeps a REAL terminal on `stream`
+    (so colors + the pairing QR work) while every line ALSO lands in the debug
+    log file — used when install.sh did NOT tee the pipeline (i.e. an interactive
+    run, where teeing would have destroyed the TTY). Logging must never break an
+    install, so every write is best-effort and only the expected stream errors
+    (OSError) are swallowed; everything else delegates to the wrapped stream so
+    TTY-dependent rendering (isatty, fileno) is unchanged. ANSI is stripped on the
+    way to the FILE only, so the terminal stays colored and the log stays clean."""
+
+    def __init__(self, stream, fileobj, *, strip_ansi: bool = False) -> None:
         self._stream = stream
         self._file = fileobj
+        self._strip_ansi = strip_ansi
 
     def write(self, data: str) -> int:
         with contextlib.suppress(OSError, ValueError):
             self._stream.write(data)
         with contextlib.suppress(OSError, ValueError):
-            self._file.write(data)
+            self._file.write(_ANSI_RE.sub("", data) if self._strip_ansi else data)
             self._file.flush()
         return len(data)
 
@@ -3575,8 +3584,8 @@ def _setup_tmp_debug_log() -> None:
         f = open(path, "a", buffering=1, encoding="utf-8", errors="replace")
     except OSError:
         return
-    sys.stdout = _Tee(sys.stdout, f)
-    sys.stderr = _Tee(sys.stderr, f)
+    sys.stdout = _Tee(sys.stdout, f, strip_ansi=True)
+    sys.stderr = _Tee(sys.stderr, f, strip_ansi=True)
 
 
 def _entry() -> int:

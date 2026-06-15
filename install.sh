@@ -44,12 +44,19 @@ REPO_RAW="https://raw.githubusercontent.com/chat4000/chat4000-installer/${REF}"
 # writable, and never let logging setup abort an install.
 CHAT4000_INSTALLER_LOG="${CHAT4000_INSTALLER_LOG:-/tmp/chat4000-installer-$(date +%Y%m%d-%H%M%S)-$$.log}"
 export CHAT4000_INSTALLER_LOG
-if : > "$CHAT4000_INSTALLER_LOG" 2>/dev/null; then
+# Always stamp a bootstrap marker straight into the log (best-effort, no TTY needed).
+printf '[install.sh] %s pid=%s ref=%s argv: %s\n' \
+  "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$REF" "$*" >> "$CHAT4000_INSTALLER_LOG" 2>/dev/null || true
+# Capture strategy: tee the WHOLE pipeline into the log ONLY when there is no
+# terminal to preserve — a detached version-poller upgrade or a piped run (stdout
+# is /dev/null or a pipe). That is the case this log exists for, and there is no
+# TTY to lose. When stdout IS a terminal (an interactive `curl|bash` user), do NOT
+# tee: teeing turns stdout into a pipe and kills the TTY — no colors, and the
+# pairing QR's isatty() guard skips it. Instead keep the real TTY and let
+# installer.py dual-write its own output to the SAME log via _Tee (BOOT_TEE unset).
+if ! [ -t 1 ] && : >> "$CHAT4000_INSTALLER_LOG" 2>/dev/null; then
   exec > >(tee -a "$CHAT4000_INSTALLER_LOG") 2>&1
-  # Tell installer.py the pipeline is already tee'd so it doesn't double-write.
   export CHAT4000_BOOT_TEE=1
-  printf '[install.sh] %s pid=%s ref=%s argv: %s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$$" "$REF" "$*"
 fi
 
 # Find a usable Python interpreter (≥ 3.8).
