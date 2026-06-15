@@ -237,49 +237,45 @@ class TestAgentRunMarker(unittest.TestCase):
         self.assertIn("DO NOT run the install command again", printed["text"])
 
 
-class TestDetectRestartMethodF1(unittest.TestCase):
-    """F1: a disabled-service box must route to 'foreground', not the
-    'openclaw-supervised' detour whose `gateway restart` no-ops on a disabled
-    box. The old check only matched the literal 'service disabled' substring;
-    OpenClaw 2026.6.6 prints 'Service: systemd user (disabled)'."""
+class TestDetectRestartMethod(unittest.TestCase):
+    """detect_restart_method is now docker-vs-not, nothing more: a container
+    gateway lives in its own PID namespace (a host-side kill can't reach it) so it
+    MUST go through `docker restart`; everything else collapses to one "local"
+    kill-and-see path that needs no supervisor-type detection up front. The
+    disabled-service handling that used to live here now lives inside
+    restart_gateway's local path (see TestRestartGatewayLocalKillAndSee)."""
 
-    def _detect(self, status_out):
+    def _detect(self, *, container_up, docker_on_path=True):
         class _R:
             returncode = 0
-            stdout = status_out
+            stdout = "openclaw-gateway\n" if container_up else ""
             stderr = ""
 
         def fake_run(cmd, *a, **k):
-            if cmd[1:] == ["ps", "--filter", "name=openclaw-gateway", "--format", "{{.Names}}"]:
-                return _R()  # no docker container in output
-            if len(cmd) >= 2 and cmd[1:] == ["gateway", "status"]:
-                return _R()
-            r = _R()
-            r.stdout = ""
-            return r
+            return _R()
 
-        # No docker on PATH so we exercise the `openclaw gateway status` branch.
         def fake_which(name):
-            return "/usr/bin/openclaw" if name == "openclaw" else None
+            if name == "docker":
+                return "/usr/bin/docker" if docker_on_path else None
+            return "/usr/bin/openclaw"
 
         with mock.patch.object(installer.subprocess, "run", side_effect=fake_run), \
              mock.patch.object(installer.shutil, "which", side_effect=fake_which):
             return installer.detect_restart_method()
 
-    def test_systemd_user_disabled_parenthetical_is_foreground(self):
-        # The exact string from the broken box.
-        self.assertEqual(self._detect("Service: systemd user (disabled)"), "foreground")
+    def test_running_container_is_docker(self):
+        self.assertEqual(self._detect(container_up=True), "docker")
 
-    def test_legacy_service_disabled_still_foreground(self):
-        self.assertEqual(self._detect("Gateway service disabled."), "foreground")
+    def test_no_container_is_local(self):
+        self.assertEqual(self._detect(container_up=False), "local")
 
-    def test_not_installed_is_foreground(self):
-        self.assertEqual(self._detect("Service is not installed"), "foreground")
+    def test_no_docker_on_path_is_local(self):
+        self.assertEqual(self._detect(container_up=False, docker_on_path=False), "local")
 
-    def test_enabled_supervised_box_stays_supervised(self):
-        self.assertEqual(
-            self._detect("Service: systemd user (enabled, running)"), "openclaw-supervised"
-        )
+    def test_never_returns_none(self):
+        # The local path always has a kill-and-see strategy, so detection never
+        # comes up empty — callers can rely on a non-None method.
+        self.assertIsNotNone(self._detect(container_up=False))
 
 
 class TestOpenclawGatewayLockfilePid(unittest.TestCase):
@@ -349,70 +345,147 @@ class TestVerifyGatewayRestarted(unittest.TestCase):
             self.assertTrue(installer._verify_gateway_restarted(None, timeout=1))
 
 
-class TestRestartGatewayForcesRealRestart(unittest.TestCase):
-    """F3 + F4 + META together: the foreground path must KILL the old gateway by
-    pid and VERIFY a NEW one came up — never short-circuit-reuse a serving
-    gateway (the upgrade case where the old gateway runs the OLD code)."""
+class TestRestartGatewayLocalKillAndSee(unittest.TestCase):
+    """The single "local" kill-and-see path (mirrors the Hermes restart), driven
+    step-by-step:
+      1. graceful `openclaw gateway restart` that PROVES a new live pid → success;
+      2. F1/F2: a disabled/no-op rc-0 restart is NOT trusted → fall through to kill;
+      3/4. kill by lockfile pid, then SEE if a supervisor revives it → success;
+      5. no revival → foreground start, then VERIFY a new pid (META).
+    plus the no-pid-but-running loud-failure guard."""
 
-    def test_foreground_kills_old_then_verifies_new(self):
-        calls = {"killed": False, "spawned": False}
-
-        def fake_kill_gw():
-            calls["killed"] = True
-            return 513  # old gateway pid
-
-        def fake_popen(*a, **k):
-            calls["spawned"] = True
-            return mock.MagicMock()
-
-        with mock.patch.object(installer, "_kill_openclaw_gateway", side_effect=fake_kill_gw), \
-             mock.patch.object(installer.subprocess, "Popen", side_effect=fake_popen), \
-             mock.patch.object(installer.time, "sleep", lambda *_: None), \
-             mock.patch.object(installer, "_verify_gateway_restarted", lambda pre, **k: pre == 513), \
-             mock.patch("builtins.open", mock.mock_open()), \
-             mock.patch.object(installer.shutil, "which", lambda n: "/usr/bin/openclaw"):
-            ok = installer.restart_gateway("foreground")
-        self.assertTrue(ok)
-        self.assertTrue(calls["killed"], "old gateway must be killed first")
-        self.assertTrue(calls["spawned"], "a new gateway must be spawned")
-
-    def test_foreground_reports_failure_when_no_new_gateway(self):
-        # Verification fails (no new pid) → restart_gateway must return False,
-        # never a phantom success.
-        with mock.patch.object(installer, "_kill_openclaw_gateway", lambda: 513), \
-             mock.patch.object(installer.subprocess, "Popen", lambda *a, **k: mock.MagicMock()), \
-             mock.patch.object(installer.time, "sleep", lambda *_: None), \
-             mock.patch.object(installer, "_verify_gateway_restarted", lambda *a, **k: False), \
-             mock.patch("builtins.open", mock.mock_open()), \
-             mock.patch.object(installer.shutil, "which", lambda n: "/usr/bin/openclaw"):
-            self.assertFalse(installer.restart_gateway("foreground"))
-
-    def test_supervised_rc0_but_unverified_falls_through_to_foreground(self):
-        # F2: `gateway restart` rc 0 that didn't actually restart must NOT be
-        # trusted — it routes to foreground (which kills + verifies).
-        fell_through = {"v": False}
-
+    def _run(self, restart_out="Gateway restarted.", restart_rc=0):
         class _R:
-            returncode = 0
-            stdout = "Gateway restarted."
+            returncode = restart_rc
+            stdout = restart_out
             stderr = ""
+        return _R()
 
-        def fake_restart(method):
-            if method == "foreground":
-                fell_through["v"] = True
-                return True
-            return orig_restart(method)
+    def test_graceful_native_restart_with_new_pid_is_success(self):
+        # Step 1: native restart, output is benign, verify sees a new pid → done.
+        # We must NOT proceed to kill/spawn.
+        killed = {"v": False}
+        with mock.patch.object(installer, "_openclaw_gateway_pid", lambda: 513), \
+             mock.patch.object(installer.subprocess, "run", lambda *a, **k: self._run()), \
+             mock.patch.object(installer, "_verify_gateway_restarted", lambda pre, **k: True), \
+             mock.patch.object(installer, "_kill_openclaw_gateway",
+                               lambda: killed.__setitem__("v", True)), \
+             mock.patch.object(installer.shutil, "which", lambda n: "/usr/bin/openclaw"):
+            self.assertTrue(installer.restart_gateway("local"))
+        self.assertFalse(killed["v"], "a verified native restart must not proceed to kill")
 
-        orig_restart = installer.restart_gateway
-        with mock.patch.object(installer.subprocess, "run", lambda *a, **k: _R()), \
-             mock.patch.object(installer, "_openclaw_gateway_pid", lambda: 513), \
+    def test_supervisor_revives_within_grace_is_success_without_spawn(self):
+        # Step 4: after the kill, a NEW live pid (!= pre) appears within GRACE → a
+        # supervisor revived it; we must succeed WITHOUT spawning a foreground one.
+        pids = iter([513, 513, 9001])  # pre_pid, native-verify miss, then revived
+        spawned = {"v": False}
+
+        def fake_pid():
+            try:
+                return next(pids)
+            except StopIteration:
+                return 9001
+
+        with mock.patch.object(installer, "_openclaw_gateway_pid", side_effect=fake_pid), \
+             mock.patch.object(installer.subprocess, "run", lambda *a, **k: self._run("disabled")), \
+             mock.patch.object(installer, "_kill_openclaw_gateway", lambda: 513), \
+             mock.patch.object(installer.subprocess, "Popen",
+                               lambda *a, **k: spawned.__setitem__("v", True)), \
+             mock.patch.object(installer.time, "sleep", lambda *_: None), \
+             mock.patch.object(installer.shutil, "which", lambda n: "/usr/bin/openclaw"):
+            self.assertTrue(installer.restart_gateway("local"))
+        self.assertFalse(spawned["v"], "supervisor revival must not trigger a foreground spawn")
+
+    def test_no_supervisor_foreground_start_verified_is_success(self):
+        # Step 5: native no-ops, kill, no revival within GRACE → spawn foreground,
+        # then verify a NEW pid. Disabled output routes straight past native.
+        spawned = {"v": False}
+        with mock.patch.object(installer, "_openclaw_gateway_pid", lambda: 513), \
+             mock.patch.object(installer.subprocess, "run",
+                               lambda *a, **k: self._run("Service: systemd user (disabled)")), \
+             mock.patch.object(installer, "_kill_openclaw_gateway", lambda: 513), \
+             mock.patch.object(installer.subprocess, "Popen",
+                               lambda *a, **k: spawned.__setitem__("v", True) or mock.MagicMock()), \
+             mock.patch.object(installer, "_verify_gateway_restarted", lambda pre, **k: True), \
+             mock.patch.object(installer.time, "sleep", lambda *_: None), \
+             mock.patch("builtins.open", mock.mock_open()), \
+             mock.patch.object(installer.shutil, "which", lambda n: "/usr/bin/openclaw"):
+            self.assertTrue(installer.restart_gateway("local"))
+        self.assertTrue(spawned["v"], "no revival must spawn a foreground gateway")
+
+    def test_foreground_unverified_is_failure(self):
+        # META: spawned but a new pid never appears → must return False, not a
+        # phantom success.
+        with mock.patch.object(installer, "_openclaw_gateway_pid", lambda: 513), \
+             mock.patch.object(installer.subprocess, "run",
+                               lambda *a, **k: self._run("(disabled)")), \
+             mock.patch.object(installer, "_kill_openclaw_gateway", lambda: 513), \
+             mock.patch.object(installer.subprocess, "Popen",
+                               lambda *a, **k: mock.MagicMock()), \
              mock.patch.object(installer, "_verify_gateway_restarted", lambda *a, **k: False), \
-             mock.patch.object(installer.shutil, "which", lambda n: "/usr/bin/openclaw"), \
-             mock.patch.object(installer, "restart_gateway", side_effect=fake_restart):
-            # call the REAL function body for the supervised branch:
-            result = orig_restart("openclaw-supervised")
-        self.assertTrue(result)
-        self.assertTrue(fell_through["v"], "unverified supervised restart must fall to foreground")
+             mock.patch.object(installer.time, "sleep", lambda *_: None), \
+             mock.patch("builtins.open", mock.mock_open()), \
+             mock.patch.object(installer.shutil, "which", lambda n: "/usr/bin/openclaw"):
+            self.assertFalse(installer.restart_gateway("local"))
+
+    def test_no_lockfile_pid_but_gateway_running_fails_loudly(self):
+        # No authoritative pid AND a gateway is otherwise running (argv match): we
+        # can't identify/kill/verify it by pid — must FAIL, never silently succeed.
+        spawned = {"v": False}
+        with mock.patch.object(installer, "_openclaw_gateway_pid", lambda: None), \
+             mock.patch.object(installer.subprocess, "run",
+                               lambda *a, **k: self._run("(disabled)")), \
+             mock.patch.object(installer, "_openclaw_gateway_argv_alive", lambda: True), \
+             mock.patch.object(installer.subprocess, "Popen",
+                               lambda *a, **k: spawned.__setitem__("v", True)), \
+             mock.patch.object(installer.shutil, "which", lambda n: "/usr/bin/openclaw"):
+            self.assertFalse(installer.restart_gateway("local"))
+        self.assertFalse(spawned["v"], "must not spawn when it can't anchor on a pid")
+
+    def test_fresh_install_no_pid_no_running_starts_foreground(self):
+        # Clean box: no pre pid, no argv match → proceed to foreground start and
+        # verify the new gateway (pre_pid None means any new live pid passes).
+        spawned = {"v": False}
+        with mock.patch.object(installer, "_openclaw_gateway_pid", lambda: None), \
+             mock.patch.object(installer.subprocess, "run",
+                               lambda *a, **k: self._run("(disabled)")), \
+             mock.patch.object(installer, "_openclaw_gateway_argv_alive", lambda: False), \
+             mock.patch.object(installer, "_kill_openclaw_gateway", lambda: None), \
+             mock.patch.object(installer.subprocess, "Popen",
+                               lambda *a, **k: spawned.__setitem__("v", True) or mock.MagicMock()), \
+             mock.patch.object(installer, "_verify_gateway_restarted", lambda pre, **k: True), \
+             mock.patch.object(installer.time, "sleep", lambda *_: None), \
+             mock.patch("builtins.open", mock.mock_open()), \
+             mock.patch.object(installer.shutil, "which", lambda n: "/usr/bin/openclaw"):
+            self.assertTrue(installer.restart_gateway("local"))
+        self.assertTrue(spawned["v"], "a clean box must start a foreground gateway")
+
+
+class TestRestartGatewayDocker(unittest.TestCase):
+    """The docker branch MUST go through `docker restart` (container PID namespace
+    is unreachable from a host kill) AND verify a live gateway came back — rc 0
+    alone is NOT proof (the bug this fixes)."""
+
+    def test_docker_restart_verified_is_success(self):
+        with mock.patch.object(installer.shutil, "which", lambda n: "/usr/bin/" + n), \
+             mock.patch.object(installer.subprocess, "run",
+                               lambda *a, **k: mock.MagicMock(returncode=0, stderr="", stdout="")), \
+             mock.patch.object(installer, "_verify_docker_gateway_restarted", lambda *a, **k: True):
+            self.assertTrue(installer.restart_gateway("docker"))
+
+    def test_docker_restart_rc0_but_no_gateway_is_failure(self):
+        # The old bug: returned True on rc 0 with no proof. Now it must fail.
+        with mock.patch.object(installer.shutil, "which", lambda n: "/usr/bin/" + n), \
+             mock.patch.object(installer.subprocess, "run",
+                               lambda *a, **k: mock.MagicMock(returncode=0, stderr="", stdout="")), \
+             mock.patch.object(installer, "_verify_docker_gateway_restarted", lambda *a, **k: False):
+            self.assertFalse(installer.restart_gateway("docker"))
+
+    def test_docker_restart_nonzero_is_failure(self):
+        with mock.patch.object(installer.shutil, "which", lambda n: "/usr/bin/" + n), \
+             mock.patch.object(installer.subprocess, "run",
+                               lambda *a, **k: mock.MagicMock(returncode=1, stderr="boom", stdout="")):
+            self.assertFalse(installer.restart_gateway("docker"))
 
 
 class TestHermesRestartVerify(unittest.TestCase):

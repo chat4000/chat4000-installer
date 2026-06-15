@@ -1552,38 +1552,30 @@ def openclaw_install_plugin(openclaw: str, ref: str, *, quiet: bool = False) -> 
     return False, None, tail, "InstallFailed"
 
 
+OPENCLAW_GATEWAY_CONTAINER = "openclaw-gateway"
+
+
 def detect_restart_method() -> Optional[str]:
+    """Docker-vs-not, and nothing more. A gateway running inside a container lives
+    in its own PID namespace, so a host-side `os.kill` by lockfile pid can't reach
+    it — that case MUST go through `docker restart`. Everything else (systemd-user
+    supervised, a disabled unit, or a pure foreground gateway) collapses into one
+    "local" path: restart_gateway() kills by the authoritative lockfile pid and
+    SEES whether a supervisor revived it, so it never needs to know the supervisor
+    type up front (mirrors the Hermes restart). Always returns a method — "docker"
+    when an openclaw-gateway container is up, else "local"."""
     docker = shutil.which("docker")
     if docker:
         try:
             r = subprocess.run(
-                [docker, "ps", "--filter", "name=openclaw-gateway", "--format", "{{.Names}}"],
+                [docker, "ps", "--filter", f"name={OPENCLAW_GATEWAY_CONTAINER}", "--format", "{{.Names}}"],
                 capture_output=True, text=True, timeout=5,
             )
-            if "openclaw-gateway" in (r.stdout or ""):
+            if OPENCLAW_GATEWAY_CONTAINER in (r.stdout or ""):
                 return "docker"
         except (OSError, subprocess.SubprocessError):
             pass
-    openclaw = shutil.which("openclaw") or "openclaw"
-    try:
-        r = subprocess.run([openclaw, "gateway", "status"], capture_output=True, text=True, timeout=5)
-        out = ((r.stdout or "") + (r.stderr or "")).lower()
-        # F1: a box whose service is disabled/uninstalled must go straight to
-        # foreground. The old check only matched the literal "service disabled"
-        # substring, but OpenClaw 2026.6.6 prints "Service: systemd user
-        # (disabled)" — no match — so it wrongly chose "openclaw-supervised" and
-        # `gateway restart` no-oped (rc 0, nothing restarted). Match the
-        # disabled/uninstalled signals the host actually emits.
-        if any(sig in out for sig in (
-            "service disabled", "service is not installed", "(disabled)",
-            "not installed", "not running",
-        )):
-            return "foreground"
-        if r.returncode == 0 and out.strip():
-            return "openclaw-supervised"
-    except (OSError, subprocess.SubprocessError):
-        pass
-    return "foreground"
+    return "local"
 
 
 def _openclaw_gateway_lock_dir() -> Path:
@@ -1640,12 +1632,24 @@ def _pid_alive(pid: int) -> bool:
         return False
 
 
+def _openclaw_gateway_argv_alive() -> bool:
+    """SECONDARY signal only: does any process present a documented OpenClaw gateway
+    argv? The lockfile pid is the source of truth; this argv probe exists solely to
+    catch a gateway running with NO readable lockfile pid (so we can FAIL LOUDLY
+    rather than silently 'succeed'). Never used to identify a pid to kill/verify."""
+    for pat in ("openclaw gateway run", "openclaw-gateway"):
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            if subprocess.run(["pgrep", "-f", pat], capture_output=True, timeout=5).returncode == 0:
+                return True
+    return False
+
+
 def _kill_openclaw_gateway() -> Optional[int]:
     """Kill the running OpenClaw gateway and return the pid we killed (or None if
     none was running). PRIMARY kill is by the authoritative lockfile pid (F4) —
     the only thing that reliably matches a bare-`openclaw` gateway. The argv
-    patterns stay as a SECONDARY sweep for any gateway that does present the
-    documented argv shapes."""
+    patterns stay as a SECONDARY defensive mop-up for any gateway that does present
+    the documented argv shapes — never the source of truth."""
     killed = _openclaw_gateway_pid()
     if killed is not None:
         say(f"Killing running OpenClaw gateway (pid {killed}, from lockfile).")
@@ -1658,70 +1662,132 @@ def _kill_openclaw_gateway() -> Optional[int]:
     return killed
 
 
+# How long to "see" whether a supervisor (systemd Restart=always, etc.) revives
+# the gateway we just killed before we relaunch it ourselves. Mirrors the Hermes
+# fallback's respawn-watch window.
+GATEWAY_RESPAWN_GRACE_S = 8.0
+
+
+def _docker_gateway_alive(docker: str) -> bool:
+    """Is a gateway process live INSIDE the openclaw-gateway container? Prefer the
+    host-readable lockfile pid (the container often shares /tmp via bind mount, so
+    _openclaw_gateway_pid sees it); if no pid is reachable that way, fall back to
+    `docker exec <container> pgrep` for a gateway process. Either positive proves a
+    live gateway came back — without it `docker restart` rc 0 is NOT proof (the bug
+    this fixes)."""
+    if _openclaw_gateway_pid() is not None:
+        return True
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        r = subprocess.run(
+            [docker, "exec", OPENCLAW_GATEWAY_CONTAINER, "pgrep", "-f", "openclaw"],
+            capture_output=True, timeout=8,
+        )
+        return r.returncode == 0
+    return False
+
+
+def _verify_docker_gateway_restarted(docker: str, timeout: float = 30.0) -> bool:
+    """META verification mirror for the docker branch: after `docker restart`,
+    poll up to `timeout` for a live gateway inside the container. A docker restart
+    we can't prove brought a gateway back is a FAILURE, same as the local path."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _docker_gateway_alive(docker):
+            return True
+        time.sleep(1)
+    return False
+
+
 def restart_gateway(method: str) -> bool:
     openclaw = shutil.which("openclaw") or "openclaw"
     if method == "docker":
+        # A container gateway lives in its own PID namespace — a host-side kill by
+        # lockfile pid can't reach it, so docker is the one branch that CANNOT use
+        # the kill-and-see path; it MUST go through `docker restart`. But rc 0 from
+        # docker restart is NOT proof a gateway came back (the old bug returned True
+        # blindly) — META still applies: verify a live gateway before success.
         docker = shutil.which("docker")
         if not docker:
             return False
-        say("$ docker restart openclaw-gateway")
-        r = subprocess.run([docker, "restart", "openclaw-gateway"], capture_output=True, text=True)
+        say(f"$ docker restart {OPENCLAW_GATEWAY_CONTAINER}")
+        r = subprocess.run([docker, "restart", OPENCLAW_GATEWAY_CONTAINER], capture_output=True, text=True)
         if r.returncode != 0:
             warn(f"docker restart failed: {r.stderr.strip()[:200]}")
             return False
-        return True
-    if method == "openclaw-supervised":
-        # F1/F2: `openclaw gateway restart` on a disabled-service box prints
-        # "Gateway service disabled." and EXITS 0 WITHOUT restarting anything —
-        # so rc 0 is NOT proof of a restart. We verify, and route any
-        # disabled/no-restart signal to the foreground path (which kills the old
-        # gateway by pid and verifies a new one came up).
-        pre_pid = _openclaw_gateway_pid()
-        say(f"$ {openclaw} gateway restart")
-        r = subprocess.run([openclaw, "gateway", "restart"], capture_output=True, text=True)
-        out = ((r.stdout or "") + (r.stderr or "")).lower()
-        if any(sig in out for sig in ("service disabled", "(disabled)", "not installed", "not running")):
-            warn("Gateway service is not installed under a supervisor — starting in foreground.")
-            return restart_gateway("foreground")
-        if r.returncode != 0:
-            if out.strip():
-                warn(out.strip()[:500])
-            return restart_gateway("foreground")
-        # rc 0 — but VERIFY a real restart happened (pid changed / a live gateway
-        # exists), because the supervised command lies on a disabled box.
-        if _verify_gateway_restarted(pre_pid):
+        if _verify_docker_gateway_restarted(docker):
             return True
-        warn("Supervised restart reported success but no new gateway appeared — forcing a foreground restart.")
-        return restart_gateway("foreground")
-    if method == "foreground":
-        # F3/F4 + META: FORCE a real restart on every (re)install. We no longer
-        # short-circuit on "a gateway is already serving chat4000" — on an UPGRADE
-        # that is ALWAYS true (the old gateway serves the OLD code), and reusing it
-        # means the new code never loads and the version-poller never starts. The
-        # right move is to KILL the old gateway by its authoritative lockfile pid
-        # (F4), spawn a fresh one, then VERIFY a NEW gateway (different pid) is up.
-        # Killing the old one first also removes the port-18789 collision that the
-        # BUG3 reuse short-circuit existed to dodge — so the false-failure path is
-        # gone without the short-circuit.
-        log_path = "/tmp/openclaw-gateway.log"
-        pre_pid = _kill_openclaw_gateway()
-        time.sleep(1)
-        try:
-            logf = open(log_path, "ab")
-            subprocess.Popen(
-                [openclaw, "gateway", "run"],
-                stdout=logf, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
-            )
-            say(f"Started gateway in background. Log: {C_CYN}{log_path}{C_RST}")
-        except (OSError, subprocess.SubprocessError) as exc:
-            warn(f"Could not start gateway: {exc}")
-            return False
-        # META: a restart we can't prove is a FAILURE. Confirm a NEW gateway (pid
-        # differs from the one we killed) is actually live before claiming success.
-        if _verify_gateway_restarted(pre_pid):
-            return True
-        warn("Started a gateway but could not confirm a NEW gateway process came up — restart not verified.")
+        warn("docker restart returned 0 but no live gateway came back in the container — restart not verified.")
         return False
+
+    # method == "local": the single kill-and-see path. It does NOT need to know
+    # whether a supervisor is present — it kills by the authoritative lockfile pid,
+    # SEES whether something revived the gateway, and only then starts one itself.
+    # (Mirrors the Hermes restart: native-first, then pkill, then "did a supervisor
+    # respawn it? if not, relaunch.")
+    pre_pid = _openclaw_gateway_pid()  # authoritative lockfile pid; may be None.
+
+    # 1. GRACEFUL FIRST (mirror Hermes try_native): ask OpenClaw to restart its own
+    #    gateway. F1/F2: on a disabled/uninstalled box this prints e.g. "Service:
+    #    systemd user (disabled)" and EXITS 0 WITHOUT restarting anything — so rc 0
+    #    is NOT proof. We treat any disabled/not-running signal as "didn't restart"
+    #    and fall through to the kill path; otherwise we VERIFY a new live pid.
+    say(f"$ {openclaw} gateway restart")
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        r = subprocess.run([openclaw, "gateway", "restart"], capture_output=True, text=True, timeout=90)
+        out = ((r.stdout or "") + (r.stderr or "")).lower()
+        disabled = any(sig in out for sig in (
+            "service disabled", "service is not installed", "(disabled)",
+            "not installed", "not running",
+        ))
+        if not disabled and r.returncode == 0 and _verify_gateway_restarted(pre_pid):
+            return True  # native restart proved a NEW live gateway — done.
+        if disabled:
+            say("Gateway service is disabled/not installed — killing by pid and seeing if anything revives it.")
+        elif out.strip():
+            warn(out.strip()[:300])
+
+    # NO PID SOURCE but a gateway is otherwise running: we can't identify/kill/
+    #    verify it by lockfile pid, so we must FAIL LOUDLY rather than silently
+    #    succeed. (A clean no-pid box — fresh install, truly nothing running — has
+    #    no argv match either and falls through to the foreground start in step 5.)
+    if pre_pid is None and _openclaw_gateway_argv_alive():
+        warn("A gateway appears to be running but writes no readable lockfile pid — "
+             "cannot identify/kill/verify it by pid. Refusing to claim a restart.")
+        return False
+
+    # 2/3. KILL BY PID (F4): the only thing that reliably matches a bare-`openclaw`
+    #    gateway. _kill_openclaw_gateway kills the lockfile pid FIRST and keeps the
+    #    pkill-by-argv sweep ONLY as a secondary defensive mop-up.
+    _kill_openclaw_gateway()
+
+    # 4. SEE: poll the lockfile up to GRACE seconds. A live pid != pre_pid means a
+    #    supervisor (systemd Restart=always, etc.) revived it — SUCCESS, hands off.
+    if pre_pid is not None:
+        deadline = time.time() + GATEWAY_RESPAWN_GRACE_S
+        while time.time() < deadline:
+            cur = _openclaw_gateway_pid()
+            if cur is not None and cur != pre_pid:
+                say(f"A supervisor revived the gateway (pid {cur}) — nothing more to do.")
+                return True
+            time.sleep(1)
+
+    # 5. No supervisor revived it within GRACE — start one in the foreground
+    #    ourselves, then VERIFY a NEW gateway (different pid) is live. F3/F4 + META:
+    #    a restart we can't prove (no new live pid) is a FAILURE.
+    log_path = "/tmp/openclaw-gateway.log"
+    try:
+        logf = open(log_path, "ab")
+        subprocess.Popen(
+            [openclaw, "gateway", "run"],
+            stdout=logf, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
+        )
+        say(f"Started gateway in background. Log: {C_CYN}{log_path}{C_RST}")
+    except (OSError, subprocess.SubprocessError) as exc:
+        warn(f"Could not start gateway: {exc}")
+        return False
+    if _verify_gateway_restarted(pre_pid):
+        return True
+    warn("Started a gateway but could not confirm a NEW gateway process came up — restart not verified.")
     return False
 
 
