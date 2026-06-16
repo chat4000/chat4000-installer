@@ -1803,25 +1803,14 @@ def restart_gateway(method: str) -> bool:
     # respawn it? if not, relaunch.")
     pre_pid = _openclaw_gateway_pid()  # authoritative lockfile pid; may be None.
 
-    # 1. GRACEFUL FIRST (mirror Hermes try_native): ask OpenClaw to restart its own
-    #    gateway. F1/F2: on a disabled/uninstalled box this prints e.g. "Service:
-    #    systemd user (disabled)" and EXITS 0 WITHOUT restarting anything — so rc 0
-    #    is NOT proof. We treat any disabled/not-running signal as "didn't restart"
-    #    and fall through to the kill path; otherwise we VERIFY a new live pid.
-    say(f"$ {openclaw} gateway restart")
-    with contextlib.suppress(OSError, subprocess.SubprocessError):
-        r = subprocess.run([openclaw, "gateway", "restart"], capture_output=True, text=True, timeout=90)
-        out = ((r.stdout or "") + (r.stderr or "")).lower()
-        disabled = any(sig in out for sig in (
-            "service disabled", "service is not installed", "(disabled)",
-            "not installed", "not running",
-        ))
-        if not disabled and r.returncode == 0 and _verify_gateway_restarted(pre_pid):
-            return True  # native restart proved a NEW live gateway — done.
-        if disabled:
-            say("Gateway service is disabled/not installed — killing by pid and seeing if anything revives it.")
-        elif out.strip():
-            warn(out.strip()[:300])
+    # 1. We deliberately do NOT try `openclaw gateway restart` first. It earns its
+    #    keep nowhere: on a disabled/foreground box it prints "(disabled)" and EXITS
+    #    0 WITHOUT restarting (F1/F2) — useless; and on a box where it DOES work it
+    #    turns INTO the gateway daemon while we capture its stdout, so subprocess's
+    #    timeout cleanup blocks forever on the never-closing pipe — the poller-upgrade
+    #    DEADLOCK (two gateways, hung, lockfile never flips). Kill-by-lockfile-pid is
+    #    the proven mechanism and covers every case, so we go straight to it.
+    say("Killing the running gateway by its lockfile pid and seeing if a supervisor revives it.")
 
     # NO PID SOURCE but a gateway is otherwise running: we can't identify/kill/
     #    verify it by lockfile pid, so we must FAIL LOUDLY rather than silently
