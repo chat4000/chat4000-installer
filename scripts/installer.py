@@ -2320,12 +2320,33 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
 
     success, used_spec, output_tail, fail_class = openclaw_install_plugin(openclaw_path, oc_ref)
     if not success:
-        err("Installing the OpenClaw plugin from GitHub failed.")
-        err("Common causes:")
-        err("  - GitHub / network unreachable from this host (proxy / offline)")
-        err("  - npm missing on PATH (needed for the linked install's dependencies)")
-        err(f"  - The `{oc_ref}` tag doesn't exist on github.com/{OPENCLAW_REPO_SLUG} yet")
-        err("  - Permissions on the OpenClaw plugins directory")
+        # Tell the user the REAL reason. openclaw_install_plugin already computed
+        # exactly what failed (output_tail) and classified it (fail_class) — most
+        # importantly a too-old host (HostTooOld), whose preflight emits a clear,
+        # remedy-bearing message. The old code ignored both and always printed the
+        # same four generic guesses, burying the truth in an analytics event — so a
+        # too-old OpenClaw (the #1 real cause) read to the user as a network / npm /
+        # permissions problem. Surface what actually happened.
+        if fail_class == "HostTooOld":
+            # output_tail is the "OpenClaw X is too old, needs >= Y — upgrade it"
+            # message. Show that; the generic causes are all wrong for a version floor.
+            err("Installing the OpenClaw plugin failed — this machine's OpenClaw is too old.")
+            for line in (output_tail or "").strip().splitlines():
+                err(line)
+        elif output_tail and output_tail.strip():
+            # We captured the real failure output — show it instead of guessing.
+            err("Installing the OpenClaw plugin from GitHub failed. What actually went wrong:")
+            for line in output_tail.strip().splitlines()[-12:]:
+                err(f"  {line}")
+        else:
+            # Nothing captured (e.g. a download that produced no diagnostic) — fall
+            # back to the generic guesses so the user still has somewhere to look.
+            err("Installing the OpenClaw plugin from GitHub failed.")
+            err("Common causes:")
+            err("  - GitHub / network unreachable from this host (proxy / offline)")
+            err("  - npm missing on PATH (needed for the linked install's dependencies)")
+            err(f"  - The `{oc_ref}` tag doesn't exist on github.com/{OPENCLAW_REPO_SLUG} yet")
+            err("  - Permissions on the OpenClaw plugins directory")
         # IN6: error_class distinguishes the host-version preflight (HostTooOld)
         # from a generic InstallFailed.
         _emit("installer_failed", {"stage": "plugin_install", "error_class": fail_class or "InstallFailed", "error_msg": output_tail[:200] or "no output", "output_tail": output_tail, "ref": oc_ref})
