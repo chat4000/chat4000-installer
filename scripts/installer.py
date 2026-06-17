@@ -1297,14 +1297,13 @@ def hermes_uninstall(venv_python: str, uv: Optional[str]) -> None:
 def hermes_reset_local_state() -> None:
     state_dir = _hermes_home() / "plugins" / "chat4000"
     if state_dir.exists():
+        # --reset is itself the explicit, destructive opt-in (it's documented as
+        # destructive), so we do NOT prompt — prompting also crashed with EOFError
+        # when stdin has no TTY (piped installer / container).
         warn(
             f"Removing {state_dir} (key + ack store) — already-paired devices "
             "will fail to decrypt until re-paired."
         )
-        ans = input(f"{C_YEL}Continue? [y/N]:{C_RST} ").strip().lower()
-        if ans not in ("y", "yes"):
-            say("Reset cancelled.")
-            return
         shutil.rmtree(state_dir, ignore_errors=True)
         ok(f"Removed {state_dir}")
 
@@ -1877,11 +1876,9 @@ def _verify_gateway_restarted(pre_pid: Optional[int], timeout: float = 30.0) -> 
 def openclaw_reset_local_state() -> None:
     state_dir = _openclaw_home() / "plugins" / "chat4000"
     if state_dir.exists():
+        # --reset is the explicit destructive opt-in; don't prompt (and prompting
+        # crashed with EOFError when stdin has no TTY — piped installer / container).
         warn(f"Removing {state_dir} (key + ack store) — already-paired devices will fail to decrypt until re-paired.")
-        ans = input(f"{C_YEL}Continue? [y/N]:{C_RST} ").strip().lower()
-        if ans not in ("y", "yes"):
-            say("Reset cancelled.")
-            return
         shutil.rmtree(state_dir, ignore_errors=True)
         ok(f"Removed {state_dir}")
 
