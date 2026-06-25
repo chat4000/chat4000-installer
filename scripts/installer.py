@@ -506,6 +506,32 @@ def _emit(event: str, props: Optional[dict] = None, *, distinct_id: Optional[str
     enriched = {k: _scrub_props_value(v) for k, v in enriched.items()}
     _post_posthog(event, enriched, distinct_id or _current_distinct_id())
 
+    # Central Sentry hook: every HANDLED installer failure also lands in Sentry as
+    # a "message" event so it's visible alongside the uncaught crashes. This one
+    # site covers all ~15 _emit("installer_failed", …) callers + the agent_error
+    # funnel. We do NOT mirror installer_cancelled / installer_succeeded, and we
+    # do NOT mirror installer_crashed (the top-level handler already reports that
+    # as an exception via send_sentry_envelope).
+    if event == "installer_failed":
+        stage = enriched.get("stage") or "unknown"
+        error_class = enriched.get("error_class") or "Unknown"
+        # Best-effort, never raises (send_sentry_message swallows everything).
+        with contextlib.suppress(Exception):
+            send_sentry_message(
+                f"installer_failed: {stage}",
+                level="error",
+                tags={
+                    "stage": stage,
+                    "error_class": error_class,
+                    "mode": "agent" if _AGENT_MODE else "human",
+                    "env": os.environ.get("CHAT4000_ENV")
+                    or os.environ.get("HERMES_ENV")
+                    or "production",
+                },
+                extra=enriched,
+                fingerprint=[stage, error_class],
+            )
+
 
 # ─── Sentry (stdlib envelope POST, no SDK) ────────────────────────────────
 
@@ -518,11 +544,36 @@ def send_sentry_envelope(exc: BaseException, *, tags: Optional[dict] = None) -> 
     _send_sentry_one(SENTRY_DSN, exc, tags=tags)
 
 
-def _send_sentry_one(dsn: str, exc: BaseException, *, tags: Optional[dict]) -> None:
+def send_sentry_message(
+    message: str,
+    *,
+    level: str = "error",
+    tags: Optional[dict] = None,
+    extra: Optional[dict] = None,
+    fingerprint: Optional[list] = None,
+) -> None:
+    """Post a Sentry "message" event (not an exception) to the single self-hosted
+    Sentry. Stdlib only; best-effort; strips home paths + obvious secrets first.
+    Used for HANDLED installer failures, which have no traceback to send."""
+    if _TELEMETRY_DISABLED:
+        return
+    _send_sentry_one(
+        SENTRY_DSN,
+        message=message,
+        level=level,
+        tags=tags,
+        extra=extra,
+        fingerprint=fingerprint,
+    )
+
+
+def _sentry_post_event(dsn: str, event: dict) -> None:
+    """Build the envelope for `event` and POST it to Sentry. Shared by the
+    exception path and the message path. Best-effort: must NEVER raise back into
+    the installer (this is the crash/error-reporting path itself)."""
     if not dsn:
         return
     try:
-        import datetime
         from urllib.parse import urlparse
 
         parsed = urlparse(dsn)
@@ -531,50 +582,6 @@ def _send_sentry_one(dsn: str, exc: BaseException, *, tags: Optional[dict]) -> N
         if not public_key or not project_id or not parsed.hostname:
             return
         envelope_url = f"{parsed.scheme}://{parsed.hostname}/api/{project_id}/envelope/"
-
-        frames = []
-        tb = exc.__traceback__
-        while tb is not None:
-            co = tb.tb_frame.f_code
-            frames.append(
-                {
-                    "filename": _scrub_path(co.co_filename),
-                    "function": co.co_name,
-                    "lineno": tb.tb_lineno,
-                    "module": co.co_name,
-                    "in_app": "installer.py" in co.co_filename,
-                }
-            )
-            tb = tb.tb_next
-
-        event = {
-            "event_id": uuid.uuid4().hex,
-            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-            "platform": "python",
-            "level": "error",
-            "release": INSTALLER_RELEASE,
-            "environment": os.environ.get("CHAT4000_ENV") or os.environ.get("HERMES_ENV") or "production",
-            "tags": {
-                "installer": "merged",
-                "mode": "agent" if _AGENT_MODE else "human",
-                "python_version": (
-                    f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
-                ),
-                "os_platform": sys.platform,
-                **(tags or {}),
-            },
-            "exception": {
-                "values": [
-                    {
-                        "type": type(exc).__name__,
-                        "value": _scrub_secrets(str(exc))[:500],
-                        "stacktrace": {"frames": frames},
-                    }
-                ]
-            },
-            "user": {"id": _current_distinct_id()},
-            "sdk": {"name": "chat4000-installer", "version": INSTALLER_VERSION},
-        }
 
         envelope_header = json.dumps({"dsn": dsn, "event_id": event["event_id"]})
         item_header = json.dumps({"type": "event"})
@@ -597,6 +604,98 @@ def _send_sentry_one(dsn: str, exc: BaseException, *, tags: Optional[dict]) -> N
     except (urllib.error.URLError, OSError, TimeoutError, ValueError):
         # This IS the crash-reporting path — must never raise back into _entry().
         pass
+
+
+def _sentry_base_event(*, level: str, tags: Optional[dict]) -> dict:
+    """Common Sentry event scaffolding shared by exception + message events."""
+    import datetime
+
+    return {
+        "event_id": uuid.uuid4().hex,
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "platform": "python",
+        "level": level,
+        "release": INSTALLER_RELEASE,
+        "environment": os.environ.get("CHAT4000_ENV") or os.environ.get("HERMES_ENV") or "production",
+        "tags": {
+            "installer": "merged",
+            "mode": "agent" if _AGENT_MODE else "human",
+            "python_version": (
+                f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}"
+            ),
+            "os_platform": sys.platform,
+            **(tags or {}),
+        },
+        "user": {"id": _current_distinct_id()},
+        "sdk": {"name": "chat4000-installer", "version": INSTALLER_VERSION},
+    }
+
+
+def _send_sentry_one(
+    dsn: str,
+    exc: Optional[BaseException] = None,
+    *,
+    tags: Optional[dict] = None,
+    message: Optional[str] = None,
+    level: str = "error",
+    extra: Optional[dict] = None,
+    fingerprint: Optional[list] = None,
+) -> None:
+    """Send ONE Sentry event — either an exception (with `exc`) or a message
+    (with `message`). Both paths share the envelope POST + auth + scrub logic via
+    `_sentry_post_event`. Best-effort; never raises."""
+    if not dsn:
+        return
+    try:
+        event = _sentry_base_event(level=level, tags=tags)
+
+        if exc is not None:
+            frames = []
+            tb = exc.__traceback__
+            while tb is not None:
+                co = tb.tb_frame.f_code
+                frames.append(
+                    {
+                        "filename": _scrub_path(co.co_filename),
+                        "function": co.co_name,
+                        "lineno": tb.tb_lineno,
+                        "module": co.co_name,
+                        "in_app": "installer.py" in co.co_filename,
+                    }
+                )
+                tb = tb.tb_next
+            event["exception"] = {
+                "values": [
+                    {
+                        "type": type(exc).__name__,
+                        "value": _scrub_secrets(str(exc))[:500],
+                        "stacktrace": {"frames": frames},
+                    }
+                ]
+            }
+        else:
+            event["message"] = _scrub_secrets(_scrub_path(message or ""))[:500]
+
+        if extra:
+            # Scrub home/username paths AND obvious secrets out of every extra
+            # value before it leaves the box.
+            scrubbed_extra = {}
+            for k, v in extra.items():
+                v = _scrub_props_value(v)
+                if isinstance(v, str):
+                    v = _scrub_secrets(v)
+                scrubbed_extra[k] = v
+            event["extra"] = scrubbed_extra
+
+        if fingerprint:
+            event["fingerprint"] = [
+                _scrub_secrets(_scrub_path(str(f))) for f in fingerprint
+            ]
+    except (TypeError, ValueError, AttributeError):
+        # Building the event must never raise back into the installer.
+        return
+
+    _sentry_post_event(dsn, event)
 
 
 # ─── Detection: Hermes ────────────────────────────────────────────────────
@@ -2256,7 +2355,7 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
     # chat4000 in the running agent.
     hdr("🔁 Restarting the Hermes gateway")
     if do_pair and pair_rc == 0:
-        say("Starting the gateway so it loads chat4000 — your phone will finish joining in ~15s.")
+        say("Starting the gateway so it loads chat4000 — your phone will finish joining in a minute or two.")
     else:
         say("Starting the gateway so it loads chat4000.")
     restart_method = _hermes_restart_gateway(venv_bin)
@@ -2265,8 +2364,8 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
         _emit("installer_gateway_restarted", {"method": restart_method})  # IN7
     else:
         warn("Could not restart the Hermes gateway automatically.")
-        warn(f"Restart it yourself:  {C_CYN}{venv_bin}/hermes gateway restart{C_RST}")
-        _emit("installer_failed", {"stage": "gateway_restart", "error_class": "RestartUnavailable", "error_msg": "hermes native restart and pkill+relaunch both failed"})
+        warn(f"Start it yourself:  {C_CYN}{venv_bin}/hermes gateway run{C_RST}  (after stopping any running gateway)")
+        _emit("installer_failed", {"stage": "gateway_restart", "error_class": "RestartUnavailable", "error_msg": "pkill+relaunch failed"})
         return 1
     if not do_pair:
         # UPGRADE invocation: plugin refreshed + gateway restarted, no device. The
@@ -2955,35 +3054,30 @@ def spawn_detached_pair(cmd: list, env: dict) -> tuple:
     return (None, None, logpath, f"pairing didn't print a code within {int(PAIR_EMIT_TIMEOUT)}s (log: {logpath})")
 
 
-def _hermes_gateway_reload_sh(hermes_bin: str, *, try_native: bool = True) -> str:
+def _hermes_gateway_reload_sh(hermes_bin: str) -> str:
     """Shell that makes the gateway load chat4000: Hermes has no hot-reload, so a
     gateway that booted BEFORE chat4000 was enabled must restart to pick it up.
-    The native `hermes gateway restart` is preferred (supervisor-aware, no argv
-    guessing; time-capped so a hung restart can't stall the reload) — but only
-    AFTER capturing the running gateway's EXACT argv from /proc, so the fallback
-    can still relaunch identically if the native path half-dies. The fallback
-    pkills and relaunches that captured argv (the live gateway runs as `hermes
-    gateway`, NOT `hermes gateway run`, so we don't guess the command — the
-    wizard's run-only grep is the bug that left it unrestarted), detached so it
-    outlives us. If a supervisor respawns it first, we don't double-start.
-    `try_native=False` skips the native attempt (the human flow already tried it
-    from Python before falling back here). Run from a temp file (see
-    _spawn_detached_gateway_reload) so the match pattern never appears in the
-    caller's own argv → pkill can't kill the reloader itself."""
+
+    Single-stage and deterministic: we do NOT call `hermes gateway restart`. It
+    reliably HANGS (suspected: a second Telegram-bot instance holding the
+    getUpdates lock blocks a clean restart), and waiting on it just burns time
+    before doing exactly this. So we go straight to kill + relaunch. First we
+    capture the running gateway's EXACT argv from /proc so the relaunch is
+    identical (the live gateway runs as `hermes gateway`, NOT `hermes gateway
+    run`, so we don't guess the command), then SIGTERM it so it can flush state
+    cleanly, escalate to SIGKILL only for survivors after a short grace, and
+    relaunch detached so it outlives us. If a supervisor respawns it first, we
+    don't double-start. Run from a temp file (see _spawn_detached_gateway_reload)
+    so the match pattern never appears in the caller's own argv → pkill can't
+    kill the reloader itself."""
     hb = shlex.quote(hermes_bin)
-    native = ""
-    if try_native:
-        native = f"""if command -v timeout >/dev/null 2>&1; then
-  timeout 60 {hb} gateway restart >/dev/null 2>&1 && exit 0
-else
-  {hb} gateway restart >/dev/null 2>&1 && exit 0
-fi
-"""
     return f"""sleep 3
 gpid=$(pgrep -f 'hermes gateway' 2>/dev/null | head -n1)
 if [ -n "$gpid" ] && [ -r "/proc/$gpid/cmdline" ]; then cp "/proc/$gpid/cmdline" /tmp/chat4000-gw-argv.bin 2>/dev/null; fi
-{native}pkill -9 -f 'hermes gateway' 2>/dev/null || true
-for _ in $(seq 1 12); do pgrep -f 'hermes gateway' >/dev/null 2>&1 || break; sleep 1; done
+pkill -TERM -f 'hermes gateway' 2>/dev/null || true
+for _ in $(seq 1 10); do pgrep -f 'hermes gateway' >/dev/null 2>&1 || break; sleep 1; done
+pkill -KILL -f 'hermes gateway' 2>/dev/null || true
+for _ in $(seq 1 5); do pgrep -f 'hermes gateway' >/dev/null 2>&1 || break; sleep 1; done
 sleep 2
 if pgrep -f 'hermes gateway' >/dev/null 2>&1; then exit 0; fi
 if [ -s /tmp/chat4000-gw-argv.bin ]; then
@@ -3045,10 +3139,9 @@ def _hermes_gateway_alive() -> bool:
 
 def _verify_hermes_gateway_back(timeout: float = 30.0) -> bool:
     """META verification mirror for Hermes: after a (re)start, confirm a gateway
-    process is actually live again. Both the native `hermes gateway restart` and
-    the pkill+relaunch fallback can report 'done' on an unsupervised box while
-    nothing came back up — so a restart we can't observe is treated as a FAILURE.
-    Polls every 1s up to `timeout`."""
+    process is actually live again. The pkill + relaunch can report 'done' on an
+    unsupervised box while nothing came back up — so a restart we can't observe is
+    treated as a FAILURE. Polls every 1s up to `timeout`."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         if _hermes_gateway_alive():
@@ -3059,39 +3152,26 @@ def _verify_hermes_gateway_back(timeout: float = 30.0) -> bool:
 
 def _hermes_restart_gateway(venv_bin: str) -> Optional[str]:
     """Restart the Hermes gateway NOW (human flow — we don't live inside the
-    gateway, so a synchronous bounce can't kill us). Prefers the native
-    `hermes gateway restart` (supervisor-aware, no argv guessing), time-capped;
-    only when that fails falls back to the pkill + identical-argv relaunch
-    script (_hermes_gateway_reload_sh, native attempt skipped — we just tried).
-    The agent flows keep their detached, event-driven reload instead.
+    gateway, so a synchronous bounce can't kill us). Single-stage: we go STRAIGHT
+    to the pkill + identical-argv relaunch script (_hermes_gateway_reload_sh). We
+    do NOT call `hermes gateway restart` — it reliably HANGS (suspected: a second
+    Telegram-bot instance holding the getUpdates lock), so the old two-stage path
+    burned its whole timeout (~2-3 min observed) before falling back to exactly
+    this. The agent flows keep their detached, event-driven reload (same script).
 
-    Every path that reports success is VERIFIED: a gateway process must actually
-    be live again (META — neither the native command nor the relaunch can claim a
-    restart that didn't happen, which on an unsupervised box would otherwise pass
-    silently).
+    Success is VERIFIED: a gateway process must actually be live again (META — the
+    relaunch can't claim a restart that didn't happen, which on an unsupervised
+    box would otherwise pass silently).
 
-    Returns the method that worked — "native" | "relaunch" (the IN7
-    installer_gateway_restarted prop) — or None when both failed."""
+    Returns "relaunch" (the IN7 installer_gateway_restarted prop) when a live
+    gateway came back, or None when it didn't."""
     hermes_bin = f"{venv_bin}/hermes"
-    say(f"$ {hermes_bin} gateway restart")
-    try:
-        r = subprocess.run([hermes_bin, "gateway", "restart"], capture_output=True, text=True, timeout=90)
-        if r.returncode == 0:
-            if _verify_hermes_gateway_back():
-                return "native"
-            warn("`hermes gateway restart` returned 0 but no gateway came back — falling back to pkill + relaunch.")
-        else:
-            out = ((r.stdout or "") + (r.stderr or "")).strip()
-            warn(f"`hermes gateway restart` exited {r.returncode}{(': ' + out[:300]) if out else ''} — falling back to pkill + relaunch.")
-    except subprocess.TimeoutExpired:
-        warn("`hermes gateway restart` timed out — falling back to pkill + relaunch.")
-    except OSError as exc:
-        warn(f"`hermes gateway restart` unavailable ({exc}) — falling back to pkill + relaunch.")
-    # Fallback: the argv-capture pkill+relaunch script, run SYNCHRONOUSLY from a
-    # temp file — a `bash -c` would put the 'hermes gateway' pkill pattern into
-    # the reloader's own argv and it would kill itself (the temp-file trick from
-    # _spawn_detached_gateway_reload, same reason).
-    script = _hermes_gateway_reload_sh(hermes_bin, try_native=False)
+    say("Stopping the running Hermes gateway and relaunching it so it loads chat4000.")
+    # The argv-capture kill (SIGTERM, then SIGKILL after a grace) + relaunch
+    # script, run SYNCHRONOUSLY from a temp file — a `bash -c` would put the
+    # 'hermes gateway' pkill pattern into the reloader's own argv and it would
+    # kill itself (the temp-file trick from _spawn_detached_gateway_reload).
+    script = _hermes_gateway_reload_sh(hermes_bin)
     sh_path = f"/tmp/chat4000-gwreload-{uuid.uuid4().hex[:8]}.sh"
     try:
         Path(sh_path).write_text("#!/usr/bin/env bash\n" + script, encoding="utf-8")
