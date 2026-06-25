@@ -2305,78 +2305,66 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
         _emit("installer_failed", {"stage": "prepare", "exit_code": prep_rc})
         return prep_rc
 
-    # 2/3 — `chat4000 pair`: INTERACTIVE (inherited stdio) so the human sees the
-    # QR + code and the watcher's live feedback. Pair-first, restart after — the
-    # same ordering as the agent flow: restarting first would tear the QR away
-    # mid-scan, since the restart below is what bounces the gateway.
-    #
-    # --no-pair (UPGRADE invocation, e.g. a resident plugin's version-poller
-    # refreshing itself) skips pairing entirely but STILL restarts the gateway
-    # below so the freshly-installed plugin code is loaded and running. Mirrors
-    # the OpenClaw gate (do_pair = interactive and not args.no_pair).
-    do_pair = not args.no_pair
-    if not do_pair:
-        # pair_rc = 0 keeps the "restart, then report success" branches below on
-        # their happy path — there's no failed pairing here, just an upgrade.
-        pair_rc = 0
-        ok("Plugin refreshed (--no-pair). Pair a device any time with:")
-        print(f"  {C_CYN}{chat4000_bin} pair{C_RST}")
-    else:
-        hdr("📱 Pairing your device")
-        print(f"{C_DIM}Scan the QR with the chat4000 iOS/macOS app. Ctrl-C to skip pairing.{C_RST}\n")
-        pair_cmd = [chat4000_bin, "pair"]
-        if args.stage:
-            pair_cmd.append("--stage")
-        pair_cmd += _pair_flag_args(args)
-        try:
-            pair_rc = subprocess.run(pair_cmd).returncode
-        except KeyboardInterrupt:
-            print()
-            warn("Pairing cancelled. Finish any time:")
-            print(f"  {C_CYN}{chat4000_bin} pair{C_RST}  (then restart your Hermes gateway so it loads chat4000)")
-            _emit("installer_cancelled", {"stage": "pair"})
-            return 130
-        except OSError as exc:
-            err(f"Could not run pairing: {exc}")
-            _emit("installer_failed", {"stage": "pair", "error_class": type(exc).__name__, "error_msg": str(exc)[:200]})
-            return 1
-        if pair_rc != 0:
-            # Pairing resolved unhappily (expired window, registrar error, …). The
-            # gateway restart below still has to happen — the plugin is installed and
-            # enabled, and a later manual `chat4000 pair` needs chat4000 loaded.
-            err(f"Pairing exited {pair_rc}. Pair again any time: {chat4000_bin} pair")
-            _emit("installer_failed", {"stage": "pair", "exit_code": pair_rc})
-        else:
-            # IN7: parity with the OpenClaw flow — the interactive pair succeeded.
-            _emit("pairing_completed_via_installer", {})
-
-    # 3/3 — AFTER pairing resolves: restart the gateway. Hermes has no hot-reload
-    # (plugins are discovered only at startup), so this is what actually puts
-    # chat4000 in the running agent.
+    # 2/3 — Restart the gateway FIRST (non-agent / server flow) so it actually
+    # LOADS chat4000 BEFORE we pair. Hermes discovers plugins only at startup, so
+    # the device should join a gateway that already has chat4000 running. Safe to
+    # restart here because the human/server installer does NOT live inside the
+    # gateway — unlike the agent flow (install_hermes_agent), where restarting
+    # first would kill the agent relaying the code, so THAT flow stays pair-first
+    # + detached event-driven reload.
     hdr("🔁 Restarting the Hermes gateway")
-    if do_pair and pair_rc == 0:
-        say("Starting the gateway so it loads chat4000 — your phone will finish joining in a minute or two.")
-    else:
-        say("Starting the gateway so it loads chat4000.")
+    say("Starting the gateway so it loads chat4000.")
     restart_method = _hermes_restart_gateway(venv_bin)
     if restart_method:
-        ok("Gateway restarted — chat4000 is loading.")
+        ok("Gateway restarted — chat4000 is live.")
         _emit("installer_gateway_restarted", {"method": restart_method})  # IN7
     else:
         warn("Could not restart the Hermes gateway automatically.")
         warn(f"Start it yourself:  {C_CYN}{venv_bin}/hermes gateway run{C_RST}  (after stopping any running gateway)")
         _emit("installer_failed", {"stage": "gateway_restart", "error_class": "RestartUnavailable", "error_msg": "pkill+relaunch failed"})
         return 1
+
+    # --no-pair UPGRADE invocation (e.g. a resident plugin's version-poller
+    # refreshing itself): plugin refreshed + gateway restarted, no device. Done.
+    do_pair = not args.no_pair
     if not do_pair:
-        # UPGRADE invocation: plugin refreshed + gateway restarted, no device. The
-        # running gateway now has the new plugin code loaded — a resident
-        # version-poller can run. Done.
         ok("Upgrade complete — chat4000 plugin refreshed and the gateway is running.")
         _emit("installer_succeeded", {})
-    elif pair_rc == 0:
-        ok("All set — your device is paired and chat4000 is live.")
-        _emit("installer_succeeded", {})
-    return pair_rc
+        return 0
+
+    # 3/3 — `chat4000 pair`: INTERACTIVE (inherited stdio) so the human sees the
+    # QR + code and the watcher's live feedback. chat4000 is already live (we
+    # restarted above), so the device joins right after scanning.
+    hdr("📱 Pairing your device")
+    print(f"{C_DIM}Scan the QR with the chat4000 iOS/macOS app. Ctrl-C to skip pairing.{C_RST}\n")
+    pair_cmd = [chat4000_bin, "pair"]
+    if args.stage:
+        pair_cmd.append("--stage")
+    pair_cmd += _pair_flag_args(args)
+    try:
+        pair_rc = subprocess.run(pair_cmd).returncode
+    except KeyboardInterrupt:
+        print()
+        warn("Pairing cancelled. Pair a device any time:")
+        print(f"  {C_CYN}{chat4000_bin} pair{C_RST}")
+        _emit("installer_cancelled", {"stage": "pair"})
+        return 130
+    except OSError as exc:
+        err(f"Could not run pairing: {exc}")
+        _emit("installer_failed", {"stage": "pair", "error_class": type(exc).__name__, "error_msg": str(exc)[:200]})
+        return 1
+    if pair_rc != 0:
+        # Pairing resolved unhappily (expired window, registrar error, …). The
+        # gateway is already restarted with chat4000 loaded, so a later manual
+        # `chat4000 pair` just works.
+        err(f"Pairing exited {pair_rc}. Pair again any time: {chat4000_bin} pair")
+        _emit("installer_failed", {"stage": "pair", "exit_code": pair_rc})
+        return pair_rc
+    # IN7: parity with the OpenClaw flow — the interactive pair succeeded.
+    _emit("pairing_completed_via_installer", {})
+    ok("All set — your device is paired and chat4000 is live.")
+    _emit("installer_succeeded", {})
+    return 0
 
 
 def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
@@ -2467,13 +2455,33 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
         err("If this is a token error, pass --service-token <TOKEN> and select --env prod|stage.")
         _emit("installer_failed", {"stage": "setup", "exit_code": setup_rc})
         return setup_rc
+    # Restart the gateway FIRST (non-agent / server flow) so it LOADS chat4000
+    # BEFORE we pair — the device then joins a live channel. Safe here because the
+    # human/server installer is a SEPARATE process from the gateway; the agent
+    # flow (install_openclaw_agent) runs differently and stays as-is. --no-restart
+    # skips it, and then the channel won't come up until the user starts the
+    # gateway themselves.
+    if args.no_restart:
+        warn("Skipping gateway restart (--no-restart) — chat4000 won't connect until you start it:")
+        print(f"  {C_CYN}{openclaw_path} gateway run{C_RST}")
+    else:
+        hdr("🔁 Starting OpenClaw gateway")
+        method = detect_restart_method()
+        if method is not None and restart_gateway(method):
+            ok(f"Gateway started (method: {method}).")
+            _emit("installer_gateway_restarted", {"method": method})
+        else:
+            warn("Could not auto-start the gateway.")
+            warn("Docker: docker restart openclaw-gateway · terminal: openclaw gateway run · service: openclaw gateway start")
+            _emit("installer_failed", {"stage": "gateway_restart", "error_class": "RestartUnavailable", "error_msg": f"no working method (probed: {method or 'none'})"})
+            return 1
+
+    # Now pair (interactive). chat4000 is already live after the restart above,
+    # so the device joins immediately after scanning.
     if not do_pair:
         ok("Identity + rooms ready. Pair a device any time with:")
         print(f"  {C_CYN}{openclaw_path} chat4000 pair{C_RST}")
     else:
-        # Pair INTERACTIVELY (inherited stdio) so the human sees the QR + code
-        # and the watcher's live feedback. Pair-first, restart after — same
-        # ordering as the agent flow.
         hdr("📱 Pairing a device")
         print(f"{C_DIM}Scan the QR with the chat4000 iOS/macOS app. Ctrl-C to cancel.{C_RST}\n")
         pair_cmd = [openclaw_path, "chat4000", "pair"]
@@ -2499,25 +2507,12 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
             return pair_rc
         _emit("pairing_completed_via_installer", {})
 
-    # (Re)start gateway.
-    if args.no_restart:
-        warn("Skipping gateway restart (--no-restart).")
-        print(f"  {C_CYN}{openclaw_path} gateway run{C_RST}")
-        return 0
-
-    hdr("🔁 Starting OpenClaw gateway")
-    method = detect_restart_method()
-    if method is not None and restart_gateway(method):
-        ok(f"Gateway started (method: {method}).")
-        _emit("installer_gateway_restarted", {"method": method})
-    else:
-        warn("Could not auto-start the gateway.")
-        warn("Docker: docker restart openclaw-gateway · terminal: openclaw gateway run · service: openclaw gateway start")
-        _emit("installer_failed", {"stage": "gateway_restart", "error_class": "RestartUnavailable", "error_msg": f"no working method (probed: {method or 'none'})"})
-        return 1
-
     if not interactive:
         ok("Installed. Pair + verify each target individually when ready.")
+        return 0
+    if args.no_restart:
+        ok("Installed + paired. Start the gateway to bring chat4000 online:")
+        print(f"  {C_CYN}{openclaw_path} gateway run{C_RST}")
         return 0
 
     print(f"{C_DIM}First install can take a couple of minutes while OpenClaw loads plugins{C_RST}")
