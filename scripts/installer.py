@@ -1193,6 +1193,25 @@ def _hermes_home() -> Path:
     return Path(home).expanduser() if home else Path.home() / ".hermes"
 
 
+def _hermes_chat4000_state_dir() -> Path:
+    """The chat4000 plugin's state dir, resolved the SAME way the plugin does
+    (chat4000_hermes_plugin.key_store.resolve_chat4000_plugin_dir): HERMES_STATE_DIR
+    overrides, else the Hermes home; then /plugins/chat4000. The plugin writes its
+    `ready` marker + logs under here."""
+    env_state = (os.environ.get("HERMES_STATE_DIR") or "").strip()
+    base = Path(env_state).expanduser() if env_state else _hermes_home()
+    return base / "plugins" / "chat4000"
+
+
+def _hermes_ready_marker() -> Path:
+    """The plugin's readiness marker file. The Hermes adapter writes it ONCE the
+    gateway is fully connected to the relay + bootstrapped (adapter._mark_ready,
+    after its first sync), and deletes it on disconnect — so its presence is real
+    "chat4000 is up and connected" proof, not just "process exists". Mirrors
+    key_store.resolve_chat4000_ready_marker()."""
+    return _hermes_chat4000_state_dir() / "ready"
+
+
 def collect_hermes_stats(venv_bin: str) -> dict:
     """install date + channels/plugins + session count for a Hermes venv."""
     stats: dict = {
@@ -1984,47 +2003,182 @@ def openclaw_reset_local_state() -> None:
 
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
+# How long the non-agent flow waits, after a gateway restart, for chat4000 to
+# ACTUALLY connect to the relay before pairing. Generous: OpenClaw's first plugin
+# boot can take a couple of minutes (the plugin's own install wizard waits 180s).
+READY_WAIT_S = 150.0
+# Clock-skew slack when judging whether a readiness marker is "fresh" (written by
+# THIS gateway boot, at/after the restart instant) rather than left over from a
+# previous run.
+_READY_SLACK_S = 2.0
 
-def wait_for_chat4000_connected(timeout: float = 120.0) -> bool:
-    runtime_log = _openclaw_home() / "plugins" / "chat4000" / "logs" / "runtime.log"
-    gateway_log = Path("/tmp/openclaw-gateway.log")
+
+def _spin_until(check, timeout: float, status: str) -> bool:
+    """Poll `check()` (a no-arg predicate) every 0.2s until it returns True or
+    `timeout` elapses, showing a spinner on a TTY. Returns True if it became
+    True, False on timeout. A check that raises a filesystem/parse error is
+    treated as 'not ready yet', never aborts the wait."""
     deadline = time.time() + timeout
     started = time.time()
-    frame_idx = 0
     is_tty = sys.stdout.isatty()
-    last_status = ""
-    print()
+    frame_idx = 0
+    if is_tty:
+        print()
     while time.time() < deadline:
-        if runtime_log.exists():
-            try:
-                if "runtime.hello_ok" in runtime_log.read_text(errors="ignore"):
-                    if is_tty:
-                        sys.stdout.write("\r" + " " * 100 + "\r")
-                        sys.stdout.flush()
-                    return True
-            except OSError:
-                pass
-        status = "starting gateway"
-        if gateway_log.exists():
-            try:
-                gw = gateway_log.read_text(errors="ignore")
-                if "[gateway] ready" in gw or "starting channels and sidecars" in gw:
-                    status = "loading channels"
-                if "[chat4000]" in gw and "Starting chat4000" in gw:
-                    status = "chat4000 channel starting"
-                if runtime_log.exists():
-                    status = "chat4000 connecting to gateway"
-            except OSError:
-                pass
+        try:
+            if check():
+                if is_tty:
+                    sys.stdout.write("\r" + " " * 100 + "\r")
+                    sys.stdout.flush()
+                return True
+        except (OSError, ValueError):
+            pass
         if is_tty:
             elapsed = int(time.time() - started)
             frame = SPINNER_FRAMES[frame_idx % len(SPINNER_FRAMES)]
-            line = f"\r{C_CYN}{frame}{C_RST}  {C_BOLD}{status}{C_RST}{C_DIM}  ({elapsed}s){C_RST}"
-            pad = max(0, len(last_status) - len(line))
-            sys.stdout.write(line + (" " * pad))
+            sys.stdout.write(
+                f"\r{C_CYN}{frame}{C_RST}  {C_BOLD}{status}{C_RST}{C_DIM}  ({elapsed}s){C_RST}   "
+            )
             sys.stdout.flush()
-            last_status = line
-        time.sleep(0.1)
+        time.sleep(0.2)
+        frame_idx += 1
+    if is_tty:
+        sys.stdout.write("\r" + " " * 100 + "\r")
+        sys.stdout.flush()
+    return False
+
+
+# ─── Readiness: Hermes (the plugin's own `ready` marker) ───────────────────
+
+
+def _clear_hermes_ready_marker() -> None:
+    """Delete the Hermes `ready` marker before a restart, so its REAPPEARANCE is
+    unambiguous proof that THIS gateway boot connected (the plugin's own install
+    wizard uses the same delete → restart → await-reappear pattern). Best-effort:
+    a failed delete just falls back to the mtime freshness check below."""
+    with contextlib.suppress(OSError):
+        _hermes_ready_marker().unlink()
+
+
+def _hermes_ready_marker_fresh(since_ts: float) -> bool:
+    """True when the plugin's `ready` marker exists AND was (re)written at/after
+    `since_ts` (minus slack). Pure predicate — unit-testable without a gateway."""
+    marker = _hermes_ready_marker()
+    try:
+        return marker.is_file() and marker.stat().st_mtime >= since_ts - _READY_SLACK_S
+    except OSError:
+        return False
+
+
+def wait_for_hermes_chat4000_ready(since_ts: float, timeout: float = READY_WAIT_S) -> bool:
+    """Wait for the Hermes chat4000 `ready` marker to (re)appear after a restart —
+    real proof the gateway is up, chat4000 is loaded, AND it has connected to the
+    relay (the adapter writes the marker only after its first relay sync). Returns
+    True once ready, False on timeout."""
+    return _spin_until(
+        lambda: _hermes_ready_marker_fresh(since_ts),
+        timeout,
+        "waiting for chat4000 to connect to the relay",
+    )
+
+
+# ─── Readiness: OpenClaw (the plugin's own runtime.log markers) ────────────
+
+_RUNTIME_TS_RE = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d\.\d{3})")
+# Either marker proves the chat4000 channel reached the relay: hello_ok = Matrix
+# sync connected; rooms_ready = space/control room ensured (pairing-ready). The
+# plugin writes both to runtime.log; its own wizard treats either as "ready".
+_OPENCLAW_READY_MARKERS = ("runtime.hello_ok", "runtime.rooms_ready")
+
+
+def _openclaw_runtime_log() -> Path:
+    return _openclaw_home() / "plugins" / "chat4000" / "logs" / "runtime.log"
+
+
+def _parse_runtime_ts(line: str) -> Optional[float]:
+    """Epoch seconds for a runtime.log line's leading LOCAL timestamp
+    'YYYY-MM-DD HH:MM:SS.mmm' (the format the plugin's RuntimeLogger emits), or
+    None when the line doesn't begin with one."""
+    m = _RUNTIME_TS_RE.match(line)
+    if not m:
+        return None
+    try:
+        import datetime
+
+        return datetime.datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S.%f").timestamp()
+    except (ValueError, OverflowError):
+        return None
+
+
+def _openclaw_runtime_connected_since(since_ts: float) -> bool:
+    """True when runtime.log carries a readiness marker (hello_ok / rooms_ready)
+    whose line timestamp is at/after `since_ts` (minus slack) — i.e. THIS gateway
+    boot connected, not a stale marker from a previous run (the bug the old
+    whole-file substring search had). If a marker line's timestamp can't be parsed
+    (log rotation / format drift), fall back to 'marker present AND file mtime
+    fresh'. Pure predicate — unit-testable without a gateway."""
+    path = _openclaw_runtime_log()
+    try:
+        text = path.read_text(errors="ignore")
+    except OSError:
+        return False
+    saw_marker_unparsed = False
+    for line in text.splitlines():
+        if not any(mk in line for mk in _OPENCLAW_READY_MARKERS):
+            continue
+        ts = _parse_runtime_ts(line)
+        if ts is None:
+            saw_marker_unparsed = True
+            continue
+        if ts >= since_ts - _READY_SLACK_S:
+            return True
+    if saw_marker_unparsed:
+        try:
+            return path.stat().st_mtime >= since_ts - _READY_SLACK_S
+        except OSError:
+            return False
+    return False
+
+
+def wait_for_chat4000_connected(since_ts: float, timeout: float = READY_WAIT_S) -> bool:
+    """Wait for the OpenClaw chat4000 channel to ACTUALLY connect to the relay
+    after a restart, by polling the plugin's own runtime.log for a FRESH readiness
+    marker (written at/after `since_ts`). Shows a spinner with a coarse phase read
+    from the gateway log. Returns True once connected, False on timeout."""
+    gateway_log = Path("/tmp/openclaw-gateway.log")
+
+    def _status() -> str:
+        status = "starting gateway"
+        try:
+            gw = gateway_log.read_text(errors="ignore")
+        except OSError:
+            return status
+        if "[gateway] ready" in gw or "starting channels and sidecars" in gw:
+            status = "loading channels"
+        if "Starting chat4000" in gw:
+            status = "chat4000 channel starting"
+        return status
+
+    deadline = time.time() + timeout
+    started = time.time()
+    is_tty = sys.stdout.isatty()
+    frame_idx = 0
+    if is_tty:
+        print()
+    while time.time() < deadline:
+        if _openclaw_runtime_connected_since(since_ts):
+            if is_tty:
+                sys.stdout.write("\r" + " " * 100 + "\r")
+                sys.stdout.flush()
+            return True
+        if is_tty:
+            elapsed = int(time.time() - started)
+            frame = SPINNER_FRAMES[frame_idx % len(SPINNER_FRAMES)]
+            sys.stdout.write(
+                f"\r{C_CYN}{frame}{C_RST}  {C_BOLD}{_status()}{C_RST}{C_DIM}  ({elapsed}s){C_RST}   "
+            )
+            sys.stdout.flush()
+        time.sleep(0.2)
         frame_idx += 1
     if is_tty:
         sys.stdout.write("\r" + " " * 100 + "\r")
@@ -2314,9 +2468,13 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
     # + detached event-driven reload.
     hdr("🔁 Restarting the Hermes gateway")
     say("Starting the gateway so it loads chat4000.")
+    # Capture the restart instant and clear the plugin's `ready` marker FIRST, so
+    # its reappearance proves THIS boot connected (not a stale marker from before).
+    restart_ts = time.time()
+    _clear_hermes_ready_marker()
     restart_method = _hermes_restart_gateway(venv_bin)
     if restart_method:
-        ok("Gateway restarted — chat4000 is live.")
+        ok("Gateway restarted — chat4000 is loading.")
         _emit("installer_gateway_restarted", {"method": restart_method})  # IN7
     else:
         warn("Could not restart the Hermes gateway automatically.")
@@ -2326,15 +2484,29 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
 
     # --no-pair UPGRADE invocation (e.g. a resident plugin's version-poller
     # refreshing itself): plugin refreshed + gateway restarted, no device. Done.
+    # (No readiness wait — there's no pairing to gate, and the poller upgrade
+    # shouldn't stall.)
     do_pair = not args.no_pair
     if not do_pair:
         ok("Upgrade complete — chat4000 plugin refreshed and the gateway is running.")
         _emit("installer_succeeded", {})
         return 0
 
+    # Gate pairing on REAL readiness (option A): poll the plugin's own `ready`
+    # marker, which the adapter writes only after it connects to the relay. The
+    # old check was just "process exists" (a false-ready) — the device could pair
+    # into a gateway that hadn't loaded/connected chat4000 yet.
+    if wait_for_hermes_chat4000_ready(restart_ts):
+        ok("chat4000 connected to the relay — ready to pair.")
+    else:
+        warn(
+            f"chat4000 hasn't reported ready within {int(READY_WAIT_S)}s — pairing anyway; "
+            f"if your device doesn't connect, check {_hermes_chat4000_state_dir()}/logs/chat4000.log"
+        )
+
     # 3/3 — `chat4000 pair`: INTERACTIVE (inherited stdio) so the human sees the
     # QR + code and the watcher's live feedback. chat4000 is already live (we
-    # restarted above), so the device joins right after scanning.
+    # restarted + waited above), so the device joins right after scanning.
     hdr("📱 Pairing your device")
     print(f"{C_DIM}Scan the QR with the chat4000 iOS/macOS app. Ctrl-C to skip pairing.{C_RST}\n")
     pair_cmd = [chat4000_bin, "pair"]
@@ -2460,7 +2632,9 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
     # human/server installer is a SEPARATE process from the gateway; the agent
     # flow (install_openclaw_agent) runs differently and stays as-is. --no-restart
     # skips it, and then the channel won't come up until the user starts the
-    # gateway themselves.
+    # gateway themselves. Capture the restart instant first so the readiness wait
+    # below only accepts a FRESH runtime.log marker (not a stale one).
+    since_ts = time.time()
     if args.no_restart:
         warn("Skipping gateway restart (--no-restart) — chat4000 won't connect until you start it:")
         print(f"  {C_CYN}{openclaw_path} gateway run{C_RST}")
@@ -2476,8 +2650,26 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
             _emit("installer_failed", {"stage": "gateway_restart", "error_class": "RestartUnavailable", "error_msg": f"no working method (probed: {method or 'none'})"})
             return 1
 
-    # Now pair (interactive). chat4000 is already live after the restart above,
-    # so the device joins immediately after scanning.
+    # Gate pairing on REAL readiness (option A): poll the plugin's own runtime.log
+    # for a FRESH hello_ok / rooms_ready marker — proof the chat4000 channel
+    # actually connected to the relay. Lockfile-pid-alive was a false-ready (the
+    # lock is written at process start, long before channels load). Skipped on
+    # --no-restart (no gateway running to watch).
+    relay_ok = False
+    if not args.no_restart:
+        print(f"{C_DIM}First gateway boot can take a couple of minutes while OpenClaw loads{C_RST}")
+        print(f"{C_DIM}plugins and the chat4000 channel connects…{C_RST}")
+        relay_ok = wait_for_chat4000_connected(since_ts)
+        if relay_ok:
+            ok("chat4000 connected to the relay.")
+            _emit("installer_chat4000_relay_connected", {})
+        else:
+            warn(f"chat4000 didn't connect within {int(READY_WAIT_S)}s — continuing anyway.")
+            warn(f"Watch logs: {C_CYN}tail -f ~/.openclaw/plugins/chat4000/logs/runtime.log{C_RST}")
+            _emit("installer_failed", {"stage": "relay_handshake", "error_class": "Timeout", "error_msg": f"no fresh runtime.log marker within {int(READY_WAIT_S)}s"})
+
+    # Now pair (interactive). chat4000 is connected after the wait above, so the
+    # device joins immediately after scanning.
     if not do_pair:
         ok("Identity + rooms ready. Pair a device any time with:")
         print(f"  {C_CYN}{openclaw_path} chat4000 pair{C_RST}")
@@ -2515,16 +2707,15 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
         print(f"  {C_CYN}{openclaw_path} gateway run{C_RST}")
         return 0
 
-    print(f"{C_DIM}First install can take a couple of minutes while OpenClaw loads plugins{C_RST}")
-    print(f"{C_DIM}and the chat4000 channel connects. Grab a coffee — we'll tell you when ready.{C_RST}")
-    if wait_for_chat4000_connected(timeout=120):
-        ok("chat4000 connected. Send a message from your iOS/Mac app — your OpenClaw agent will reply.")
+    # We already waited for the relay above (before pairing). Report on that
+    # result — connected ⇒ success; never-connected ⇒ the relay_handshake failure
+    # was already emitted, so just surface it and exit non-zero.
+    if relay_ok:
+        ok("chat4000 is live. Send a message from your iOS/Mac app — your OpenClaw agent will reply.")
         _emit("installer_succeeded", {})
-        _emit("installer_chat4000_relay_connected", {})
         return 0
-    warn("chat4000 didn't connect within 120s.")
+    warn("chat4000 hadn't connected to the relay, so it isn't live yet.")
     warn(f"Watch logs: {C_CYN}tail -f ~/.openclaw/plugins/chat4000/logs/runtime.log{C_RST}")
-    _emit("installer_failed", {"stage": "relay_handshake", "error_class": "Timeout", "error_msg": "no runtime.hello_ok within 120s"})
     return 1
 
 

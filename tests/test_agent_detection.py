@@ -346,13 +346,15 @@ class TestVerifyGatewayRestarted(unittest.TestCase):
 
 
 class TestRestartGatewayLocalKillAndSee(unittest.TestCase):
-    """The single "local" kill-and-see path (mirrors the Hermes restart), driven
-    step-by-step:
-      1. graceful `openclaw gateway restart` that PROVES a new live pid → success;
-      2. F1/F2: a disabled/no-op rc-0 restart is NOT trusted → fall through to kill;
-      3/4. kill by lockfile pid, then SEE if a supervisor revives it → success;
-      5. no revival → foreground start, then VERIFY a new pid (META).
-    plus the no-pid-but-running loud-failure guard."""
+    """The single "local" kill-and-see path (mirrors the Hermes restart). There is
+    NO `openclaw gateway restart` step — it deadlocks and was dropped in fd90ad3 —
+    so the path goes straight to:
+      kill by lockfile pid, then SEE if a supervisor revives it → success;
+      no revival → foreground start, then VERIFY a new pid (META);
+    plus the no-pid-but-running loud-failure guard.
+
+    (The former step-1 'graceful native restart' test was removed when that step
+    was dropped; supervisor-revival success is covered by the test below.)"""
 
     def _run(self, restart_out="Gateway restarted.", restart_rc=0):
         class _R:
@@ -360,19 +362,6 @@ class TestRestartGatewayLocalKillAndSee(unittest.TestCase):
             stdout = restart_out
             stderr = ""
         return _R()
-
-    def test_graceful_native_restart_with_new_pid_is_success(self):
-        # Step 1: native restart, output is benign, verify sees a new pid → done.
-        # We must NOT proceed to kill/spawn.
-        killed = {"v": False}
-        with mock.patch.object(installer, "_openclaw_gateway_pid", lambda: 513), \
-             mock.patch.object(installer.subprocess, "run", lambda *a, **k: self._run()), \
-             mock.patch.object(installer, "_verify_gateway_restarted", lambda pre, **k: True), \
-             mock.patch.object(installer, "_kill_openclaw_gateway",
-                               lambda: killed.__setitem__("v", True)), \
-             mock.patch.object(installer.shutil, "which", lambda n: "/usr/bin/openclaw"):
-            self.assertTrue(installer.restart_gateway("local"))
-        self.assertFalse(killed["v"], "a verified native restart must not proceed to kill")
 
     def test_supervisor_revives_within_grace_is_success_without_spawn(self):
         # Step 4: after the kill, a NEW live pid (!= pre) appears within GRACE → a
@@ -489,23 +478,27 @@ class TestRestartGatewayDocker(unittest.TestCase):
 
 
 class TestHermesRestartVerify(unittest.TestCase):
-    """Mirror of META into Hermes: every success path must confirm a gateway
-    process is live again (kill mechanism unchanged — only verification added)."""
+    """Single-stage Hermes restart (no `hermes gateway restart` — it hangs): the
+    kill + relaunch script runs, then success REQUIRES a verified live gateway
+    (META). Method is always 'relaunch' or None now; 'native' is retired."""
 
-    def test_native_success_requires_live_gateway(self):
+    def test_relaunch_success_requires_live_gateway(self):
+        # Relaunch script runs (rc 0) AND a live gateway is verified → "relaunch".
         class _R:
             returncode = 0
             stdout = ""
             stderr = ""
 
         with mock.patch.object(installer.subprocess, "run", lambda *a, **k: _R()), \
+             mock.patch.object(installer.Path, "write_text", lambda *a, **k: None), \
+             mock.patch.object(installer.os, "chmod", lambda *a, **k: None), \
+             mock.patch.object(installer.os, "unlink", lambda *a, **k: None), \
              mock.patch.object(installer, "_verify_hermes_gateway_back", lambda *a, **k: True):
-            self.assertEqual(installer._hermes_restart_gateway("/opt/h/bin"), "native")
+            self.assertEqual(installer._hermes_restart_gateway("/opt/h/bin"), "relaunch")
 
-    def test_native_rc0_but_no_gateway_falls_back(self):
-        # rc 0 but nothing came back → must NOT report 'native'; falls through to
-        # the relaunch script. We make the relaunch fail so the result is None,
-        # proving 'native' was rejected.
+    def test_relaunch_no_live_gateway_is_none(self):
+        # The relaunch ran (rc 0) but no gateway came back → must NOT report
+        # success: META requires a verified-live gateway, so the result is None.
         class _R:
             returncode = 0
             stdout = ""
@@ -515,7 +508,7 @@ class TestHermesRestartVerify(unittest.TestCase):
 
         def fake_verify(*a, **k):
             verify_calls["n"] += 1
-            return False  # gateway never comes back, on either path
+            return False  # gateway never comes back
 
         with mock.patch.object(installer.subprocess, "run", lambda *a, **k: _R()), \
              mock.patch.object(installer, "_verify_hermes_gateway_back", side_effect=fake_verify), \
@@ -524,7 +517,7 @@ class TestHermesRestartVerify(unittest.TestCase):
              mock.patch.object(installer.os, "unlink", lambda *a, **k: None):
             result = installer._hermes_restart_gateway("/opt/h/bin")
         self.assertIsNone(result)
-        self.assertGreaterEqual(verify_calls["n"], 1, "native success path must verify")
+        self.assertGreaterEqual(verify_calls["n"], 1, "relaunch success path must verify")
 
 
 if __name__ == "__main__":

@@ -92,7 +92,7 @@ class TestHermesNoPairGate(unittest.TestCase):
 
         def fake_restart(venv_bin):
             restart_called["v"] = True
-            return "native"
+            return "relaunch"
 
         with mock.patch.object(installer.subprocess, "run", side_effect=fake_subprocess_run), \
              mock.patch.object(installer, "detect_uv", return_value=None), \
@@ -101,6 +101,8 @@ class TestHermesNoPairGate(unittest.TestCase):
              mock.patch.object(installer, "symlink_chat4000_onto_path", return_value=None), \
              mock.patch.object(installer, "_run_streaming", return_value=(0, "")), \
              mock.patch.object(installer, "_hermes_restart_gateway", side_effect=fake_restart), \
+             mock.patch.object(installer, "_clear_hermes_ready_marker", return_value=None), \
+             mock.patch.object(installer, "wait_for_hermes_chat4000_ready", return_value=True), \
              mock.patch.object(installer, "_emit", return_value=None), \
              mock.patch.object(installer, "use_agent_distinct_id", return_value="x"):
             rc = installer.install_into_hermes(t, args, interactive=True)
