@@ -2004,9 +2004,12 @@ def openclaw_reset_local_state() -> None:
 SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
 
 # How long the non-agent flow waits, after a gateway restart, for chat4000 to
-# ACTUALLY connect to the relay before pairing. Generous: OpenClaw's first plugin
-# boot can take a couple of minutes (the plugin's own install wizard waits 180s).
-READY_WAIT_S = 150.0
+# ACTUALLY connect to the relay before pairing. This is only a CAP — the wait
+# returns the instant the readiness marker appears, so a large value costs time
+# only on genuine failure. Measured live on a hermes-shell box: a cold gateway
+# took ~210s to boot the agent + load chat4000 + connect + first-sync (the plugin
+# wizard's 180s was too short there), so 300s gives comfortable margin.
+READY_WAIT_S = 300.0
 # Clock-skew slack when judging whether a readiness marker is "fresh" (written by
 # THIS gateway boot, at/after the restart instant) rather than left over from a
 # previous run.
