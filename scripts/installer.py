@@ -612,7 +612,7 @@ def _sentry_base_event(*, level: str, tags: Optional[dict]) -> dict:
 
     return {
         "event_id": uuid.uuid4().hex,
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
         "platform": "python",
         "level": level,
         "release": INSTALLER_RELEASE,
