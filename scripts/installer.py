@@ -2910,29 +2910,36 @@ def agent_success(
         "",
     ]
     if kind == "Hermes":
-        # Hermes mechanics: one agent turn = ONE final reply; the gateway then
-        # splits image-markdown out of it and sends GIF → text → QR in markdown
-        # order. There is no way to send twice — an agent that replies with just
-        # the GIF "to send the rest later" has ended its turn and lost MESSAGE 2
-        # forever (happened live on hermes-test-94).
+        # Hermes mechanic (THE thing that makes agents fail here): an agent turn
+        # produces exactly ONE reply, and the gateway AUTOMATICALLY splits that
+        # reply's image-markdown into separate Telegram messages, in markdown
+        # order — GIF image, then the text, then the QR image. So the fix for the
+        # real-world "only the GIF went out, user never got the code" failure is
+        # NOT "send three times" (you can't — you get one reply): it is "put all
+        # three INTO your single reply, in order." An agent that replied with just
+        # the GIF "to send the rest next" ended its turn and lost the code forever
+        # (hermes-test-94, and again live). Do NOT do that.
         lines += [
-            "THE CONTRACT — send the user THREE things as THREE SEPARATE messages, one",
-            "after another, in this order, pausing ONE TO TWO SECONDS between each send:",
-            "  1. MESSAGE 1 — the GIF image (send it, by itself, FIRST).",
-            "  2. MESSAGE 2 — the pairing text (link + code), about 1-2 seconds later.",
-            "  3. MESSAGE 3 — the QR image, about 1-2 seconds after that.",
+            "HOW TO DELIVER (read carefully — this is where agents get it wrong): you get",
+            "exactly ONE reply this turn, and the gateway AUTOMATICALLY splits it into",
+            "separate messages for you. So put ALL THREE of the parts below into your",
+            "SINGLE reply, in EXACTLY this order — the gateway then sends them as three",
+            "separate messages on its own:",
+            "  1. the GIF image-markdown — FIRST, on its own line",
+            "  2. the pairing text (link + code)",
+            "  3. the QR image-markdown — LAST, on its own line",
             "",
-            "❌ DO NOT put the GIF, the text, and the QR in ONE message. Sending them as a",
-            "single combined message is a MISTAKE — it is NOT what the user wants. The QR",
-            "must arrive as its OWN image message, never as `![](...)` text sitting under",
-            "the GIF. Three things → three separate messages → a second or two apart. Always.",
+            "Each image must be on its OWN line — that is what makes the gateway send it as",
+            "its own image message. You do NOT send three times and you do NOT pause between",
+            "them; you write ONE reply containing all three, and the gateway does the rest.",
             "",
-            "You must send ALL THREE — do NOT send only the GIF and stop. On a real run the",
-            "agent's entire output was just the GIF and the user never got the code: that is",
-            "a FAILURE. All three go out, each as its own message, in order.",
-            "After all three are sent you produce NOTHING ELSE about this install — not in",
-            "any later turn, heartbeat, or status/'unfinished tool' check — until the",
-            "USER asks. ANY other output about this run, at ANY time, is a FAILURE.",
+            "❌ DO NOT reply with ONLY the GIF and stop. On real runs the agent's whole reply",
+            "was just the GIF and the user NEVER got the pairing code — a FAILURE. There is",
+            "NO second turn to 'send the rest'; if the code/QR aren't in THIS reply, they are",
+            "lost. All three parts go in this one reply, in order.",
+            "After this reply you produce NOTHING ELSE about this install — not in any later",
+            "turn, heartbeat, or status/'unfinished tool' check — until the USER asks. ANY",
+            "other output about this run, at ANY time, is a FAILURE.",
             "You are a RELAY, not a reporter: no narration, no summaries, no verification,",
             "no terminal commands, no log inspection, no talk about yourself or your tools.",
             "",
@@ -2986,10 +2993,11 @@ def agent_success(
             "",
         ]
         lines += [
-            "═══ MESSAGE 1 — send this FIRST, by itself, before anything else: ═══",
+            "═══ ALL THREE PARTS GO IN YOUR ONE REPLY, IN THIS ORDER ═══",
+            "═══ PART 1 — the GIF image, FIRST, on its own line: ═══",
             gif_line,
             "",
-            "═══ MESSAGE 2 — send SECOND (~1-2s later). Exactly this text + structure: ═══",
+            "═══ PART 2 — the pairing text, right after the GIF. Exactly this text + structure: ═══",
         ]
     else:
         lines += [
@@ -3034,15 +3042,30 @@ def agent_success(
             f"• Code lifetime: this code lives {_ttl_human(pair_ttl)} (custom --pair-ttl),",
             "  not the usual 5 minutes. If you say anything about expiry, use that lifetime.",
         ]
+    if kind == "Hermes":
+        lines += [
+            "",
+            "═══ PART 3 — the QR image, LAST in your reply, on its own line: ═══",
+            "📱 Or scan this QR with the other device:",
+            qr_line,
+            "═══════════════════════════════════════════════════════════",
+            "• Put the QR as image-markdown ![](url) on its OWN line so the gateway sends it",
+            "  as its own image message. Post ONLY the ![](url) — do NOT also write the QR url",
+            "  as plain text.",
+            "",
+        ]
+    else:
+        lines += [
+            "",
+            "═══ MESSAGE 3 — the QR, sent LAST as its OWN image, SEPARATE from the GIF: ═══",
+            "📱 Or scan this QR with the other device:",
+            qr_line,
+            "═══════════════════════════════════════════════════════════",
+            "• MESSAGE 3 is its OWN image send — post ONLY the ![](url) QR image. Do NOT write",
+            "  the QR url as plain text, and do NOT merge the QR into MESSAGE 2's text.",
+            "",
+        ]
     lines += [
-        "",
-        "═══ MESSAGE 3 — the QR, sent LAST as its OWN image, SEPARATE from the GIF: ═══",
-        "📱 Or scan this QR with the other device:",
-        qr_line,
-        "═══════════════════════════════════════════════════════════",
-        "• MESSAGE 3 is its OWN image send — post ONLY the ![](url) QR image. Do NOT write",
-        "  the QR url as plain text, and do NOT merge the QR into MESSAGE 2's text.",
-        "",
         "⛔ STOP after MESSAGE 3. The following are ALL FORBIDDEN — you have actually done",
         "   every one of these on past runs; do NOT do any of them again:",
         "",
@@ -3092,10 +3115,23 @@ def agent_success(
         "      user got a dancing GIF and NO pairing code, ever. GIF without MESSAGE 2",
         "      = FAILURE.",
         "   ❌ Do NOT also write the QR url as text — post ONLY the ![](url) image.",
-        "   ❌ Do NOT cram the GIF, the text, and the QR into ONE message. They are THREE",
-        "      separate messages, sent one after another ~1-2 seconds apart. One combined",
-        "      message (GIF + text + QR together) is a MISTAKE and is NOT what the user",
-        "      wants — the QR ends up as raw text instead of a scannable image.",
+    ]
+    if kind == "Hermes":
+        lines += [
+            "   ❌ Do NOT split the GIF, the text, and the QR across multiple turns or",
+            "      replies. You get ONE reply — put all three in it (GIF on its own line,",
+            "      then the text, then the QR on its own line) and the gateway sends them as",
+            "      three separate messages for you. Replying with only the GIF 'to send the",
+            "      rest next turn' loses the code — there IS no next turn.",
+        ]
+    else:
+        lines += [
+            "   ❌ Do NOT cram the GIF, the text, and the QR into ONE message. They are THREE",
+            "      separate messages, sent one after another ~1-2 seconds apart. One combined",
+            "      message (GIF + text + QR together) is a MISTAKE and is NOT what the user",
+            "      wants — the QR ends up as raw text instead of a scannable image.",
+        ]
+    lines += [
         "   ❌ Do NOT append a trailing offer like \"If that code expired, tell me and I'll",
         "      rerun the install.\"",
         "",
@@ -3315,6 +3351,69 @@ def _spawn_detached_gateway_reload(hermes_bin: str, max_wait: int = GATEWAY_RELO
         )
 
 
+OPENCLAW_RELOAD_MARKER = "chat4000-ocreload"  # in the detached reloader's filename/argv
+
+
+def _wait_pair_watcher_resolved(max_wait: int) -> None:
+    """Block until the detached `chat4000 pair` watcher exits — device redeemed or
+    the code window expired — capped at `max_wait`s. Polls every 5s."""
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            if subprocess.run(["pgrep", "-f", "chat4000 pair"], capture_output=True, timeout=10).returncode != 0:
+                return  # watcher gone — pairing resolved
+        time.sleep(5)
+
+
+def _spawn_detached_openclaw_reload(max_wait: int = GATEWAY_RELOAD_MAX_WAIT_S) -> bool:
+    """OpenClaw analog of _spawn_detached_gateway_reload. The OpenClaw AGENT runs
+    UNDER the gateway, so restarting it SYNCHRONOUSLY in-process (the old agent
+    flow) kills the very gateway — and this installer process — before the pairing
+    block reaches the agent: observed live as the agent_success block never
+    arriving, the code expiring unrelayed, and the gateway left dead. So defer the
+    restart to a DETACHED worker that waits for pairing to RESOLVE, then restarts.
+    OpenClaw's restart is docker/supervisor-aware (restart_gateway), so the worker
+    re-invokes THIS installer with the hidden --internal-openclaw-reload flag, run
+    from a STABLE copy (install.sh deletes the original temp file on exit).
+    Returns True if a worker was spawned or one is already pending."""
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        if subprocess.run(["pgrep", "-f", OPENCLAW_RELOAD_MARKER], capture_output=True, timeout=10).returncode == 0:
+            return True  # a reload worker from a prior run is already pending
+    try:
+        src = os.path.abspath(sys.argv[0] or __file__)
+        copy = f"/tmp/{OPENCLAW_RELOAD_MARKER}-{uuid.uuid4().hex[:8]}.py"
+        shutil.copyfile(src, copy)
+    except OSError:
+        return False
+    try:
+        subprocess.Popen(
+            [sys.executable, copy, "--internal-openclaw-reload", "--reload-max-wait", str(int(max_wait))],
+            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            start_new_session=True,  # survives our exit AND the gateway it bounces
+            close_fds=True, env=_pair_env(),
+        )
+        return True
+    except (OSError, subprocess.SubprocessError):
+        with contextlib.suppress(OSError):
+            os.unlink(copy)
+        return False
+
+
+def _run_openclaw_deferred_reload(max_wait: int) -> int:
+    """Body of the detached --internal-openclaw-reload worker: wait for pairing to
+    resolve, restart the gateway (docker/supervisor-aware), then delete our own
+    copied script. Best-effort; always returns 0."""
+    _wait_pair_watcher_resolved(max_wait)
+    method = detect_restart_method()
+    if method:
+        restart_gateway(method)
+    with contextlib.suppress(OSError):
+        me = os.path.abspath(sys.argv[0])
+        if OPENCLAW_RELOAD_MARKER in os.path.basename(me):
+            os.unlink(me)
+    return 0
+
+
 def _hermes_gateway_alive() -> bool:
     """Is a Hermes gateway process live? Mirrors the kill side, which targets
     `hermes gateway` via pgrep -f, so the same pattern is the authoritative
@@ -3415,13 +3514,18 @@ def install_openclaw_agent(t: dict, args) -> int:
     code, qr, logpath, perr = spawn_detached_pair(pair_cmd, _pair_env())
     if not code:
         return agent_error("starting device pairing", perr or "no pairing code produced", stage_token="pair")
-    # 4. (Re)start the gateway so the channel goes live. It's a separate process,
-    #    so this can't kill the agent running us. Soft-fail — the code is already
-    #    valid; the user just needs the gateway up for messages to flow.
-    note = None
-    method = detect_restart_method()
-    if not (method and restart_gateway(method)):
-        note = ("the OpenClaw gateway didn't auto-start — have the user run "
+    # 4. (Re)start the gateway so the channel goes live — DETACHED + DEFERRED.
+    #    The OpenClaw agent (and THIS installer) run under the gateway, so a
+    #    synchronous in-place restart kills our own process before the pairing
+    #    block reaches the agent (observed: agent_success never arrived, the code
+    #    expired unrelayed, the gateway was left dead). Mirror the Hermes agent
+    #    flow: hand the restart to a detached worker that waits for pairing to
+    #    resolve, THEN bounces the gateway — so the agent relays the code first.
+    if _spawn_detached_openclaw_reload():
+        note = ("after your user pairs (or the code window ends) I restart the OpenClaw gateway "
+                "so it loads chat4000 — the bot may blip briefly at that moment")
+    else:
+        note = ("I couldn't schedule the gateway restart — have the user run "
                 "`openclaw gateway run` (or `docker restart openclaw-gateway`) so messages flow")
     _emit("installer_pkg_installed", {"plugin_package": OPENCLAW_PKG, "source": "github", "ref": oc_ref, "mode": "agent"})
     return agent_success("OpenClaw", code, qr, logpath, note, stage=_is_stage(args),
@@ -3710,7 +3814,16 @@ def main() -> int:
     parser.add_argument("--no-telemetry", action="store_true", help="disable PostHog + Sentry for this run")
     parser.add_argument("--installer-ref", default=None, help="(internal) ref install.sh fetched this installer from")
     parser.add_argument("--verbose", action="store_true", help="echo every subprocess command")
+    # Hidden: the detached OpenClaw gateway-reload worker (see
+    # _spawn_detached_openclaw_reload) re-invokes the installer with these.
+    parser.add_argument("--internal-openclaw-reload", dest="internal_openclaw_reload", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--reload-max-wait", dest="reload_max_wait", type=int, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    # Detached OpenClaw gateway-reload worker: do ONLY that (wait for pairing to
+    # resolve, then restart), short-circuiting all normal install/telemetry logic.
+    if args.internal_openclaw_reload:
+        return _run_openclaw_deferred_reload(int(args.reload_max_wait or GATEWAY_RELOAD_MAX_WAIT_S))
 
     global _AGENT_MODE, _AGENT_AUTODETECTED
     _AGENT_MODE = args.agent
