@@ -2162,7 +2162,7 @@ def wait_for_hermes_chat4000_ready(since_ts: float, timeout: float = READY_WAIT_
     return _spin_until(
         lambda: _hermes_ready_marker_fresh(since_ts),
         timeout,
-        "waiting for chat4000 to connect to the relay",
+        "restarting the gateway & loading chat4000 — can take a few min",
     )
 
 
@@ -2567,14 +2567,13 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
     # first would kill the agent relaying the code, so THAT flow stays pair-first
     # + detached event-driven reload.
     hdr("🔁 Restarting the Hermes gateway")
-    say("Starting the gateway so it loads chat4000.")
     # Capture the restart instant and clear the plugin's `ready` marker FIRST, so
     # its reappearance proves THIS boot connected (not a stale marker from before).
     restart_ts = time.time()
     _clear_hermes_ready_marker()
     restart_method = _hermes_restart_gateway(venv_bin)
     if restart_method:
-        ok("Gateway restarted — chat4000 is loading.")
+        ok("Gateway relaunched — chat4000 is booting now.")
         _emit("installer_gateway_restarted", {"method": restart_method})  # IN7
     else:
         warn("Could not restart the Hermes gateway automatically.")
@@ -2596,6 +2595,10 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
     # marker, which the adapter writes only after it connects to the relay. The
     # old check was just "process exists" (a false-ready) — the device could pair
     # into a gateway that hadn't loaded/connected chat4000 yet.
+    say(
+        f"Waiting for chat4000 to finish booting and connect to the relay — "
+        f"this can take a few minutes (up to ~{int(READY_WAIT_S // 60)} min on a busy agent)."
+    )
     if wait_for_hermes_chat4000_ready(restart_ts):
         ok("chat4000 connected to the relay — ready to pair.")
     else:
