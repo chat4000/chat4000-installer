@@ -1281,17 +1281,30 @@ def collect_hermes_stats(venv_bin: str) -> dict:
         stats["install_date"], stats["age_days"] = _install_date(venv_dir)
     except OSError:
         pass
-    # agent version
-    hermes_bin = Path(venv_bin) / "hermes"
-    if hermes_bin.exists():
-        try:
-            out = subprocess.run([str(hermes_bin), "--version"], capture_output=True, text=True, timeout=10)
-            blob = (out.stdout or out.stderr).strip()
-            if blob:
-                m = re.search(r"\b(\d+\.\d+\.\d+[\w.+-]*)", blob.splitlines()[0])
-                stats["agent_version"] = m.group(1) if m else blob.splitlines()[0]
-        except (OSError, subprocess.SubprocessError):
-            pass
+    # agent version — read the installed package metadata OFFLINE via the venv's
+    # python. `hermes --version` performs a NETWORK "update available" check
+    # (it prints e.g. "Update available: 1559 commits behind"), which stalls up
+    # to its timeout on a slow/blocked network. importlib.metadata reads the
+    # local *.dist-info only and never touches the network.
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        meta = subprocess.run(
+            [f"{venv_bin}/python", "-c",
+             "import importlib.metadata as m; print(m.version('hermes-agent'))"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if meta.returncode == 0 and meta.stdout.strip():
+            stats["agent_version"] = meta.stdout.strip()
+    # Fallback: if the metadata read failed, try `hermes --version` but with a
+    # SHORT timeout so the scan can never stall on its network update-check.
+    if stats["agent_version"] is None:
+        hermes_bin = Path(venv_bin) / "hermes"
+        if hermes_bin.exists():
+            with contextlib.suppress(OSError, subprocess.SubprocessError):
+                out = subprocess.run([str(hermes_bin), "--version"], capture_output=True, text=True, timeout=3)
+                blob = (out.stdout or out.stderr).strip()
+                if blob:
+                    m = re.search(r"\b(\d+\.\d+\.\d+[\w.+-]*)", blob.splitlines()[0])
+                    stats["agent_version"] = m.group(1) if m else blob.splitlines()[0]
 
     home = _hermes_home()
 
