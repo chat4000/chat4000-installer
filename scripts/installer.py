@@ -181,6 +181,47 @@ def _is_stage(args) -> bool:
 
 _STARTED_AT_MS = int(time.time() * 1000)
 
+
+# ─── File-only structured debug log (dbg) ──────────────────────────────────
+# A SECOND, structured view of the run that lands ONLY in the debug-log FILE
+# (never the terminal, in interactive OR detached runs) alongside the human
+# transcript. Every line carries a UTC millisecond wall-clock, the delta since
+# the previous dbg line, and T+ elapsed-since-start — so the file reads as a
+# profiled timeline. Wired into the print helpers (say/ok/warn/err/hdr), _emit,
+# the readiness polls, and the install decision points. Best-effort throughout:
+# logging must NEVER break an install, so dbg swallows every error.
+_DBG_FILE = None  # set by _setup_tmp_debug_log; a line-buffered append handle.
+_DBG_LAST_MS = _STARTED_AT_MS
+
+
+def _dbg_ts(now_ms: int) -> str:
+    """UTC wall-clock with milliseconds for `now_ms` (epoch ms), e.g.
+    2026-06-26T11:15:57.402Z. Uses only `time` (no datetime dependency)."""
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now_ms // 1000)) + f".{now_ms % 1000:03d}Z"
+
+
+def dbg(msg: str, level: str = "dbg") -> None:
+    """Write ONE timestamped record to the structured debug-log FILE only — never
+    to the terminal, in any run mode. Carries UTC ms wall-clock, the delta since
+    the previous dbg line, and T+elapsed-since-start. Best-effort: a logging
+    failure must never abort an install, so all errors are swallowed."""
+    global _DBG_LAST_MS
+    f = _DBG_FILE
+    if f is None:
+        return
+    try:
+        now_ms = int(time.time() * 1000)
+        delta = (now_ms - _DBG_LAST_MS) / 1000.0
+        _DBG_LAST_MS = now_ms
+        since = (now_ms - _STARTED_AT_MS) / 1000.0
+        ts = _dbg_ts(now_ms)
+        for line in _ANSI_RE.sub("", str(msg)).split("\n"):
+            f.write(f"{ts} d+{delta:7.3f} T+{since:8.3f} [{level:<6}] {line}\n")
+        f.flush()
+    except (OSError, ValueError):
+        pass
+
+
 # ─── ANSI ─────────────────────────────────────────────────────────────────
 
 if sys.stdout.isatty():
@@ -211,30 +252,35 @@ _AGENT_AUTODETECTED: Optional[str] = None
 
 
 def say(msg: str) -> None:
+    dbg(msg, level="say")
     if _AGENT_MODE:
         return
     print(f"{C_CYN}>{C_RST} {msg}")
 
 
 def ok(msg: str) -> None:
+    dbg(msg, level="ok")
     if _AGENT_MODE:
         return
     print(f"{C_GRN}✓{C_RST} {msg}")
 
 
 def warn(msg: str) -> None:
+    dbg(msg, level="warn")
     if _AGENT_MODE:
         return
     print(f"{C_YEL}⚠{C_RST} {msg}")
 
 
 def err(msg: str) -> None:
+    dbg(msg, level="err")
     if _AGENT_MODE:
         return
     print(f"{C_RED}✗{C_RST} {msg}", file=sys.stderr)
 
 
 def hdr(msg: str) -> None:
+    dbg(msg, level="phase")
     if _AGENT_MODE:
         return
     line = "━" * 63
@@ -498,6 +544,10 @@ def _emit(event: str, props: Optional[dict] = None, *, distinct_id: Optional[str
     never raises, scrubs home/username paths from props. distinct_id defaults to
     the current machine id — env_id before a target is selected, the target's
     agent_install_id after (BA5)."""
+    # Mirror EVERY analytics event into the debug log (file-only), regardless of
+    # whether telemetry is disabled — the local log is independent of PostHog and
+    # this gives a complete, timestamped event timeline for forensics.
+    dbg(f"{event}  {props if props else {}}", level="event")
     if _TELEMETRY_DISABLED:
         return
     enriched = _base_props()
@@ -1526,6 +1576,7 @@ def _run_streaming(cmd: list, *, quiet: bool, cwd: Optional[str] = None) -> tupl
     """Run cmd with stdout+stderr merged, echoing lines unless quiet.
     Returns (returncode, full_output)."""
     say(f"$ {' '.join(cmd)}")
+    _t0 = time.time()
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, cwd=cwd)
     buf: list = []
     if proc.stdout is not None:
@@ -1534,7 +1585,13 @@ def _run_streaming(cmd: list, *, quiet: bool, cwd: Optional[str] = None) -> tupl
                 sys.stdout.write(line)
                 sys.stdout.flush()
             buf.append(line)
-    return proc.wait(), "".join(buf)
+    rc = proc.wait()
+    # B2: record exit code + wall-clock duration to the debug log (the streamed
+    # output itself was captured above; this profiles it). File-only.
+    dbg(f"exit={rc} dur={time.time() - _t0:.2f}s :: {' '.join(cmd)}", level="run")
+    if quiet and buf:
+        dbg("captured output (quiet run):\n" + "".join(buf).rstrip(), level="run")
+    return rc, "".join(buf)
 
 
 def _openclaw_prepare_checkout(checkout: str, *, quiet: bool) -> Optional[str]:
@@ -2025,6 +2082,11 @@ def _spin_until(check, timeout: float, status: str) -> bool:
     started = time.time()
     is_tty = sys.stdout.isatty()
     frame_idx = 0
+    # B1: the spinner shows nothing on disk — log the wait's start, a throttled
+    # heartbeat (~every 5s, so a 210s wait is ~42 lines not thousands), and the
+    # outcome, all file-only.
+    dbg(f"wait start: {status} (cap {int(timeout)}s)", level="wait")
+    last_log = started
     if is_tty:
         print()
     while time.time() < deadline:
@@ -2033,9 +2095,14 @@ def _spin_until(check, timeout: float, status: str) -> bool:
                 if is_tty:
                     sys.stdout.write("\r" + " " * 100 + "\r")
                     sys.stdout.flush()
+                dbg(f"ready: {status} after {time.time() - started:.1f}s", level="wait")
                 return True
         except (OSError, ValueError):
             pass
+        now = time.time()
+        if now - last_log >= 5.0:
+            dbg(f"waiting: {status} — {int(now - started)}s/{int(timeout)}s elapsed", level="wait")
+            last_log = now
         if is_tty:
             elapsed = int(time.time() - started)
             frame = SPINNER_FRAMES[frame_idx % len(SPINNER_FRAMES)]
@@ -2048,6 +2115,7 @@ def _spin_until(check, timeout: float, status: str) -> bool:
     if is_tty:
         sys.stdout.write("\r" + " " * 100 + "\r")
         sys.stdout.flush()
+    dbg(f"TIMEOUT: {status} after {int(timeout)}s — never became ready", level="wait")
     return False
 
 
@@ -2166,6 +2234,10 @@ def wait_for_chat4000_connected(since_ts: float, timeout: float = READY_WAIT_S) 
     started = time.time()
     is_tty = sys.stdout.isatty()
     frame_idx = 0
+    # B1: file-only start/heartbeat/outcome, including the coarse gateway-log
+    # phase so the debug log shows WHERE in boot the wait is sitting.
+    dbg(f"wait start: chat4000 relay-connect (cap {int(timeout)}s)", level="wait")
+    last_log = started
     if is_tty:
         print()
     while time.time() < deadline:
@@ -2173,7 +2245,12 @@ def wait_for_chat4000_connected(since_ts: float, timeout: float = READY_WAIT_S) 
             if is_tty:
                 sys.stdout.write("\r" + " " * 100 + "\r")
                 sys.stdout.flush()
+            dbg(f"ready: chat4000 connected to the relay after {time.time() - started:.1f}s", level="wait")
             return True
+        now = time.time()
+        if now - last_log >= 5.0:
+            dbg(f"waiting: relay-connect — phase='{_status()}' — {int(now - started)}s/{int(timeout)}s", level="wait")
+            last_log = now
         if is_tty:
             elapsed = int(time.time() - started)
             frame = SPINNER_FRAMES[frame_idx % len(SPINNER_FRAMES)]
@@ -2186,6 +2263,7 @@ def wait_for_chat4000_connected(since_ts: float, timeout: float = READY_WAIT_S) 
     if is_tty:
         sys.stdout.write("\r" + " " * 100 + "\r")
         sys.stdout.flush()
+    dbg(f"TIMEOUT: chat4000 relay-connect after {int(timeout)}s — phase='{_status()}'", level="wait")
     return False
 
 
@@ -2291,6 +2369,12 @@ def _print_target_row(idx: int, t: dict) -> None:
     if ch:
         shown = ", ".join(ch[:8]) + (" …" if len(ch) > 8 else "")
         print(f"      {C_DIM}↳ {shown}{C_RST}")
+    # B5: capture the scan row in the debug log (the human row uses raw print()).
+    dbg(
+        f"target[{idx}] {kind} {t.get('display')} ver={ver} installed={date}({age_s}) "
+        f"channels={chans_s} sessions={sess_s} chat4000_plugin={plug_s}",
+        level="scan",
+    )
 
 
 def _emit_agent_detected(t: dict) -> None:
@@ -2516,8 +2600,11 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
     if args.stage:
         pair_cmd.append("--stage")
     pair_cmd += _pair_flag_args(args)
+    dbg(f"pairing: launching interactive {' '.join(pair_cmd)}", level="pair")
+    _pair_t0 = time.time()
     try:
         pair_rc = subprocess.run(pair_cmd).returncode
+        dbg(f"pairing: exited rc={pair_rc} after {time.time() - _pair_t0:.1f}s", level="pair")
     except KeyboardInterrupt:
         print()
         warn("Pairing cancelled. Pair a device any time:")
@@ -2818,7 +2905,10 @@ def _double_run_guard_disabled() -> bool:
     """True only when the test-only CHAT4000_NO_DOUBLE_RUN_GUARD env var is set
     truthy. Used to bypass the BUG2 double-run marker on test boxes; in production
     the var is unset and the marker is always honoured."""
-    return os.environ.get(NO_DOUBLE_RUN_GUARD_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+    disabled = os.environ.get(NO_DOUBLE_RUN_GUARD_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+    if disabled:
+        dbg(f"double-run guard DISABLED via {NO_DOUBLE_RUN_GUARD_ENV} (test-only — never in prod)", level="decide")
+    return disabled
 # v2 plugins print a universal https link; v1 printed a chat4000:// deep link.
 _QR_RE = re.compile(r"(chat4000://pair\?\S+|https://pair\.chat4000\.com/\?\S+)")
 _CODE_IN_URI_RE = re.compile(r"[?&]code=(\d+)")
@@ -3619,10 +3709,13 @@ def _fresh_agent_run_marker() -> Optional[dict]:
         with contextlib.suppress(OSError):
             Path(AGENT_RUN_MARKER).unlink()
         return None
-    if time.time() - ts > AGENT_RUN_MARKER_TTL_S:
+    age = int(time.time() - ts)
+    if age > AGENT_RUN_MARKER_TTL_S:
+        dbg(f"agent-run marker STALE (age {age}s > TTL {AGENT_RUN_MARKER_TTL_S}s) — removing, run proceeds", level="decide")
         with contextlib.suppress(OSError):
             Path(AGENT_RUN_MARKER).unlink()  # stale: let this run proceed normally
         return None
+    dbg(f"agent-run marker FRESH (age {age}s < TTL {AGENT_RUN_MARKER_TTL_S}s) — re-invocation will short-circuit", level="decide")
     return data
 
 
@@ -3836,10 +3929,19 @@ def main() -> int:
             args.agent = True
             _AGENT_MODE = True
             _AGENT_AUTODETECTED = inferred
+            dbg(f"agent caller inferred from process ancestry: {inferred} — flipping to agent mode", level="decide")
 
     # IN5: resolve env_id up front; distinct_id starts as env_id for the
     # pre-target-selection events (BA5).
     init_ids()
+    dbg(
+        f"resolved config: agent_mode={_AGENT_MODE} autodetected={_AGENT_AUTODETECTED} "
+        f"stage={getattr(args, 'stage', None)} no_pair={getattr(args, 'no_pair', None)} "
+        f"scan_only={getattr(args, 'scan_only', None)} target={getattr(args, 'target', None)} "
+        f"branch={getattr(args, 'branch', None)} latest={getattr(args, 'latest', None)} "
+        f"installer_ref={getattr(args, 'installer_ref', None)}",
+        level="decide",
+    )
 
     if args.stage:
         os.environ["CHAT4000_ENV"] = "stage"
@@ -3967,14 +4069,39 @@ def _setup_tmp_debug_log() -> None:
                 f"[installer.py] started {time.strftime('%Y-%m-%dT%H:%M:%S')} "
                 f"pid={os.getpid()} argv={sys.argv[1:]}\n"
             )
-    if os.environ.get("CHAT4000_BOOT_TEE") == "1":
-        return  # install.sh already mirrors bash+python into `path`.
+    # Open ONE line-buffered append handle to the log file and use it for BOTH the
+    # stdout/stderr mirror AND the structured dbg() log. This handle is what makes
+    # dbg() work in EVERY mode: in BOOT_TEE runs install.sh already tees stdout into
+    # `path`, so we do NOT wrap stdout (that would double-write the human transcript),
+    # but we still keep _DBG_FILE so the timestamped dbg() lines land in the file.
+    global _DBG_FILE
     try:
         f = open(path, "a", buffering=1, encoding="utf-8", errors="replace")
     except OSError:
         return
-    sys.stdout = _Tee(sys.stdout, f, strip_ansi=True)
-    sys.stderr = _Tee(sys.stderr, f, strip_ansi=True)
+    _DBG_FILE = f
+    if os.environ.get("CHAT4000_BOOT_TEE") != "1":
+        sys.stdout = _Tee(sys.stdout, f, strip_ansi=True)
+        sys.stderr = _Tee(sys.stderr, f, strip_ansi=True)
+    _dbg_session_header()
+
+
+def _dbg_session_header() -> None:
+    """B7: a one-time environment fingerprint at the top of the debug log, so every
+    log is self-describing (version, interpreter, OS, key tool paths, env). File-only."""
+    dbg("──── chat4000 installer debug session ────", level="hdr")
+    dbg(f"installer_version={INSTALLER_VERSION}  pid={os.getpid()}  argv={sys.argv[1:]}", level="env")
+    dbg(f"python={sys.version.split()[0]}  platform={sys.platform}  arch={platform.machine() or '?'}", level="env")
+    euid = os.geteuid() if hasattr(os, "geteuid") else "?"
+    dbg(f"cwd={os.getcwd()}  euid={euid}  log={_TMP_LOG_PATH}", level="env")
+    for tool in ("uv", "npm", "openclaw", "hermes", "docker", "git"):
+        dbg(f"tool {tool}: {shutil.which(tool) or 'NOT FOUND'}", level="env")
+    dbg(
+        f"env CHAT4000_ENV={os.environ.get('CHAT4000_ENV', '')!r} "
+        f"BOOT_TEE={os.environ.get('CHAT4000_BOOT_TEE', '')!r} "
+        f"TELEMETRY_DISABLED={os.environ.get('CHAT4000_TELEMETRY_DISABLED', '')!r}",
+        level="env",
+    )
 
 
 def _entry() -> int:
