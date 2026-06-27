@@ -3386,18 +3386,26 @@ def _reuse_live_pair() -> Optional[tuple]:
 def spawn_detached_pair(cmd: list, env: dict) -> tuple:
     """Start the pair command DETACHED (own session, output → a /tmp log), then
     tail the log until it prints the pairing code + QR. Returns
-    (code, qr_uri, logpath, error). On success the child keeps running (polling
-    the registrar for the rest of its TTL) after we return — we never wait on it,
-    which is the whole point: this process exits while pairing continues."""
+    (code, qr_uri, logpath, error, pair_pid). On success the child keeps running
+    (polling the registrar for the rest of its TTL) after we return — we never
+    wait on it, which is the whole point: this process exits while pairing
+    continues.
+
+    pair_pid is the detached pair process's PID (None when a live watcher was
+    reused or no child was spawned). The OpenClaw deferred reload waits on THIS
+    exact pid (kill -0) rather than `pgrep -f "chat4000 pair"`: OpenClaw renames
+    its live processes via process.title (the pair process shows up as bare
+    `openclaw`, never "chat4000 pair"), so the argv pattern never matches it and
+    the reload would otherwise fire immediately and kill the relaying agent."""
     reused = _reuse_live_pair()
     if reused:
-        return reused
+        return (*reused, None)
     _kill_stale_pair_watchers()
     logpath = f"/tmp/chat4000-pair-{uuid.uuid4().hex[:8]}.log"
     try:
         logf = open(logpath, "ab")  # noqa: SIM115  # handed to the child; we close our copy below
     except OSError as exc:
-        return (None, None, None, f"could not open pairing log {logpath}: {exc}")
+        return (None, None, None, f"could not open pairing log {logpath}: {exc}", None)
 
     try:
         proc = subprocess.Popen(
@@ -3411,7 +3419,7 @@ def spawn_detached_pair(cmd: list, env: dict) -> tuple:
         )
     except (OSError, subprocess.SubprocessError) as exc:
         logf.close()
-        return (None, None, logpath, f"could not start pairing: {exc}")
+        return (None, None, logpath, f"could not start pairing: {exc}", None)
     logf.close()  # the child holds its own copy of the fd
 
     deadline = time.time() + PAIR_EMIT_TIMEOUT
@@ -3433,20 +3441,20 @@ def spawn_detached_pair(cmd: list, env: dict) -> tuple:
         # Prefer the full QR+code (the QR line carries the code). The plain
         # "Pairing code:" line is a fallback if the child exits/times out first.
         if qr and code:
-            return (code, qr, logpath, None)
+            return (code, qr, logpath, None, proc.pid)
         lm = _CODE_LINE_RE.search(text)
         if lm:
             last_code = lm.group(1).replace(" ", "")
         rc = proc.poll()
         if rc is not None:
             if last_code:
-                return (last_code, qr, logpath, None)
+                return (last_code, qr, logpath, None, proc.pid)
             tail = _scrub_secrets(text.strip())[-800:]
-            return (None, qr, logpath, tail or f"pairing exited ({rc}) before printing a code")
+            return (None, qr, logpath, tail or f"pairing exited ({rc}) before printing a code", proc.pid)
         time.sleep(0.2)
     if last_code:
-        return (last_code, None, logpath, None)
-    return (None, None, logpath, f"pairing didn't print a code within {int(PAIR_EMIT_TIMEOUT)}s (log: {logpath})")
+        return (last_code, None, logpath, None, proc.pid)
+    return (None, None, logpath, f"pairing didn't print a code within {int(PAIR_EMIT_TIMEOUT)}s (log: {logpath})", proc.pid)
 
 
 def _hermes_gateway_reload_sh(hermes_bin: str) -> str:
@@ -3526,7 +3534,12 @@ OPENCLAW_RELOAD_MARKER = "chat4000-ocreload"  # in the detached reloader's filen
 
 def _wait_pair_watcher_resolved(max_wait: int) -> None:
     """Block until the detached `chat4000 pair` watcher exits — device redeemed or
-    the code window expired — capped at `max_wait`s. Polls every 5s."""
+    the code window expired — capped at `max_wait`s. Polls every 5s.
+
+    FALLBACK ONLY (no known pair pid): matches the watcher by its argv. This is
+    RELIABLE for Hermes (its command is literally `chat4000 pair`) but a NO-OP for
+    OpenClaw, whose process.title rename hides the "chat4000 pair" substring — so
+    the OpenClaw path passes an explicit pid and uses _wait_pair_pid_resolved."""
     deadline = time.time() + max_wait
     while time.time() < deadline:
         with contextlib.suppress(OSError, subprocess.SubprocessError):
@@ -3535,7 +3548,28 @@ def _wait_pair_watcher_resolved(max_wait: int) -> None:
         time.sleep(5)
 
 
-def _spawn_detached_openclaw_reload(max_wait: int = GATEWAY_RELOAD_MAX_WAIT_S) -> bool:
+def _wait_pair_pid_resolved(pid: int, max_wait: int) -> None:
+    """Block until the detached pair process `pid` is done — device redeemed or the
+    code window expired — capped at `max_wait`s. Polls every 5s.
+
+    Waits on the EXACT pid (kill -0) instead of an argv pattern, so it is immune
+    to OpenClaw's process-title rename that defeats `pgrep -f "chat4000 pair"`
+    (the live pair process shows up as bare `openclaw`). Without this the reload
+    fired ~immediately and killed the agent before it relayed the code (observed
+    live on oc-9). A ZOMBIE counts as resolved: container PID 1 often does not
+    reap, so a finished pair child can linger defunct while kill -0 still
+    succeeds — _pid_is_zombie catches that so we don't stall the full max_wait."""
+    dbg(f"reload: waiting on pair pid {pid} (cap {int(max_wait)}s)", level="wait")
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
+        if not _pid_alive(pid) or _pid_is_zombie(pid):
+            dbg(f"reload: pair pid {pid} resolved after {int(max_wait - (deadline - time.time()))}s", level="wait")
+            return
+        time.sleep(5)
+    dbg(f"reload: pair pid {pid} still alive at cap {int(max_wait)}s — proceeding to restart", level="wait")
+
+
+def _spawn_detached_openclaw_reload(max_wait: int = GATEWAY_RELOAD_MAX_WAIT_S, pair_pid: Optional[int] = None) -> bool:
     """OpenClaw analog of _spawn_detached_gateway_reload. The OpenClaw AGENT runs
     UNDER the gateway, so restarting it SYNCHRONOUSLY in-process (the old agent
     flow) kills the very gateway — and this installer process — before the pairing
@@ -3555,9 +3589,13 @@ def _spawn_detached_openclaw_reload(max_wait: int = GATEWAY_RELOAD_MAX_WAIT_S) -
         shutil.copyfile(src, copy)
     except OSError:
         return False
+    worker_cmd = [sys.executable, copy, "--internal-openclaw-reload", "--reload-max-wait", str(int(max_wait))]
+    if pair_pid:
+        # Wait on the EXACT pair pid (rename-proof) instead of the argv pattern.
+        worker_cmd += ["--pair-pid", str(int(pair_pid))]
     try:
         subprocess.Popen(
-            [sys.executable, copy, "--internal-openclaw-reload", "--reload-max-wait", str(int(max_wait))],
+            worker_cmd,
             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
             start_new_session=True,  # survives our exit AND the gateway it bounces
             close_fds=True, env=_pair_env(),
@@ -3569,11 +3607,18 @@ def _spawn_detached_openclaw_reload(max_wait: int = GATEWAY_RELOAD_MAX_WAIT_S) -
         return False
 
 
-def _run_openclaw_deferred_reload(max_wait: int) -> int:
+def _run_openclaw_deferred_reload(max_wait: int, pair_pid: Optional[int] = None) -> int:
     """Body of the detached --internal-openclaw-reload worker: wait for pairing to
     resolve, restart the gateway (docker/supervisor-aware), then delete our own
-    copied script. Best-effort; always returns 0."""
-    _wait_pair_watcher_resolved(max_wait)
+    copied script. Best-effort; always returns 0.
+
+    Prefer waiting on the exact pair pid (rename-proof — OpenClaw's process.title
+    rename defeats the argv-pattern pgrep). Fall back to the argv-pattern wait only
+    when no pid was passed (older caller / reused live pair)."""
+    if pair_pid:
+        _wait_pair_pid_resolved(pair_pid, max_wait)
+    else:
+        _wait_pair_watcher_resolved(max_wait)
     method = detect_restart_method()
     if method:
         restart_gateway(method)
@@ -3681,7 +3726,7 @@ def install_openclaw_agent(t: dict, args) -> int:
         # SERVICE_TOKEN" even right after a successful setup.
         pair_cmd += ["--service-token", args.service_token]
     pair_cmd += _pair_flag_args(args)
-    code, qr, logpath, perr = spawn_detached_pair(pair_cmd, _pair_env())
+    code, qr, logpath, perr, pair_pid = spawn_detached_pair(pair_cmd, _pair_env())
     if not code:
         return agent_error("starting device pairing", perr or "no pairing code produced", stage_token="pair")
     # 4. (Re)start the gateway so the channel goes live — DETACHED + DEFERRED.
@@ -3691,7 +3736,7 @@ def install_openclaw_agent(t: dict, args) -> int:
     #    expired unrelayed, the gateway was left dead). Mirror the Hermes agent
     #    flow: hand the restart to a detached worker that waits for pairing to
     #    resolve, THEN bounces the gateway — so the agent relays the code first.
-    if _spawn_detached_openclaw_reload():
+    if _spawn_detached_openclaw_reload(pair_pid=pair_pid):
         note = ("after your user pairs (or the code window ends) I restart the OpenClaw gateway "
                 "so it loads chat4000 — the bot may blip briefly at that moment")
     else:
@@ -3741,7 +3786,7 @@ def install_hermes_agent(t: dict, args) -> int:
     if args.stage:
         pair_cmd.append("--stage")
     pair_cmd += _pair_flag_args(args)
-    code, qr, logpath, perr = spawn_detached_pair(pair_cmd, _pair_env())
+    code, qr, logpath, perr, _pair_pid = spawn_detached_pair(pair_cmd, _pair_env())
     if not code:
         return agent_error("starting device pairing", perr or "no pairing code produced", stage_token="pair")
     # 5. PROACTIVELY (re)start the gateway so it LOADS chat4000. Hermes discovers
@@ -3992,12 +4037,16 @@ def main() -> int:
     # _spawn_detached_openclaw_reload) re-invokes the installer with these.
     parser.add_argument("--internal-openclaw-reload", dest="internal_openclaw_reload", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--reload-max-wait", dest="reload_max_wait", type=int, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--pair-pid", dest="pair_pid_wait", type=int, default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     # Detached OpenClaw gateway-reload worker: do ONLY that (wait for pairing to
     # resolve, then restart), short-circuiting all normal install/telemetry logic.
     if args.internal_openclaw_reload:
-        return _run_openclaw_deferred_reload(int(args.reload_max_wait or GATEWAY_RELOAD_MAX_WAIT_S))
+        return _run_openclaw_deferred_reload(
+            int(args.reload_max_wait or GATEWAY_RELOAD_MAX_WAIT_S),
+            pair_pid=args.pair_pid_wait,
+        )
 
     global _AGENT_MODE, _AGENT_AUTODETECTED
     _AGENT_MODE = args.agent
