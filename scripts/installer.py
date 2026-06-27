@@ -2716,6 +2716,11 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
         setup_cmd += ["--env", args.env]
     if args.service_token:
         setup_cmd += ["--service-token", args.service_token]
+    if getattr(args, "debug", False):
+        # --debug: persist runtime-log-level=debug so the gateway runtime writes
+        # DEBUG timing breadcrumbs (message ingest, read-receipt + status send) to
+        # ~/.openclaw/plugins/chat4000/logs/runtime.log.
+        setup_cmd += ["--runtime-log-level", "debug"]
 
     do_pair = interactive and not args.no_pair
     hdr("🔑 Setting up the plugin (bot + user + rooms)")
@@ -2787,6 +2792,8 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
             pair_cmd.append("--stage")
         elif args.env:
             pair_cmd += ["--env", args.env]
+        if getattr(args, "debug", False):
+            pair_cmd += ["--runtime-log-level", "debug"]
         if args.service_token:
             # setup persists provisioning.url but NOT the token, and `pair`
             # talks to the registrar itself (same reason as the agent flow).
@@ -3921,6 +3928,7 @@ def main() -> int:
     parser.add_argument("--pair-ttl", dest="pair_ttl", type=int, default=None, metavar="SECONDS", help="pairing-code lifetime in seconds, up to 63072000 (the 2-year cap; default: server config, normally 300). A long-lived code is a standing credential — prefer the shortest TTL that works")
     parser.add_argument("--reusable", action="store_true", help="make the pairing code REUSABLE: it can be redeemed many times until it expires, each redeem adding another device (fleet enrollment; default codes are single-use)")
     parser.add_argument("--no-telemetry", action="store_true", help="disable PostHog + Sentry for this run")
+    parser.add_argument("--debug", action="store_true", help="(openclaw) debug install: forward --runtime-log-level debug to the plugin so the gateway runtime writes DEBUG timing breadcrumbs (message ingest, read-receipt + status send) to ~/.openclaw/plugins/chat4000/logs/runtime.log")
     parser.add_argument("--installer-ref", default=None, help="(internal) ref install.sh fetched this installer from")
     parser.add_argument("--verbose", action="store_true", help="echo every subprocess command")
     # Hidden: the detached OpenClaw gateway-reload worker (see
