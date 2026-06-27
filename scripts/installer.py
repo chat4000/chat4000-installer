@@ -2792,8 +2792,9 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
             pair_cmd.append("--stage")
         elif args.env:
             pair_cmd += ["--env", args.env]
-        if getattr(args, "debug", False):
-            pair_cmd += ["--runtime-log-level", "debug"]
+        # NOTE: --runtime-log-level is a `setup`/`wizard` option, NOT a `pair`
+        # option — `pair` rejects it ("does not recognize option"). The runtime
+        # log level is persisted by `setup` above, so pairing needs nothing here.
         if args.service_token:
             # setup persists provisioning.url but NOT the token, and `pair`
             # talks to the registrar itself (same reason as the agent flow).
