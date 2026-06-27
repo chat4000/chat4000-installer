@@ -2991,6 +2991,38 @@ def _ttl_human(seconds: int) -> str:
     return f"{seconds} seconds"
 
 
+def _download_to_tmp(url: str, prefix: str, ext: str) -> Optional[str]:
+    """Best-effort download `url` to a /tmp file; return its local path (or None
+    on any failure → caller falls back to the remote ![](url) form).
+
+    Why local files for Hermes: Hermes' DEFAULT streaming reply path DROPS remote
+    image URLs — gateway/run.py::_deliver_media_from_response extracts ![](http…)
+    only to strip it from the text and NEVER sends it (verified in hermes-agent
+    0.17.0), so a GIF/QR referenced by URL never arrives as a real Telegram image
+    (a live run showed the GIF only via Telegram's link-preview and NO QR at all).
+    It DOES, however, deliver LOCAL files named by a `MEDIA:<path>` directive: the
+    stream consumer strips the directive from the visible text, then Hermes sends
+    the file natively (gif→send_animation, png→send_photo). So for the Hermes
+    agent relay we fetch the assets to /tmp and hand the agent `MEDIA:/tmp/…`
+    lines. Freshly-written /tmp files pass the host's media-delivery validation
+    (non-strict default; not on the credential/system denylist)."""
+    if not url:
+        return None
+    try:
+        path = f"/tmp/{prefix}-{uuid.uuid4().hex[:8]}{ext}"
+        with urllib.request.urlopen(url, timeout=15) as resp:  # noqa: S310  # first-party chat4000 asset
+            data = resp.read()
+        if not data:
+            return None
+        with open(path, "wb") as fh:
+            fh.write(data)
+        dbg(f"downloaded media for relay: {url} -> {path} ({len(data)} bytes)", level="pair")
+        return path
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
+        dbg(f"media download failed ({url}): {exc} — falling back to ![](url)", level="pair")
+        return None
+
+
 def agent_success(
     kind: str,
     code: str,
@@ -3008,11 +3040,23 @@ def agent_success(
     code_disp = f"{code[:3]}-{code[3:]}" if (code and len(code) == 6 and code.isdigit()) else code
     pair_url = f"https://pair.chat4000.com/?code={code}" if code else None
     # First-party QR-image endpoint (the registrar, per-env): returns a PNG QR for
-    # this code. The agent posts it as image-markdown → Telegram renders a clean,
-    # scannable image (the old ASCII QR was unscannable in Telegram).
+    # this code.
     qr_img_url = _qr_image_url(code, stage) if code else None
+    # Media delivery differs by host. OpenClaw renders remote image-markdown, so it
+    # keeps ![](url). Hermes' default STREAMING reply path DROPS remote image URLs
+    # (see _download_to_tmp) — exactly why a live run showed the GIF only via
+    # Telegram's link-preview and NO QR. So for Hermes we download both assets to
+    # /tmp and hand the agent `MEDIA:/tmp/…` directive lines, which Hermes delivers
+    # as native images. URL form stays the fallback if a download fails.
     gif_line = f"![]({CELEBRATION_GIF_URL})"
     qr_line = f"![]({qr_img_url})" if qr_img_url else "(QR unavailable — use the code or link above)"
+    if kind == "Hermes":
+        _gif_media = _download_to_tmp(CELEBRATION_GIF_URL, "chat4000-celebration", ".gif")
+        _qr_media = _download_to_tmp(qr_img_url, "chat4000-qr", ".png")
+        if _gif_media:
+            gif_line = f"MEDIA:{_gif_media}"
+        if _qr_media:
+            qr_line = f"MEDIA:{_qr_media}"
     lines = [
         "[chat4000 installer → agent]  👋 Hi again — the chat4000 installer your user asked for.",
         "Good news: the install + pairing setup ALREADY SUCCEEDED — that is the ONLY",
@@ -3024,33 +3068,33 @@ def agent_success(
         "",
     ]
     if kind == "Hermes":
-        # Hermes mechanic (THE thing that makes agents fail here): an agent turn
-        # produces exactly ONE reply, and the gateway AUTOMATICALLY splits that
-        # reply's image-markdown into separate Telegram messages, in markdown
-        # order — GIF image, then the text, then the QR image. So the fix for the
-        # real-world "only the GIF went out, user never got the code" failure is
-        # NOT "send three times" (you can't — you get one reply): it is "put all
-        # three INTO your single reply, in order." An agent that replied with just
-        # the GIF "to send the rest next" ended its turn and lost the code forever
-        # (hermes-test-94, and again live). Do NOT do that.
+        # Hermes media mechanic: the celebration GIF and the QR are delivered as
+        # LOCAL-file attachment directives (`MEDIA:/tmp/…`), NOT image-markdown.
+        # Hermes' default streaming reply path DROPS remote ![](url) images (it
+        # strips them and never sends them — verified in hermes-agent 0.17.0),
+        # which is why a live run showed the GIF only as a Telegram link-preview
+        # and no QR at all. A `MEDIA:<path>` line is different: the stream consumer
+        # strips it from the visible text and Hermes delivers that local file
+        # natively as a real image (gif→animation, png→photo). So the agent just
+        # pastes the two MEDIA lines verbatim into its single reply; Hermes turns
+        # them into the actual GIF + QR images on its own.
         lines += [
             "HOW TO DELIVER (read carefully — this is where agents get it wrong): you get",
-            "exactly ONE reply this turn, and the gateway AUTOMATICALLY splits it into",
-            "separate messages for you. So put ALL THREE of the parts below into your",
-            "SINGLE reply, in EXACTLY this order — the gateway then sends them as three",
-            "separate messages on its own:",
-            "  1. the GIF image-markdown — FIRST, on its own line",
+            "exactly ONE reply this turn. Put ALL THREE parts below into that SINGLE reply:",
+            "  1. a GIF attachment directive line  (looks like  MEDIA:/tmp/…gif)",
             "  2. the pairing text (link + code)",
-            "  3. the QR image-markdown — LAST, on its own line",
+            "  3. a QR  attachment directive line  (looks like  MEDIA:/tmp/…png)",
             "",
-            "Each image must be on its OWN line — that is what makes the gateway send it as",
-            "its own image message. You do NOT send three times and you do NOT pause between",
-            "them; you write ONE reply containing all three, and the gateway does the rest.",
+            "The two attachment-directive lines are LITERAL: paste each EXACTLY as given",
+            "below, each on its OWN line. Do NOT alter them, do NOT wrap them in backticks,",
+            "do NOT turn them into markdown images or links, do NOT post any URL. Hermes",
+            "strips those directive lines from what the user sees and delivers each as a",
+            "real inline image automatically — the GIF and the QR both arrive as pictures.",
             "",
             "❌ DO NOT reply with ONLY the GIF and stop. On real runs the agent's whole reply",
             "was just the GIF and the user NEVER got the pairing code — a FAILURE. There is",
             "NO second turn to 'send the rest'; if the code/QR aren't in THIS reply, they are",
-            "lost. All three parts go in this one reply, in order.",
+            "lost. All three parts go in this one reply.",
             "After this reply you produce NOTHING ELSE about this install — not in any later",
             "turn, heartbeat, or status/'unfinished tool' check — until the USER asks. ANY",
             "other output about this run, at ANY time, is a FAILURE.",
@@ -3107,11 +3151,12 @@ def agent_success(
             "",
         ]
         lines += [
-            "═══ ALL THREE PARTS GO IN YOUR ONE REPLY, IN THIS ORDER ═══",
-            "═══ PART 1 — the GIF image, FIRST, on its own line: ═══",
+            "═══ ALL THREE PARTS GO IN YOUR ONE REPLY ═══",
+            "═══ PART 1 — the GIF attachment directive. Paste this line EXACTLY, on its own",
+            "    line, unchanged (do NOT convert it to a link or markdown): ═══",
             gif_line,
             "",
-            "═══ PART 2 — the pairing text, right after the GIF. Exactly this text + structure: ═══",
+            "═══ PART 2 — the pairing text. Exactly this text + structure: ═══",
         ]
     else:
         lines += [
@@ -3132,13 +3177,21 @@ def agent_success(
         f"{code_disp}",
         "═══════════════════════════════════════════════════════════",
         "",
-        "Quiet formatting rules for MESSAGE 2 (apply them, don't show them to the user):",
+        "Quiet formatting rules for the pairing text (apply them, don't show them to the user):",
         f"• Post the link {pair_url} as a real tappable URL — never in backticks/code span.",
         f"• The link's code is the raw 6 digits ({code}), NO dash — even though you show the",
         f"  pairing code dashed as {code_disp}. Never alter the code inside the link.",
-        "• Post the QR as image-markdown ![](url) so it renders as an image. Do NOT also",
-        "  write the QR url as plain text — the image only.",
     ]
+    if kind == "Hermes":
+        lines += [
+            "• The GIF and QR are delivered by the two MEDIA: directive lines — paste each",
+            "  verbatim on its own line. Do NOT post any image-markdown or URL for them.",
+        ]
+    else:
+        lines += [
+            "• Post the QR as image-markdown ![](url) so it renders as an image. Do NOT also",
+            "  write the QR url as plain text — the image only.",
+        ]
     # Wording guard: a custom --pair-ttl / --reusable changes the code's REAL
     # lifetime, and the agent must never imply the usual single-use 5-minute
     # window when that isn't true. Conditional, so default runs stay
@@ -3159,13 +3212,14 @@ def agent_success(
     if kind == "Hermes":
         lines += [
             "",
-            "═══ PART 3 — the QR image, LAST in your reply, on its own line: ═══",
+            "═══ PART 3 — the QR attachment directive. Paste this line EXACTLY, on its own",
+            "    line, unchanged (it is NOT markdown and NOT a URL — do not convert it): ═══",
             "📱 Or scan this QR with the other device:",
             qr_line,
             "═══════════════════════════════════════════════════════════",
-            "• Put the QR as image-markdown ![](url) on its OWN line so the gateway sends it",
-            "  as its own image message. Post ONLY the ![](url) — do NOT also write the QR url",
-            "  as plain text.",
+            "• The line above is a literal attachment directive — Hermes turns it into the",
+            "  real QR image on its own. Paste it verbatim; do NOT post any ![](url) and do",
+            "  NOT write a URL.",
             "",
         ]
     else:
@@ -3228,15 +3282,16 @@ def agent_success(
         "      output was \"![](https://chat4000.com/gifs/celebration.gif)\" — and the",
         "      user got a dancing GIF and NO pairing code, ever. GIF without MESSAGE 2",
         "      = FAILURE.",
-        "   ❌ Do NOT also write the QR url as text — post ONLY the ![](url) image.",
     ]
     if kind == "Hermes":
         lines += [
-            "   ❌ Do NOT split the GIF, the text, and the QR across multiple turns or",
-            "      replies. You get ONE reply — put all three in it (GIF on its own line,",
-            "      then the text, then the QR on its own line) and the gateway sends them as",
-            "      three separate messages for you. Replying with only the GIF 'to send the",
-            "      rest next turn' loses the code — there IS no next turn.",
+            "   ❌ Do NOT alter, wrap, or convert the two MEDIA: attachment lines. Paste each",
+            "      verbatim on its own line; Hermes delivers them as the real GIF + QR images.",
+            "      Do NOT post the QR (or GIF) as ![](url) or as a plain URL — that is the bug",
+            "      that made the QR never show up. The MEDIA: lines are the ONLY correct form.",
+            "   ❌ Do NOT split the GIF, the text, and the QR across multiple turns or replies.",
+            "      You get ONE reply — put all three in it. Replying with only the GIF 'to send",
+            "      the rest next turn' loses the code — there IS no next turn.",
         ]
     else:
         lines += [
@@ -3244,6 +3299,7 @@ def agent_success(
             "      separate messages, sent one after another ~1-2 seconds apart. One combined",
             "      message (GIF + text + QR together) is a MISTAKE and is NOT what the user",
             "      wants — the QR ends up as raw text instead of a scannable image.",
+            "   ❌ Do NOT also write the QR url as text — post ONLY the ![](url) image.",
         ]
     lines += [
         "   ❌ Do NOT append a trailing offer like \"If that code expired, tell me and I'll",
