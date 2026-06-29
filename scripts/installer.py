@@ -2079,7 +2079,7 @@ SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇",
 # only on genuine failure. Measured live on a hermes-shell box: a cold gateway
 # took ~210s to boot the agent + load chat4000 + connect + first-sync (the plugin
 # wizard's 180s was too short there), so 300s gives comfortable margin.
-READY_WAIT_S = 300.0
+READY_WAIT_S = 360.0
 # Clock-skew slack when judging whether a readiness marker is "fresh" (written by
 # THIS gateway boot, at/after the restart instant) rather than left over from a
 # previous run.
@@ -2101,6 +2101,7 @@ def _spin_until(check, timeout: float, status: str) -> bool:
     dbg(f"wait start: {status} (cap {int(timeout)}s)", level="wait")
     last_log = started
     if is_tty:
+        print(f"{C_DIM}🙏🏻 thanks for waiting — we only have to do this once! ✨ go grab a coffee ☕🐢{C_RST}")
         print()
     while time.time() < deadline:
         try:
@@ -2120,7 +2121,7 @@ def _spin_until(check, timeout: float, status: str) -> bool:
             elapsed = int(time.time() - started)
             frame = SPINNER_FRAMES[frame_idx % len(SPINNER_FRAMES)]
             sys.stdout.write(
-                f"\r{C_CYN}{frame}{C_RST}  {C_BOLD}{status}{C_RST}{C_DIM}  ({elapsed}s){C_RST}   "
+                f"\r{C_CYN}{frame}{C_RST}  {C_BOLD}{status}{C_RST}{C_DIM}  ({elapsed} / {int(timeout)} secs){C_RST}   "
             )
             sys.stdout.flush()
         time.sleep(0.2)
@@ -2252,6 +2253,7 @@ def wait_for_chat4000_connected(since_ts: float, timeout: float = READY_WAIT_S) 
     dbg(f"wait start: chat4000 relay-connect (cap {int(timeout)}s)", level="wait")
     last_log = started
     if is_tty:
+        print(f"{C_DIM}🙏🏻 thanks for waiting — we only have to do this once! ✨ go grab a coffee ☕🐢{C_RST}")
         print()
     while time.time() < deadline:
         if _openclaw_runtime_connected_since(since_ts):
@@ -2268,7 +2270,7 @@ def wait_for_chat4000_connected(since_ts: float, timeout: float = READY_WAIT_S) 
             elapsed = int(time.time() - started)
             frame = SPINNER_FRAMES[frame_idx % len(SPINNER_FRAMES)]
             sys.stdout.write(
-                f"\r{C_CYN}{frame}{C_RST}  {C_BOLD}{_status()}{C_RST}{C_DIM}  ({elapsed}s){C_RST}   "
+                f"\r{C_CYN}{frame}{C_RST}  {C_BOLD}{_status()}{C_RST}{C_DIM}  ({elapsed} / {int(timeout)} secs){C_RST}   "
             )
             sys.stdout.flush()
         time.sleep(0.2)
