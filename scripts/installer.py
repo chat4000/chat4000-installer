@@ -2468,6 +2468,41 @@ def select_targets(targets: list, args) -> Optional[list]:
 # ─── Per-kind install flows ───────────────────────────────────────────────
 
 
+PAIR_OUTCOME_ENV = "CHAT4000_PAIR_OUTCOME_FILE"
+
+# Canonical pair-outcome enum (IN11). The `pair` command writes ONE of these as a
+# single line to $CHAT4000_PAIR_OUTCOME_FILE; the installer reads it back to attach
+# a granular outcome to its terminal analytics event. Keep in lockstep with the
+# host plugins (chat4000-hermes-plugin cli.py / chat4000-openclaw-plugin cli.ts).
+_PAIR_OUTCOMES = {
+    "paired", "paired_reusable", "pending_reusable", "pending_window_elapsed",
+    "expired", "registrar_error", "code_emit_timeout", "launch_failed",
+    "cancelled", "unknown", "pending_detached",
+}
+
+# Exit-code → outcome fallback (mechanism B), used ONLY when the outcome file is
+# missing/garbled. Matches the plugins' distinct per-failure exit codes.
+_PAIR_RC_OUTCOMES = {11: "expired", 12: "registrar_error", 13: "code_emit_timeout", 130: "cancelled"}
+
+
+def _read_pair_outcome(outcome_file: str, pair_rc: int) -> str:
+    """IN11: resolve the granular pair outcome. Prefer the canonical enum line the
+    `pair` command wrote to `outcome_file` (mechanism A); if that file is
+    missing/garbled, fall back to the exit code (mechanism B), then to a generic
+    "paired" (rc 0) / "unknown" (any other rc). Best-effort: a read error never
+    raises."""
+    try:
+        with open(outcome_file, encoding="utf-8") as fh:
+            line = fh.readline().strip()
+        if line in _PAIR_OUTCOMES:
+            return line
+    except OSError:
+        pass
+    if pair_rc in _PAIR_RC_OUTCOMES:
+        return _PAIR_RC_OUTCOMES[pair_rc]
+    return "paired" if pair_rc == 0 else "unknown"
+
+
 def _pair_flag_args(args) -> list:
     """--ttl/--reusable pass-through for EVERY `pair` invocation (all four
     flows). Both plugin CLIs use the same flag names, so one builder serves
@@ -2619,35 +2654,45 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
         pair_cmd.append("--stage")
     pair_cmd += _pair_flag_args(args)
     dbg(f"pairing: launching interactive {' '.join(pair_cmd)}", level="pair")
+    # IN11: hand `pair` a file to write its canonical outcome enum to, and read it
+    # back after to attach a granular pair_outcome / error_class to the terminal
+    # event (the exit code is the fallback signal — see _read_pair_outcome).
+    _pair_fd, _outcome_file = tempfile.mkstemp(prefix="chat4000-pair-outcome-")
+    os.close(_pair_fd)
     _pair_t0 = time.time()
     try:
-        pair_rc = subprocess.run(pair_cmd).returncode
-        dbg(f"pairing: exited rc={pair_rc} after {time.time() - _pair_t0:.1f}s", level="pair")
-    except KeyboardInterrupt:
-        print()
-        warn("Pairing cancelled. Pair a device any time:")
-        print(f"  {C_CYN}{chat4000_bin} pair{C_RST}")
-        _emit("installer_cancelled", {"stage": "pair"})
-        return 130
-    except OSError as exc:
-        err(f"Could not run pairing: {exc}")
-        _emit("installer_failed", {"stage": "pair", "error_class": type(exc).__name__, "error_msg": str(exc)[:200]})
-        return 1
-    if pair_rc != 0:
-        # Pairing resolved unhappily (expired window, registrar error, …). The
-        # gateway is already restarted with chat4000 loaded, so a later manual
-        # `chat4000 pair` just works.
-        err(f"Pairing exited {pair_rc}. Pair again any time: {chat4000_bin} pair")
-        _emit("installer_failed", {"stage": "pair", "exit_code": pair_rc})
-        return pair_rc
-    # IN10: pair now exits non-zero on a real expiry, so reaching here means the
-    # pair subprocess resolved cleanly — but the installer can't see whether a
-    # device actually redeemed (opaque subprocess), so don't ASSERT "paired". The
-    # plugin's PL4 pairing_completed is the source of truth for a real redeem; the
-    # installer's own pairing_completed_via_installer is dropped (IN10).
-    ok(f"chat4000 is live. If you paired a device it's connecting now — otherwise pair one any time: {chat4000_bin} pair")
-    _emit("installer_succeeded", {})
-    return 0
+        try:
+            pair_rc = subprocess.run(pair_cmd, env={**os.environ, PAIR_OUTCOME_ENV: _outcome_file}).returncode
+            dbg(f"pairing: exited rc={pair_rc} after {time.time() - _pair_t0:.1f}s", level="pair")
+        except KeyboardInterrupt:
+            print()
+            warn("Pairing cancelled. Pair a device any time:")
+            print(f"  {C_CYN}{chat4000_bin} pair{C_RST}")
+            _emit("installer_cancelled", {"stage": "pair", "pair_outcome": "cancelled"})
+            return 130
+        except OSError as exc:
+            err(f"Could not run pairing: {exc}")
+            _emit("installer_failed", {"stage": "pair", "error_class": "launch_failed", "error_msg": str(exc)[:200]})
+            return 1
+        outcome = _read_pair_outcome(_outcome_file, pair_rc)
+        if pair_rc != 0:
+            # Pairing resolved unhappily (expired window, registrar error, …). The
+            # gateway is already restarted with chat4000 loaded, so a later manual
+            # `chat4000 pair` just works.
+            err(f"Pairing exited {pair_rc} ({outcome}). Pair again any time: {chat4000_bin} pair")
+            _emit("installer_failed", {"stage": "pair", "exit_code": pair_rc, "error_class": outcome})
+            return pair_rc
+        # IN10: pair now exits non-zero on a real expiry, so reaching here means the
+        # pair subprocess resolved cleanly — but the installer can't see whether a
+        # device actually redeemed (opaque subprocess), so don't ASSERT "paired". The
+        # plugin's PL4 pairing_completed is the source of truth for a real redeem; the
+        # installer's own pairing_completed_via_installer is dropped (IN10).
+        ok(f"chat4000 is live. If you paired a device it's connecting now — otherwise pair one any time: {chat4000_bin} pair")
+        _emit("installer_succeeded", {"pair_outcome": outcome})
+        return 0
+    finally:
+        with contextlib.suppress(OSError):
+            os.unlink(_outcome_file)
 
 
 def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
@@ -2786,6 +2831,7 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
 
     # Now pair (interactive). chat4000 is connected after the wait above, so the
     # device joins immediately after scanning.
+    pair_outcome = None  # IN11: set only when pairing actually runs (do_pair)
     if not do_pair:
         ok("Identity + rooms ready. Pair a device any time with:")
         print(f"  {C_CYN}{openclaw_path} chat4000 pair{C_RST}")
@@ -2805,19 +2851,32 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
             # talks to the registrar itself (same reason as the agent flow).
             pair_cmd += ["--service-token", args.service_token]
         pair_cmd += _pair_flag_args(args)
+        # IN11: capture the granular pair outcome (see _read_pair_outcome).
+        _pair_fd, _outcome_file = tempfile.mkstemp(prefix="chat4000-pair-outcome-")
+        os.close(_pair_fd)
         try:
-            pair_rc = subprocess.run(pair_cmd).returncode
-        except KeyboardInterrupt:
-            warn("Pairing cancelled. Pair a device any time with:")
-            print(f"  {C_CYN}{openclaw_path} chat4000 pair{C_RST}")
-            _emit("installer_cancelled", {"stage": "pair"})
-            return 130
-        if pair_rc != 0:
-            err(f"Pairing exited {pair_rc}. Pair again any time: {openclaw_path} chat4000 pair")
-            _emit("installer_failed", {"stage": "pair", "exit_code": pair_rc})
-            return pair_rc
-        # IN10: no installer-side pairing_completed_via_installer — the plugin's
-        # PL4 pairing_completed (with client_id) is the source of truth.
+            try:
+                pair_rc = subprocess.run(pair_cmd, env={**os.environ, PAIR_OUTCOME_ENV: _outcome_file}).returncode
+            except KeyboardInterrupt:
+                warn("Pairing cancelled. Pair a device any time with:")
+                print(f"  {C_CYN}{openclaw_path} chat4000 pair{C_RST}")
+                _emit("installer_cancelled", {"stage": "pair", "pair_outcome": "cancelled"})
+                return 130
+            except OSError as exc:
+                # IN11: couldn't even launch `pair` — parity with the Hermes flow.
+                err(f"Could not run pairing: {exc}")
+                _emit("installer_failed", {"stage": "pair", "error_class": "launch_failed", "error_msg": str(exc)[:200]})
+                return 1
+            pair_outcome = _read_pair_outcome(_outcome_file, pair_rc)
+            if pair_rc != 0:
+                err(f"Pairing exited {pair_rc} ({pair_outcome}). Pair again any time: {openclaw_path} chat4000 pair")
+                _emit("installer_failed", {"stage": "pair", "exit_code": pair_rc, "error_class": pair_outcome})
+                return pair_rc
+            # IN10: no installer-side pairing_completed_via_installer — the plugin's
+            # PL4 pairing_completed (with client_id) is the source of truth.
+        finally:
+            with contextlib.suppress(OSError):
+                os.unlink(_outcome_file)
 
     if not interactive:
         ok("Installed. Pair + verify each target individually when ready.")
@@ -2832,7 +2891,7 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
     # was already emitted, so just surface it and exit non-zero.
     if relay_ok:
         ok("chat4000 is live. Send a message from your iOS/Mac app — your OpenClaw agent will reply.")
-        _emit("installer_succeeded", {})
+        _emit("installer_succeeded", {"pair_outcome": pair_outcome} if pair_outcome else {})
         return 0
     warn("chat4000 hadn't connected to the relay, so it isn't live yet.")
     warn(f"Watch logs: {C_CYN}tail -f ~/.openclaw/plugins/chat4000/logs/runtime.log{C_RST}")
@@ -3042,7 +3101,9 @@ def agent_success(
     # IN7: agent-mode terminal success — install + setup + detached pair start
     # all succeeded (the only path here). Pairing itself completes detached;
     # the completion event is the plugin's PL4, not the installer's.
-    _emit("installer_succeeded", {})
+    # IN11: in agent mode the code was emitted but pairing resolves detached after
+    # we exit, so the granular outcome the installer can attest to is pending_detached.
+    _emit("installer_succeeded", {"pair_outcome": "pending_detached"})
     code_disp = f"{code[:3]}-{code[3:]}" if (code and len(code) == 6 and code.isdigit()) else code
     pair_url = f"https://pair.chat4000.com/?code={code}" if code else None
     # First-party QR-image endpoint (the registrar, per-env): returns a PNG QR for
@@ -3734,7 +3795,12 @@ def install_openclaw_agent(t: dict, args) -> int:
     pair_cmd += _pair_flag_args(args)
     code, qr, logpath, perr, pair_pid = spawn_detached_pair(pair_cmd, _pair_env())
     if not code:
-        return agent_error("starting device pairing", perr or "no pairing code produced", stage_token="pair")
+        # IN11: pair_pid is None only when the detached launch itself failed
+        # (couldn't open the log / Popen failed); otherwise the process started but
+        # never emitted a code within the window.
+        return agent_error("starting device pairing", perr or "no pairing code produced",
+                           stage_token="pair",
+                           error_class="launch_failed" if pair_pid is None else "code_emit_timeout")
     # 4. (Re)start the gateway so the channel goes live — DETACHED + DEFERRED.
     #    The OpenClaw agent (and THIS installer) run under the gateway, so a
     #    synchronous in-place restart kills our own process before the pairing
@@ -3794,7 +3860,11 @@ def install_hermes_agent(t: dict, args) -> int:
     pair_cmd += _pair_flag_args(args)
     code, qr, logpath, perr, _pair_pid = spawn_detached_pair(pair_cmd, _pair_env())
     if not code:
-        return agent_error("starting device pairing", perr or "no pairing code produced", stage_token="pair")
+        # IN11: see install_openclaw_agent — pair_pid None ⇒ the detached launch
+        # failed; a live pid with no code ⇒ the code-emission window timed out.
+        return agent_error("starting device pairing", perr or "no pairing code produced",
+                           stage_token="pair",
+                           error_class="launch_failed" if _pair_pid is None else "code_emit_timeout")
     # 5. PROACTIVELY (re)start the gateway so it LOADS chat4000. Hermes discovers
     #    plugins only at startup, so a gateway that booted before this install will
     #    never run chat4000 until it restarts — and this must NOT be gated on the
