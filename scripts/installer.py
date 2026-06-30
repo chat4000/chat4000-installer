@@ -2640,9 +2640,12 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
         err(f"Pairing exited {pair_rc}. Pair again any time: {chat4000_bin} pair")
         _emit("installer_failed", {"stage": "pair", "exit_code": pair_rc})
         return pair_rc
-    # IN7: parity with the OpenClaw flow — the interactive pair succeeded.
-    _emit("pairing_completed_via_installer", {})
-    ok("All set — your device is paired and chat4000 is live.")
+    # IN10: pair now exits non-zero on a real expiry, so reaching here means the
+    # pair subprocess resolved cleanly — but the installer can't see whether a
+    # device actually redeemed (opaque subprocess), so don't ASSERT "paired". The
+    # plugin's PL4 pairing_completed is the source of truth for a real redeem; the
+    # installer's own pairing_completed_via_installer is dropped (IN10).
+    ok(f"chat4000 is live. If you paired a device it's connecting now — otherwise pair one any time: {chat4000_bin} pair")
     _emit("installer_succeeded", {})
     return 0
 
@@ -2813,7 +2816,8 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
             err(f"Pairing exited {pair_rc}. Pair again any time: {openclaw_path} chat4000 pair")
             _emit("installer_failed", {"stage": "pair", "exit_code": pair_rc})
             return pair_rc
-        _emit("pairing_completed_via_installer", {})
+        # IN10: no installer-side pairing_completed_via_installer — the plugin's
+        # PL4 pairing_completed (with client_id) is the source of truth.
 
     if not interactive:
         ok("Installed. Pair + verify each target individually when ready.")
