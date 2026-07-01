@@ -98,10 +98,19 @@ from pathlib import Path
 from typing import Optional
 
 # Line-buffer stdout/stderr so subprocess output stays interleaved in order
-# when piped through `docker exec` / `ssh`.
+# when piped through `docker exec` / `ssh`. Also harden the CODEC: a REDIRECTED
+# stdout (pipe/file, not a TTY) uses the locale encoding — cp1252 on Windows,
+# C/ascii on a bare POSIX box — none of which can encode the emoji/box-drawing
+# glyphs in banner()/hdr() or the ✓ in ok()/warn(). Left unhandled, the first
+# such print raises UnicodeEncodeError and (swallowed per-phase) the whole line
+# silently vanishes — section headers and, worst, the success confirmations —
+# so a SUCCEEDING install looks hung/failed. errors="backslashreplace" makes any
+# stray glyph degrade instead of raising; on Windows we also force UTF-8 so the
+# glyphs render as real characters rather than escapes.
 with contextlib.suppress(Exception):
-    sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
-    sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+    _out_enc = "utf-8" if os.name == "nt" else None  # None = keep current codec (POSIX)
+    sys.stdout.reconfigure(encoding=_out_enc, errors="backslashreplace", line_buffering=True)  # type: ignore[attr-defined]
+    sys.stderr.reconfigure(encoding=_out_enc, errors="backslashreplace", line_buffering=True)  # type: ignore[attr-defined]
 
 # ─── Cross-platform foundation (Windows + POSIX) ──────────────────────────
 # Every branch below is ADDITIVE: the POSIX/else path is behaviorally identical
@@ -199,8 +208,14 @@ def _find_pids_by_argv(pattern: str) -> list:
     contains `pattern`. POSIX uses pgrep -f (unchanged); Windows uses PowerShell CIM."""
     if IS_WINDOWS:
         try:
+            # `-ne $PID`: this very query runs in a `powershell -Command "…-like
+            # '*<pattern>*'…"` child, so THAT child's own command line contains
+            # <pattern> and Win32_Process would match the query against itself — a
+            # false positive that made every argv probe report a phantom process
+            # (e.g. `_hermes_gateway_alive()` returning True with no gateway).
+            # Excluding the current PID drops exactly that self-match.
             ps = ("Get-CimInstance Win32_Process | "
-                  f"Where-Object {{ $_.CommandLine -like '*{pattern}*' }} | "
+                  f"Where-Object {{ $_.ProcessId -ne $PID -and $_.CommandLine -like '*{pattern}*' }} | "
                   "Select-Object -ExpandProperty ProcessId")
             out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
                                  capture_output=True, text=True, timeout=15).stdout
@@ -221,6 +236,13 @@ def _find_pids_by_argv(pattern: str) -> list:
 # hosts; `--latest` is shorthand for the repo's default branch (newest code).
 DEFAULT_REF = "stable"
 LATEST_REF = "main"
+
+# A running Hermes gateway's command line is `.../bin/hermes gateway run` on POSIX
+# but `...\Scripts\hermes.exe gateway run` on Windows — so the space-delimited
+# "hermes gateway" only matches on POSIX. On Windows the `.exe` between the binary
+# and the subcommand breaks the substring, so we match the `.exe` form there. This
+# is the pattern every gateway kill/verify probe uses (kill side + _hermes_gateway_alive).
+HERMES_GATEWAY_ARGV = "hermes.exe gateway" if IS_WINDOWS else "hermes gateway"
 
 # Hermes — Python plugin, git-installed into Hermes' venv from the gh tag.
 HERMES_REPO_URL = "https://github.com/chat4000/chat4000-hermes-plugin"
@@ -3778,13 +3800,13 @@ def _hermes_reload_windows(hermes_bin: str) -> Optional[str]:
     when it can't read /proc/<pid>/cmdline (UNCERTAIN: if the real gateway argv
     differs from `gateway run`, the relaunch shape may not match — reported).
     Returns "relaunch" once a live gateway is verified, else None."""
-    for pid in _find_pids_by_argv("hermes gateway"):
+    for pid in _find_pids_by_argv(HERMES_GATEWAY_ARGV):
         _pid_kill(pid)  # graceful first
     time.sleep(3)
-    for pid in _find_pids_by_argv("hermes gateway"):
+    for pid in _find_pids_by_argv(HERMES_GATEWAY_ARGV):
         _pid_kill(pid, force=True)  # escalate for survivors
     time.sleep(2)
-    if _find_pids_by_argv("hermes gateway"):
+    if _find_pids_by_argv(HERMES_GATEWAY_ARGV):
         # A supervisor kept/brought it back — don't double-start.
         return "relaunch"
     log_path = str(TMP / "chat4000-gateway.log")
@@ -3981,8 +4003,10 @@ def _hermes_gateway_alive() -> bool:
     'did it come back' signal. (Hermes, unlike OpenClaw, writes no pid lockfile
     we can read, so argv is the signal we have.)"""
     # POSIX: _find_pids_by_argv is `pgrep -f "hermes gateway"` (identical signal).
-    # Windows: PowerShell CIM by command line.
-    return bool(_find_pids_by_argv("hermes gateway"))
+    # Windows: PowerShell CIM by command line, matching the `hermes.exe gateway`
+    # form (HERMES_GATEWAY_ARGV) — the bare "hermes gateway" never matches the
+    # Windows process whose argv0 is `...\hermes.exe`.
+    return bool(_find_pids_by_argv(HERMES_GATEWAY_ARGV))
 
 
 def _verify_hermes_gateway_back(timeout: float = 30.0) -> bool:
