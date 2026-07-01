@@ -78,12 +78,14 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import glob
 import json
 import os
 import platform
 import re
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -100,6 +102,117 @@ from typing import Optional
 with contextlib.suppress(Exception):
     sys.stdout.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
     sys.stderr.reconfigure(line_buffering=True)  # type: ignore[attr-defined]
+
+# ─── Cross-platform foundation (Windows + POSIX) ──────────────────────────
+# Every branch below is ADDITIVE: the POSIX/else path is behaviorally identical
+# to the pre-Windows installer. ctypes is imported LAZILY, only inside the
+# Windows-only branches, so it never loads on Linux/mac.
+
+IS_WINDOWS = os.name == "nt"
+# POSIX: /tmp EXACTLY, byte-identical to the previous hardcoded "/tmp/…" paths.
+# We deliberately do NOT use tempfile.gettempdir() on POSIX: on macOS it returns
+# $TMPDIR (e.g. /var/folders/…/T), which would silently move every installer
+# temp path off /tmp and break the byte-identical-POSIX guarantee (and diverge
+# from the OpenClaw lockfile paths that are still literal /tmp). Windows: %TEMP%.
+TMP = Path(tempfile.gettempdir()) if IS_WINDOWS else Path("/tmp")
+
+
+def _pid_alive(pid: int) -> bool:
+    """Read-only liveness check. On Windows NEVER uses os.kill (which TerminateProcess-es)."""
+    if not pid or pid <= 0:
+        return False
+    if IS_WINDOWS:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not k.GetExitCodeProcess(h, ctypes.byref(code)):
+                return False
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            k.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _pid_kill(pid: int, force: bool = False) -> None:
+    """Best-effort kill, cross-platform."""
+    if not pid or pid <= 0:
+        return
+    if IS_WINDOWS:
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.run(["taskkill", "/PID", str(pid)] + (["/F"] if force else []),
+                           capture_output=True, timeout=10)
+        return
+    with contextlib.suppress(OSError):
+        os.kill(pid, signal.SIGKILL if force else signal.SIGTERM)
+
+
+def _detached_popen_kwargs() -> dict:
+    """Popen kwargs to fully detach a child (survives our exit)."""
+    if IS_WINDOWS:
+        return {"creationflags": 0x00000008 | 0x00000200}  # DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP
+    return {"start_new_session": True}
+
+
+def _config_dir() -> Path:
+    """Per-OS config dir. POSIX/mac preserve the EXISTING ~/.config/chat4000 (do NOT
+    switch mac to ~/Library — that would break id continuity); Windows -> %APPDATA%."""
+    if IS_WINDOWS:
+        base = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
+        return Path(base) / "chat4000"
+    return Path.home() / ".config" / "chat4000"
+
+
+def _venv_exe(venv_bin: str, name: str) -> str:
+    """Path to a venv executable — `name.exe` under Scripts on Windows, bare `name`
+    under bin on POSIX. POSIX result is byte-identical to the old f"{venv_bin}/{name}"."""
+    return f"{venv_bin}/{name}.exe" if IS_WINDOWS else f"{venv_bin}/{name}"
+
+
+def _enable_ansi() -> None:
+    """Win10+: turn on ANSI (VT) processing so color codes render in the console."""
+    if not IS_WINDOWS:
+        return
+    with contextlib.suppress(Exception):
+        import ctypes
+        k = ctypes.windll.kernel32
+        for hid in (-11, -12):  # STD_OUTPUT_HANDLE, STD_ERROR_HANDLE
+            h = k.GetStdHandle(hid)
+            mode = ctypes.c_ulong()
+            if k.GetConsoleMode(h, ctypes.byref(mode)):
+                k.SetConsoleMode(h, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+
+
+def _find_pids_by_argv(pattern: str) -> list:
+    """Cross-platform `pgrep -f <pattern>` equivalent: PIDs whose full command line
+    contains `pattern`. POSIX uses pgrep -f (unchanged); Windows uses PowerShell CIM."""
+    if IS_WINDOWS:
+        try:
+            ps = ("Get-CimInstance Win32_Process | "
+                  f"Where-Object {{ $_.CommandLine -like '*{pattern}*' }} | "
+                  "Select-Object -ExpandProperty ProcessId")
+            out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                                 capture_output=True, text=True, timeout=15).stdout
+            return [int(x) for x in out.split() if x.strip().isdigit()]
+        except (OSError, subprocess.SubprocessError, ValueError):
+            return []
+    try:
+        out = subprocess.run(["pgrep", "-f", pattern], capture_output=True, text=True, timeout=5).stdout
+        return [int(x) for x in out.split() if x.strip().isdigit()]
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+
 
 # ─── Constants ────────────────────────────────────────────────────────────
 
@@ -330,16 +443,21 @@ def _resolve_id_file(path: Path) -> tuple:
         new_id = str(uuid.uuid4())
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(new_id + "\n", encoding="utf-8")
-        with contextlib.suppress(OSError):
-            os.chmod(path, 0o600)
+        # POSIX: 0600 the id file. Windows: skip — the file lives under the user
+        # profile (%APPDATA%), already ACL-private; POSIX-mode bits are a no-op
+        # there and a chmod failure must never raise on Windows.
+        if not IS_WINDOWS:
+            with contextlib.suppress(OSError):
+                os.chmod(path, 0o600)
         return (new_id, True)
     except OSError:
         return (str(uuid.uuid4()), True)
 
 
 def resolve_env_id() -> tuple:
-    """(env_id, freshly_minted) — the churny ~/.config/chat4000/install-id."""
-    return _resolve_id_file(Path.home() / ".config" / "chat4000" / "install-id")
+    """(env_id, freshly_minted) — the churny ~/.config/chat4000/install-id
+    (POSIX) or %APPDATA%\\chat4000\\install-id (Windows)."""
+    return _resolve_id_file(_config_dir() / "install-id")
 
 
 def _agent_install_id_path(kind: str) -> Path:
@@ -487,11 +605,14 @@ def _base_props() -> dict:
         enriched["os_release"] = "unknown"
     try:
         in_container = False
-        if Path("/.dockerenv").exists() or os.environ.get("KUBERNETES_SERVICE_HOST"):
-            in_container = True
-        else:
-            cgroup = Path("/proc/1/cgroup").read_text(errors="ignore")
-            in_container = any(s in cgroup for s in ("docker", "kubepods", "containerd", "podman"))
+        # /.dockerenv and /proc/1/cgroup are POSIX-only; on Windows leave
+        # in_container False (best-effort — no reliable cheap probe).
+        if not IS_WINDOWS:
+            if Path("/.dockerenv").exists() or os.environ.get("KUBERNETES_SERVICE_HOST"):
+                in_container = True
+            else:
+                cgroup = Path("/proc/1/cgroup").read_text(errors="ignore")
+                in_container = any(s in cgroup for s in ("docker", "kubepods", "containerd", "podman"))
         enriched["is_container"] = in_container
     except OSError:
         enriched["is_container"] = False
@@ -770,6 +891,20 @@ HERMES_LAYOUTS = [
     ("~/Library/Application Support/Hermes Agent/venv/bin", "macos-app-support"),
 ]
 
+# Windows Hermes venv layouts. Unlike POSIX (venv/bin/python), a Windows venv
+# puts its interpreter at <venv>/Scripts/python.exe, so these point at Scripts
+# dirs and detection checks for `python.exe`. Expanded with os.path.expandvars
+# (%APPDATA%/%LOCALAPPDATA%) + expanduser (~). Only consulted when IS_WINDOWS.
+WINDOWS_HERMES_LAYOUTS = [
+    (r"~\.hermes\hermes-agent\venv\Scripts", "win-curl-installer"),
+    (r"%APPDATA%\hermes-agent\venv\Scripts", "win-appdata"),
+    (r"%LOCALAPPDATA%\Programs\hermes-agent\venv\Scripts", "win-localappdata-programs"),
+    (r"%LOCALAPPDATA%\hermes-agent\venv\Scripts", "win-localappdata"),
+    (r"%LOCALAPPDATA%\pipx\venvs\hermes-agent\Scripts", "win-pipx"),
+    (r"%LOCALAPPDATA%\uv\tools\hermes-agent\Scripts", "win-uv-tool"),
+    (r"~\.local\share\hermes-agent\venv\Scripts", "win-xdg-data"),
+]
+
 
 def _layout_label(path: str) -> str:
     if "/nix/store/" in path:
@@ -848,14 +983,29 @@ def detect_hermes_all() -> list:
         expanded = str(Path(pattern).expanduser())
         if "*" in expanded:
             try:
-                matches = sorted(Path("/").glob(expanded.lstrip("/")))
+                matches = sorted(Path(m) for m in glob.glob(expanded, recursive=True))
                 for match in reversed(matches):
                     if (match / "python").exists():
                         add(str(match), label)
-            except OSError:
+            except (OSError, NotImplementedError):
                 continue
         else:
             if (Path(expanded) / "python").exists():
+                add(expanded, label)
+
+    # Windows install layouts (Scripts dir + python.exe), iterated IN ADDITION to
+    # shutil.which("hermes") above (which already resolves hermes.exe on PATH).
+    if IS_WINDOWS:
+        for pattern, label in WINDOWS_HERMES_LAYOUTS:
+            expanded = os.path.expandvars(str(Path(pattern).expanduser()))
+            if "*" in expanded:
+                try:
+                    for m in glob.glob(expanded, recursive=True):
+                        if (Path(m) / "python.exe").exists():
+                            add(m, label)
+                except (OSError, NotImplementedError):
+                    continue
+            elif (Path(expanded) / "python.exe").exists():
                 add(expanded, label)
     return found
 
@@ -874,6 +1024,22 @@ OPENCLAW_LOCATIONS = [
     "~/.nvm/versions/node/*/bin/openclaw",
     "~/.nix-profile/bin/openclaw",
     "/run/current-system/sw/bin/openclaw",
+]
+
+# Windows OpenClaw install locations (npm/pnpm global shims + packaged app + pipx
+# venv). Expanded with os.path.expandvars + expanduser. Only consulted when
+# IS_WINDOWS; shutil.which("openclaw") above already resolves openclaw.cmd/.exe
+# on PATH via PATHEXT.
+WINDOWS_OPENCLAW_LOCATIONS = [
+    r"%APPDATA%\npm\openclaw.cmd",
+    r"%APPDATA%\npm\openclaw.exe",
+    r"~\AppData\Roaming\npm\openclaw.cmd",
+    r"%LOCALAPPDATA%\Programs\openclaw\openclaw.exe",
+    r"%LOCALAPPDATA%\pnpm\openclaw.cmd",
+    r"%LOCALAPPDATA%\pnpm\openclaw.exe",
+    r"~\.openclaw\bin\openclaw.exe",
+    r"~\.openclaw\bin\openclaw.cmd",
+    r"%LOCALAPPDATA%\pipx\venvs\openclaw\Scripts\openclaw.exe",
 ]
 
 
@@ -911,13 +1077,28 @@ def detect_openclaw_all() -> list:
         expanded = str(Path(pattern).expanduser())
         if "*" in expanded:
             try:
-                for match in sorted(Path("/").glob(expanded.lstrip("/")), reverse=True):
+                for match in sorted((Path(m) for m in glob.glob(expanded, recursive=True)), reverse=True):
                     if match.exists() and os.access(match, os.X_OK):
                         add(str(match))
-            except OSError:
+            except (OSError, NotImplementedError):
                 continue
         else:
             if Path(expanded).exists() and os.access(expanded, os.X_OK):
+                add(expanded)
+
+    # Windows install layouts (openclaw.exe / .cmd shims). On Windows os.access
+    # X_OK is unreliable, so a plain existence check gates these.
+    if IS_WINDOWS:
+        for pattern in WINDOWS_OPENCLAW_LOCATIONS:
+            expanded = os.path.expandvars(str(Path(pattern).expanduser()))
+            if "*" in expanded:
+                try:
+                    for m in glob.glob(expanded, recursive=True):
+                        if Path(m).exists():
+                            add(m)
+                except (OSError, NotImplementedError):
+                    continue
+            elif Path(expanded).exists():
                 add(expanded)
     return found
 
@@ -1288,7 +1469,7 @@ def collect_hermes_stats(venv_bin: str) -> dict:
     # local *.dist-info only and never touches the network.
     with contextlib.suppress(OSError, subprocess.SubprocessError):
         meta = subprocess.run(
-            [f"{venv_bin}/python", "-c",
+            [_venv_exe(venv_bin, "python"), "-c",
              "import importlib.metadata as m; print(m.version('hermes-agent'))"],
             capture_output=True, text=True, timeout=5,
         )
@@ -1297,7 +1478,7 @@ def collect_hermes_stats(venv_bin: str) -> dict:
     # Fallback: if the metadata read failed, try `hermes --version` but with a
     # SHORT timeout so the scan can never stall on its network update-check.
     if stats["agent_version"] is None:
-        hermes_bin = Path(venv_bin) / "hermes"
+        hermes_bin = Path(_venv_exe(venv_bin, "hermes"))
         if hermes_bin.exists():
             with contextlib.suppress(OSError, subprocess.SubprocessError):
                 out = subprocess.run([str(hermes_bin), "--version"], capture_output=True, text=True, timeout=3)
@@ -1318,7 +1499,7 @@ def collect_hermes_stats(venv_bin: str) -> dict:
     stats["session_count"] = _count_hermes_sessions(home)
 
     # Is our plugin importable in this venv + at which version?
-    vp = f"{venv_bin}/python"
+    vp = _venv_exe(venv_bin, "python")
     try:
         chk = subprocess.run(
             [vp, "-c", "import chat4000_hermes_plugin"], capture_output=True, timeout=15
@@ -1489,7 +1670,44 @@ def hermes_reset_local_state() -> None:
         ok(f"Removed {state_dir}")
 
 
+def _shim_chat4000_onto_path_windows(venv_bin: str) -> None:
+    """Windows has no symlink-on-PATH convention, so drop a `chat4000.cmd` shim that
+    execs the venv's chat4000 entry point. The venv script is `Scripts\\chat4000.exe`
+    (console-script) or `Scripts\\chat4000` (fallback); the shim just forwards args
+    to whichever exists. Prefer %LOCALAPPDATA%\\Microsoft\\WindowsApps (on PATH by
+    default on Win10+), else any user bin already on PATH."""
+    exe = Path(venv_bin) / "chat4000.exe"
+    plain = Path(venv_bin) / "chat4000"
+    target = exe if exe.exists() else (plain if plain.exists() else None)
+    if target is None:
+        return
+    path_dirs = os.environ.get("PATH", "").split(os.pathsep)
+    candidates = [Path(os.path.expandvars(r"%LOCALAPPDATA%\Microsoft\WindowsApps"))]
+    candidates += [Path(p) for p in path_dirs if p.strip()]
+    shim_body = f'@echo off\r\n"{target}" %*\r\n'
+    for d in candidates:
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+            if not os.access(d, os.W_OK):
+                continue
+            shim = d / "chat4000.cmd"
+            shim.write_text(shim_body, encoding="utf-8")
+            ok(
+                f"Installed {C_CYN}chat4000{C_RST} shim -> {shim}  "
+                f"{C_DIM}(run `chat4000 status` from anywhere){C_RST}"
+            )
+            if str(d) not in path_dirs:
+                warn(f"{d} isn't on your PATH — add it, or run {shim} directly.")
+            return
+        except OSError:
+            continue
+    warn(f"Couldn't place a chat4000.cmd shim on PATH; run it via {target}")
+
+
 def symlink_chat4000_onto_path(venv_bin: str) -> None:
+    if IS_WINDOWS:
+        _shim_chat4000_onto_path_windows(venv_bin)
+        return
     src = Path(venv_bin) / "chat4000"
     if not src.exists():
         return
@@ -1622,7 +1840,7 @@ def _openclaw_prepare_checkout(checkout: str, *, quiet: bool) -> Optional[str]:
     gen = os.path.join(checkout, "src", "telemetry-dsn.generated.ts")
     prep = os.path.join(checkout, "scripts", "publish_npm.py")
     if not os.path.exists(gen) and os.path.exists(prep):
-        dsn_copy = Path.home() / ".config" / "chat4000" / "sentry-dsn"
+        dsn_copy = _config_dir() / "sentry-dsn"
         try:
             if not dsn_copy.exists():
                 dsn_copy.parent.mkdir(parents=True, exist_ok=True)
@@ -1804,30 +2022,16 @@ def _openclaw_gateway_pid() -> Optional[int]:
     return best
 
 
-def _pid_alive(pid: int) -> bool:
-    """Is this pid a live process? `kill -0` (signal 0) probes without killing."""
-    if pid <= 0:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True  # exists but owned by another uid
-    except OSError:
-        return False
-
-
 def _openclaw_gateway_argv_alive() -> bool:
     """SECONDARY signal only: does any process present a documented OpenClaw gateway
     argv? The lockfile pid is the source of truth; this argv probe exists solely to
     catch a gateway running with NO readable lockfile pid (so we can FAIL LOUDLY
     rather than silently 'succeed'). Never used to identify a pid to kill/verify."""
     for pat in ("openclaw gateway run", "openclaw-gateway"):
-        with contextlib.suppress(OSError, subprocess.SubprocessError):
-            if subprocess.run(["pgrep", "-f", pat], capture_output=True, timeout=5).returncode == 0:
-                return True
+        # POSIX: _find_pids_by_argv runs `pgrep -f pat` (identical to the old
+        # returncode==0 check). Windows: PowerShell CIM by command line.
+        if _find_pids_by_argv(pat):
+            return True
     return False
 
 
@@ -1840,12 +2044,14 @@ def _kill_openclaw_gateway() -> Optional[int]:
     killed = _openclaw_gateway_pid()
     if killed is not None:
         say(f"Killing running OpenClaw gateway (pid {killed}, from lockfile).")
-        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
-            os.kill(killed, 9)
+        # POSIX: SIGKILL (was os.kill(pid, 9)). Windows: taskkill /F.
+        _pid_kill(killed, force=True)
     # Secondary: argv-shape sweep for any gateway presenting a documented argv.
+    # POSIX: _find_pids_by_argv is `pgrep -f`, _pid_kill(force) is SIGKILL —
+    # equivalent to the old `pkill -9 -f`. Windows: CIM find + taskkill /F.
     for pat in ("openclaw gateway run", "openclaw-gateway"):
-        with contextlib.suppress(OSError, subprocess.SubprocessError):
-            subprocess.run(["pkill", "-9", "-f", pat], capture_output=True, timeout=5)
+        for pid in _find_pids_by_argv(pat):
+            _pid_kill(pid, force=True)
     return killed
 
 
@@ -2026,12 +2232,12 @@ def restart_gateway(method: str) -> bool:
     # 5. No supervisor revived it within GRACE — start one in the foreground
     #    ourselves, then VERIFY a NEW gateway (different pid) is live. F3/F4 + META:
     #    a restart we can't prove (no new live pid) is a FAILURE.
-    log_path = "/tmp/openclaw-gateway.log"
+    log_path = str(TMP / "openclaw-gateway.log")
     try:
         logf = open(log_path, "ab")
         subprocess.Popen(
             [openclaw, "gateway", "run"],
-            stdout=logf, stderr=subprocess.STDOUT, start_new_session=True, close_fds=True,
+            stdout=logf, stderr=subprocess.STDOUT, close_fds=True, **_detached_popen_kwargs(),
         )
         say(f"Started gateway in background. Log: {C_CYN}{log_path}{C_RST}")
     except (OSError, subprocess.SubprocessError) as exc:
@@ -2230,7 +2436,7 @@ def wait_for_chat4000_connected(since_ts: float, timeout: float = READY_WAIT_S) 
     after a restart, by polling the plugin's own runtime.log for a FRESH readiness
     marker (written at/after `since_ts`). Shows a spinner with a coarse phase read
     from the gateway log. Returns True once connected, False on timeout."""
-    gateway_log = Path("/tmp/openclaw-gateway.log")
+    gateway_log = TMP / "openclaw-gateway.log"
 
     def _status() -> str:
         status = "starting gateway"
@@ -2319,7 +2525,7 @@ def _mk_hermes(venv_bin: str, layout: str) -> dict:
     return {
         "kind": "hermes",
         "venv_bin": venv_bin,
-        "venv_python": f"{venv_bin}/python",
+        "venv_python": _venv_exe(venv_bin, "python"),
         "layout": layout,
         "display": venv_bin,
         "version": None,
@@ -2570,7 +2776,7 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
 
     symlink_chat4000_onto_path(venv_bin)
 
-    chat4000_bin = f"{venv_bin}/chat4000"
+    chat4000_bin = _venv_exe(venv_bin, "chat4000")
 
     if not interactive:
         warn("Multiple targets selected — skipping interactive setup + pairing for this one.")
@@ -2978,7 +3184,7 @@ GATEWAY_RELOAD_MAX_WAIT_S = 330
 # re-ran. This marker lets a second agent-mode invocation SHORT-CIRCUIT: if a
 # fresh marker from this window exists, reuse the live pairing info (or print a
 # clear "already ran" message) and exit 0 — no second setup/pair/restart.
-AGENT_RUN_MARKER = "/tmp/chat4000-agent-install.marker"
+AGENT_RUN_MARKER = str(TMP / "chat4000-agent-install.marker")
 AGENT_RUN_MARKER_TTL_S = 600  # 10 min: covers the relay + restart + auto-resume window
 
 # TEST-ONLY escape hatch for the 10-min double-run marker above. When this env var
@@ -3074,7 +3280,7 @@ def _download_to_tmp(url: str, prefix: str, ext: str) -> Optional[str]:
     if not url:
         return None
     try:
-        path = f"/tmp/{prefix}-{uuid.uuid4().hex[:8]}{ext}"
+        path = str(TMP / f"{prefix}-{uuid.uuid4().hex[:8]}{ext}")
         with urllib.request.urlopen(url, timeout=15) as resp:  # noqa: S310  # first-party chat4000 asset
             data = resp.read()
         if not data:
@@ -3400,9 +3606,13 @@ def _kill_stale_pair_watchers() -> None:
     stuck at 'Waiting for your plugin' (observed live on hermes-test-91 under the
     old limit). Old watchers are worthless the moment a new code is issued; kill
     them before spawning."""
+    # Matches 'chat4000 pair …' (Hermes) and 'openclaw chat4000 pair …'
+    # (OpenClaw) cmdlines; our own argv never contains this substring.
+    if IS_WINDOWS:
+        for pid in _find_pids_by_argv("chat4000 pair"):
+            _pid_kill(pid, force=True)
+        return
     try:
-        # Matches 'chat4000 pair …' (Hermes) and 'openclaw chat4000 pair …'
-        # (OpenClaw) cmdlines; our own argv never contains this substring.
         subprocess.run(["pkill", "-f", "chat4000 pair"], capture_output=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         pass  # best-effort: no pkill on the box → re-runs keep the old risk
@@ -3414,14 +3624,12 @@ def _reuse_live_pair() -> Optional[tuple]:
     installer (e.g. after the gateway restart interrupts their relay turn), and
     a re-run must not invalidate the code the user may be typing into their
     phone right now. Fresh = log younger than 180s (codes live 300s)."""
-    try:
-        r = subprocess.run(["pgrep", "-f", "chat4000 pair"], capture_output=True, text=True, timeout=10)
-        if r.returncode != 0:
-            return None
-    except (OSError, subprocess.SubprocessError):
+    # POSIX: _find_pids_by_argv is `pgrep -f "chat4000 pair"` (identical gate).
+    # Windows: PowerShell CIM by command line.
+    if not _find_pids_by_argv("chat4000 pair"):
         return None
     try:
-        logs = sorted(Path("/tmp").glob("chat4000-pair-*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+        logs = sorted(TMP.glob("chat4000-pair-*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
         if not logs:
             return None
         newest = logs[0]
@@ -3468,7 +3676,7 @@ def spawn_detached_pair(cmd: list, env: dict) -> tuple:
     if reused:
         return (*reused, None)
     _kill_stale_pair_watchers()
-    logpath = f"/tmp/chat4000-pair-{uuid.uuid4().hex[:8]}.log"
+    logpath = str(TMP / f"chat4000-pair-{uuid.uuid4().hex[:8]}.log")
     try:
         logf = open(logpath, "ab")  # noqa: SIM115  # handed to the child; we close our copy below
     except OSError as exc:
@@ -3480,9 +3688,11 @@ def spawn_detached_pair(cmd: list, env: dict) -> tuple:
             stdout=logf,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            start_new_session=True,  # detach: survives our exit, no SIGHUP/SIGINT from our tty
+            # detach: survives our exit, no SIGHUP/SIGINT from our tty (POSIX);
+            # DETACHED_PROCESS|CREATE_NEW_PROCESS_GROUP (Windows).
             close_fds=True,
             env=env,
+            **_detached_popen_kwargs(),
         )
     except (OSError, subprocess.SubprocessError) as exc:
         logf.close()
@@ -3560,6 +3770,38 @@ fi
 """
 
 
+def _hermes_reload_windows(hermes_bin: str) -> Optional[str]:
+    """Windows-native equivalent of _hermes_gateway_reload_sh: find the running
+    Hermes gateway by command line, kill it, then relaunch detached so it loads
+    chat4000. Windows has no /proc, so the exact live argv can't be recovered — we
+    relaunch `<hermes_bin> gateway run`, the SAME fallback the POSIX script uses
+    when it can't read /proc/<pid>/cmdline (UNCERTAIN: if the real gateway argv
+    differs from `gateway run`, the relaunch shape may not match — reported).
+    Returns "relaunch" once a live gateway is verified, else None."""
+    for pid in _find_pids_by_argv("hermes gateway"):
+        _pid_kill(pid)  # graceful first
+    time.sleep(3)
+    for pid in _find_pids_by_argv("hermes gateway"):
+        _pid_kill(pid, force=True)  # escalate for survivors
+    time.sleep(2)
+    if _find_pids_by_argv("hermes gateway"):
+        # A supervisor kept/brought it back — don't double-start.
+        return "relaunch"
+    log_path = str(TMP / "chat4000-gateway.log")
+    try:
+        logf = open(log_path, "ab")
+        subprocess.Popen(
+            [hermes_bin, "gateway", "run"],
+            stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+            close_fds=True, **_detached_popen_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if _verify_hermes_gateway_back():
+        return "relaunch"
+    return None
+
+
 def _spawn_detached_gateway_reload(hermes_bin: str, max_wait: int = GATEWAY_RELOAD_MAX_WAIT_S) -> None:
     """Detached: once the pairing watcher RESOLVES (device redeemed or the code
     window expired; hard cap `max_wait`s), reload the Hermes gateway so it loads
@@ -3569,6 +3811,26 @@ def _spawn_detached_gateway_reload(hermes_bin: str, max_wait: int = GATEWAY_RELO
     only at startup, so it must restart regardless of how pairing went. The
     reload script lives in a temp file so its own argv never contains the
     'hermes gateway' pkill pattern (can't self-kill); it self-deletes."""
+    # Windows: no bash. Defer to a detached self-copy that waits for pairing to
+    # resolve, then does the native kill+relaunch (mirrors the OpenClaw worker).
+    if IS_WINDOWS:
+        if _find_pids_by_argv(HERMES_RELOAD_MARKER):
+            return  # a reload worker from a prior run is already pending
+        try:
+            src = os.path.abspath(sys.argv[0] or __file__)
+            copy = str(TMP / f"{HERMES_RELOAD_MARKER}-{uuid.uuid4().hex[:8]}.py")
+            shutil.copyfile(src, copy)
+        except OSError:
+            return
+        worker_cmd = [sys.executable, copy, "--internal-hermes-reload",
+                      "--hermes-reload-bin", hermes_bin, "--reload-max-wait", str(int(max_wait))]
+        with contextlib.suppress(OSError, subprocess.SubprocessError):
+            subprocess.Popen(
+                worker_cmd,
+                stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                close_fds=True, env=_pair_env(), **_detached_popen_kwargs(),
+            )
+        return
     with contextlib.suppress(OSError, subprocess.SubprocessError):
         if subprocess.run(["pgrep", "-f", "chat4000-gwreload"], capture_output=True, timeout=10).returncode == 0:
             return  # a reload waiter from a previous run is already pending — one bounce is enough
@@ -3590,13 +3852,14 @@ def _spawn_detached_gateway_reload(hermes_bin: str, max_wait: int = GATEWAY_RELO
             stdout=subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
-            start_new_session=True,  # survives our exit AND the gateway it bounces
             close_fds=True,
             env=_pair_env(),
+            **_detached_popen_kwargs(),  # POSIX start_new_session=True; survives our exit AND the gateway it bounces
         )
 
 
 OPENCLAW_RELOAD_MARKER = "chat4000-ocreload"  # in the detached reloader's filename/argv
+HERMES_RELOAD_MARKER = "chat4000-hmreload"    # Windows-only deferred Hermes reload worker
 
 
 def _wait_pair_watcher_resolved(max_wait: int) -> None:
@@ -3609,9 +3872,10 @@ def _wait_pair_watcher_resolved(max_wait: int) -> None:
     the OpenClaw path passes an explicit pid and uses _wait_pair_pid_resolved."""
     deadline = time.time() + max_wait
     while time.time() < deadline:
-        with contextlib.suppress(OSError, subprocess.SubprocessError):
-            if subprocess.run(["pgrep", "-f", "chat4000 pair"], capture_output=True, timeout=10).returncode != 0:
-                return  # watcher gone — pairing resolved
+        # POSIX: _find_pids_by_argv is `pgrep -f "chat4000 pair"`. Empty ⇒ gone.
+        # Windows: PowerShell CIM by command line.
+        if not _find_pids_by_argv("chat4000 pair"):
+            return  # watcher gone — pairing resolved
         time.sleep(5)
 
 
@@ -3647,12 +3911,12 @@ def _spawn_detached_openclaw_reload(max_wait: int = GATEWAY_RELOAD_MAX_WAIT_S, p
     re-invokes THIS installer with the hidden --internal-openclaw-reload flag, run
     from a STABLE copy (install.sh deletes the original temp file on exit).
     Returns True if a worker was spawned or one is already pending."""
-    with contextlib.suppress(OSError, subprocess.SubprocessError):
-        if subprocess.run(["pgrep", "-f", OPENCLAW_RELOAD_MARKER], capture_output=True, timeout=10).returncode == 0:
-            return True  # a reload worker from a prior run is already pending
+    # POSIX: _find_pids_by_argv is `pgrep -f OPENCLAW_RELOAD_MARKER`. Windows: CIM.
+    if _find_pids_by_argv(OPENCLAW_RELOAD_MARKER):
+        return True  # a reload worker from a prior run is already pending
     try:
         src = os.path.abspath(sys.argv[0] or __file__)
-        copy = f"/tmp/{OPENCLAW_RELOAD_MARKER}-{uuid.uuid4().hex[:8]}.py"
+        copy = str(TMP / f"{OPENCLAW_RELOAD_MARKER}-{uuid.uuid4().hex[:8]}.py")
         shutil.copyfile(src, copy)
     except OSError:
         return False
@@ -3664,8 +3928,8 @@ def _spawn_detached_openclaw_reload(max_wait: int = GATEWAY_RELOAD_MAX_WAIT_S, p
         subprocess.Popen(
             worker_cmd,
             stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-            start_new_session=True,  # survives our exit AND the gateway it bounces
             close_fds=True, env=_pair_env(),
+            **_detached_popen_kwargs(),  # POSIX start_new_session=True; survives our exit AND the gateway it bounces
         )
         return True
     except (OSError, subprocess.SubprocessError):
@@ -3696,15 +3960,29 @@ def _run_openclaw_deferred_reload(max_wait: int, pair_pid: Optional[int] = None)
     return 0
 
 
+def _run_hermes_deferred_reload(hermes_bin: str, max_wait: int) -> int:
+    """Windows-only body of the detached --internal-hermes-reload worker: wait for
+    the pairing watcher to resolve, do the native Hermes kill+relaunch, then delete
+    our own copied script. Mirrors _run_openclaw_deferred_reload; POSIX never uses
+    this path (its detached reload runs the bash script instead)."""
+    _wait_pair_watcher_resolved(max_wait)
+    time.sleep(5)
+    _hermes_reload_windows(hermes_bin)
+    with contextlib.suppress(OSError):
+        me = os.path.abspath(sys.argv[0])
+        if HERMES_RELOAD_MARKER in os.path.basename(me):
+            os.unlink(me)
+    return 0
+
+
 def _hermes_gateway_alive() -> bool:
     """Is a Hermes gateway process live? Mirrors the kill side, which targets
     `hermes gateway` via pgrep -f, so the same pattern is the authoritative
     'did it come back' signal. (Hermes, unlike OpenClaw, writes no pid lockfile
     we can read, so argv is the signal we have.)"""
-    with contextlib.suppress(OSError, subprocess.SubprocessError):
-        r = subprocess.run(["pgrep", "-f", "hermes gateway"], capture_output=True, timeout=8)
-        return r.returncode == 0
-    return False
+    # POSIX: _find_pids_by_argv is `pgrep -f "hermes gateway"` (identical signal).
+    # Windows: PowerShell CIM by command line.
+    return bool(_find_pids_by_argv("hermes gateway"))
 
 
 def _verify_hermes_gateway_back(timeout: float = 30.0) -> bool:
@@ -3735,8 +4013,15 @@ def _hermes_restart_gateway(venv_bin: str) -> Optional[str]:
 
     Returns "relaunch" (the IN7 installer_gateway_restarted prop) when a live
     gateway came back, or None when it didn't."""
-    hermes_bin = f"{venv_bin}/hermes"
+    hermes_bin = _venv_exe(venv_bin, "hermes")
     say("Stopping the running Hermes gateway and relaunching it so it loads chat4000.")
+    # Windows: no bash — do the kill+relaunch natively (synchronous is safe here,
+    # the human flow doesn't live inside the gateway).
+    if IS_WINDOWS:
+        result = _hermes_reload_windows(hermes_bin)
+        if result is None:
+            warn("kill + relaunch ran but no Hermes gateway is live — restart not verified.")
+        return result
     # The argv-capture kill (SIGTERM, then SIGKILL after a grace) + relaunch
     # script, run SYNCHRONOUSLY from a temp file — a `bash -c` would put the
     # 'hermes gateway' pkill pattern into the reloader's own argv and it would
@@ -3823,7 +4108,7 @@ def install_hermes_agent(t: dict, args) -> int:
     use_agent_distinct_id("hermes")  # BA5
     venv_bin = t["venv_bin"]
     venv_python = t["venv_python"]
-    chat4000 = f"{venv_bin}/chat4000"
+    chat4000 = _venv_exe(venv_bin, "chat4000")
     hm_ref = args.hermes_branch or args.ref
     # 1. Install the plugin from the GitHub ref (quiet).
     uv = detect_uv()
@@ -3873,7 +4158,7 @@ def install_hermes_agent(t: dict, args) -> int:
     #    relays the code first; then the gateway reloads and invites whoever pairs,
     #    now or later. (Earlier this was gated on pair-success — that left the
     #    gateway plugin-less whenever the first window lapsed.)
-    _spawn_detached_gateway_reload(f"{venv_bin}/hermes")
+    _spawn_detached_gateway_reload(_venv_exe(venv_bin, "hermes"))
     note = ("after your user pairs (or the code window ends) I restart the Hermes gateway so it "
             "loads chat4000 — the bot may blip briefly at that moment")
     _emit("installer_pkg_installed", {"plugin_ref": hm_ref, "mode": "agent"})
@@ -4078,6 +4363,7 @@ def run_agent_mode(args) -> int:
 
 
 def main() -> int:
+    _enable_ansi()  # Win10+: turn on ANSI/VT so colors render (no-op on POSIX)
     parser = argparse.ArgumentParser(description="chat4000 plugin installer (Hermes + OpenClaw)", add_help=True)
     # Selection
     parser.add_argument("--target", choices=["hermes", "openclaw"], help="only consider this host kind")
@@ -4114,6 +4400,10 @@ def main() -> int:
     parser.add_argument("--internal-openclaw-reload", dest="internal_openclaw_reload", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--reload-max-wait", dest="reload_max_wait", type=int, default=None, help=argparse.SUPPRESS)
     parser.add_argument("--pair-pid", dest="pair_pid_wait", type=int, default=None, help=argparse.SUPPRESS)
+    # Hidden: the Windows-only detached Hermes gateway-reload worker (see
+    # _spawn_detached_gateway_reload's IS_WINDOWS branch) re-invokes with these.
+    parser.add_argument("--internal-hermes-reload", dest="internal_hermes_reload", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--hermes-reload-bin", dest="hermes_reload_bin", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args()
 
     # Detached OpenClaw gateway-reload worker: do ONLY that (wait for pairing to
@@ -4122,6 +4412,14 @@ def main() -> int:
         return _run_openclaw_deferred_reload(
             int(args.reload_max_wait or GATEWAY_RELOAD_MAX_WAIT_S),
             pair_pid=args.pair_pid_wait,
+        )
+
+    # Windows-only detached Hermes gateway-reload worker: wait for pairing to
+    # resolve, then native kill+relaunch. Short-circuits all normal logic.
+    if args.internal_hermes_reload:
+        return _run_hermes_deferred_reload(
+            args.hermes_reload_bin or "hermes",
+            int(args.reload_max_wait or GATEWAY_RELOAD_MAX_WAIT_S),
         )
 
     global _AGENT_MODE, _AGENT_AUTODETECTED
@@ -4262,8 +4560,8 @@ def _setup_tmp_debug_log() -> None:
     double-writing. Run as a bare `python installer.py` (no bootstrap), we set up
     our own tee. Best-effort throughout; never raises."""
     global _TMP_LOG_PATH
-    path = os.environ.get("CHAT4000_INSTALLER_LOG") or (
-        f"/tmp/chat4000-installer-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.log"
+    path = os.environ.get("CHAT4000_INSTALLER_LOG") or str(
+        TMP / f"chat4000-installer-{time.strftime('%Y%m%d-%H%M%S')}-{os.getpid()}.log"
     )
     _TMP_LOG_PATH = path
     # Always append a one-line "python started" marker DIRECTLY to the file (not
