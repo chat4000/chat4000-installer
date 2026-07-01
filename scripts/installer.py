@@ -941,17 +941,17 @@ def detect_hermes_all() -> list:
     install_dir = (os.environ.get("HERMES_INSTALL_DIR") or "").strip()
     if install_dir:
         p = str(Path(install_dir).expanduser() / "venv" / "bin")
-        if Path(f"{p}/python").exists():
+        if Path(_venv_exe(p, "python")).exists():
             add(p, "env:HERMES_INSTALL_DIR")
     hermes_home = (os.environ.get("HERMES_HOME") or "").strip()
     if hermes_home:
         p = str(Path(hermes_home).expanduser() / "hermes-agent" / "venv" / "bin")
-        if Path(f"{p}/python").exists():
+        if Path(_venv_exe(p, "python")).exists():
             add(p, "env:HERMES_HOME")
     venv = (os.environ.get("VIRTUAL_ENV") or "").strip()
     if venv:
         p = str(Path(venv).expanduser() / "bin")
-        if Path(f"{p}/hermes").exists() and Path(f"{p}/python").exists():
+        if Path(_venv_exe(p, "hermes")).exists() and Path(_venv_exe(p, "python")).exists():
             add(p, "env:VIRTUAL_ENV")
 
     # 2. `hermes` on PATH — wrapper-grep, then resolve as symlink.
@@ -966,14 +966,14 @@ def detect_hermes_all() -> list:
                 m = re.search(pat, content)
                 if m:
                     bin_path = m.group(0)
-                    if Path(f"{bin_path}/python").exists() or Path(f"{bin_path}/hermes").exists():
+                    if Path(_venv_exe(bin_path, "python")).exists() or Path(_venv_exe(bin_path, "hermes")).exists():
                         add(bin_path, _layout_label(bin_path))
         except OSError:
             pass
         try:
             real = Path(hermes_cmd).resolve()
             bin_path = str(real.parent)
-            if Path(f"{bin_path}/python").exists():
+            if Path(_venv_exe(bin_path, "python")).exists():
                 add(bin_path, _layout_label(bin_path))
         except OSError:
             pass
@@ -2501,7 +2501,7 @@ def build_targets(args) -> list:
     # Explicit overrides short-circuit detection for that kind.
     if args.hermes_bin:
         cand = str(Path(args.hermes_bin.rstrip("/")).expanduser())
-        if Path(f"{cand}/python").exists():
+        if Path(_venv_exe(cand, "python")).exists():
             targets.append(_mk_hermes(cand, "user-override"))
         else:
             err(f"--hermes-bin {cand}: no `python` found there.")
@@ -3136,7 +3136,7 @@ def prompt_manual_target(args) -> Optional[list]:
         return None
     cand = str(Path(user_input).expanduser())
     # Hermes venv-bin?
-    if Path(f"{cand}/python").exists():
+    if Path(_venv_exe(cand, "python")).exists():
         ok(f"Hermes venv:  {C_CYN}{cand}{C_RST}  {C_DIM}(user input){C_RST}")
         _emit("installer_hermes_path_via_user_input", {"hermes_path": cand})
         t = _mk_hermes(cand.rstrip("/"), "user-input")
