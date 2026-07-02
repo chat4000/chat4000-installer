@@ -1679,12 +1679,25 @@ def _count_hermes_sessions(home: Path) -> Optional[int]:
 # ─── Hermes install steps ─────────────────────────────────────────────────
 
 
+def _hermes_plugin_source(ref: str) -> str:
+    """pip/uv install source for the Hermes plugin at `ref` (branch/tag/SHA).
+
+    We install from GitHub's source TARBALL (`.../archive/<ref>.tar.gz`), NOT a
+    `git+https://…@<ref>` spec — so the install needs NO `git` on the user's
+    machine. pip/uv fetch over plain HTTPS and unpack with the stdlib `tarfile`
+    module (cross-platform; Windows needs no `tar` binary). GitHub serves the
+    archive for any branch, tag, or commit SHA, so `--ref` still works exactly as
+    before. (A real Windows user hit `installer_failed: pip_install` precisely
+    because `git+` requires git, which their box didn't have.)"""
+    return f"{HERMES_REPO_URL}/archive/{ref}.tar.gz"
+
+
 def hermes_install_via_uv(uv: str, venv_python: str, ref: str, *, capture: bool = False) -> None:
     subprocess.run(
         [
             uv, "pip", "install", "--python", venv_python,
             "--find-links", PYVODOZEMAC_FIND_LINKS,
-            f"git+{HERMES_REPO_URL}@{ref}",
+            _hermes_plugin_source(ref),
         ],
         check=True, capture_output=capture, text=capture,
     )
@@ -1705,7 +1718,7 @@ def hermes_install_via_pip(venv_python: str, ref: str, *, capture: bool = False)
         [
             venv_python, "-m", "pip", "install", "--upgrade",
             "--find-links", PYVODOZEMAC_FIND_LINKS,
-            f"git+{HERMES_REPO_URL}@{ref}",
+            _hermes_plugin_source(ref),
         ],
         check=True, capture_output=capture, text=capture,
     )
