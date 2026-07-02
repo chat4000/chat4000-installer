@@ -229,6 +229,53 @@ def _find_pids_by_argv(pattern: str) -> list:
         return []
 
 
+def _find_pids_by_image_subcmd(image: str, subcmd: str) -> list:
+    """Windows-only: PIDs whose process IMAGE is `image` (e.g. 'hermes.exe') AND
+    whose command line carries the ` <subcmd>` token (e.g. 'gateway').
+
+    Matching on the image NAME is the robust way to identify a process by its
+    executable on Windows: it is invariant to how the process was launched —
+    `"...\\hermes.exe" gateway run` (quoted, Start-Process / services / shortcuts),
+    `...\\hermes.exe gateway run` (unquoted, our own Popen), or bare
+    `hermes gateway run` (as recorded by cmd.exe). A full-command-line substring
+    (the old `hermes gateway` / `hermes.exe gateway`) breaks on all three: the
+    `.exe`, the closing quote, and a bare argv0 with no path/extension. Scoping to
+    the image name and then requiring the ` <subcmd>` token (leading space, so it
+    is the subcommand argument and not a path fragment) is precise without being
+    brittle. Excludes the query's own PID (the CIM probe's command line would
+    otherwise self-match on `<subcmd>`)."""
+    try:
+        ps = ("Get-CimInstance Win32_Process | "
+              f"Where-Object {{ $_.ProcessId -ne $PID -and $_.Name -eq '{image}' "
+              f"-and $_.CommandLine -like '* {subcmd}*' }} | "
+              "Select-Object -ExpandProperty ProcessId")
+        out = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                             capture_output=True, text=True, timeout=15).stdout
+        return [int(x) for x in out.split() if x.strip().isdigit()]
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return []
+
+
+def _hermes_gateway_pids() -> list:
+    """PIDs of running Hermes gateway processes, cross-platform + launch-invariant.
+    POSIX: `pgrep -f "hermes gateway"` (argv0 is `.../bin/hermes`, always present).
+    Windows: match the `hermes.exe` image + the `gateway` subcommand (see
+    _find_pids_by_image_subcmd for why the image name, not a cmdline substring)."""
+    if IS_WINDOWS:
+        return _find_pids_by_image_subcmd("hermes.exe", "gateway")
+    return _find_pids_by_argv("hermes gateway")
+
+
+def _hermes_pair_watcher_pids() -> list:
+    """PIDs of the running Hermes `chat4000 pair` watcher. POSIX: pgrep the
+    `chat4000 pair` argv. Windows: the `chat4000.exe` image + `pair` subcommand.
+    (OpenClaw does NOT surface here — it renames its pair process, so its flows
+    track the explicit pair pid via _wait_pair_pid_resolved; this is Hermes-only.)"""
+    if IS_WINDOWS:
+        return _find_pids_by_image_subcmd("chat4000.exe", "pair")
+    return _find_pids_by_argv("chat4000 pair")
+
+
 # ─── Constants ────────────────────────────────────────────────────────────
 
 # Both plugins install from their GitHub repo's `stable` tag (NOT from a package
@@ -236,13 +283,6 @@ def _find_pids_by_argv(pattern: str) -> list:
 # hosts; `--latest` is shorthand for the repo's default branch (newest code).
 DEFAULT_REF = "stable"
 LATEST_REF = "main"
-
-# A running Hermes gateway's command line is `.../bin/hermes gateway run` on POSIX
-# but `...\Scripts\hermes.exe gateway run` on Windows — so the space-delimited
-# "hermes gateway" only matches on POSIX. On Windows the `.exe` between the binary
-# and the subcommand breaks the substring, so we match the `.exe` form there. This
-# is the pattern every gateway kill/verify probe uses (kill side + _hermes_gateway_alive).
-HERMES_GATEWAY_ARGV = "hermes.exe gateway" if IS_WINDOWS else "hermes gateway"
 
 # Hermes — Python plugin, git-installed into Hermes' venv from the gh tag.
 HERMES_REPO_URL = "https://github.com/chat4000/chat4000-hermes-plugin"
@@ -3628,10 +3668,10 @@ def _kill_stale_pair_watchers() -> None:
     stuck at 'Waiting for your plugin' (observed live on hermes-test-91 under the
     old limit). Old watchers are worthless the moment a new code is issued; kill
     them before spawning."""
-    # Matches 'chat4000 pair …' (Hermes) and 'openclaw chat4000 pair …'
-    # (OpenClaw) cmdlines; our own argv never contains this substring.
+    # Windows: kill by the pair watcher's PIDs (matched on image name + `pair`
+    # subcommand, launch-invariant — see _hermes_pair_watcher_pids). POSIX: pkill.
     if IS_WINDOWS:
-        for pid in _find_pids_by_argv("chat4000 pair"):
+        for pid in _hermes_pair_watcher_pids():
             _pid_kill(pid, force=True)
         return
     try:
@@ -3646,9 +3686,7 @@ def _reuse_live_pair() -> Optional[tuple]:
     installer (e.g. after the gateway restart interrupts their relay turn), and
     a re-run must not invalidate the code the user may be typing into their
     phone right now. Fresh = log younger than 180s (codes live 300s)."""
-    # POSIX: _find_pids_by_argv is `pgrep -f "chat4000 pair"` (identical gate).
-    # Windows: PowerShell CIM by command line.
-    if not _find_pids_by_argv("chat4000 pair"):
+    if not _hermes_pair_watcher_pids():
         return None
     try:
         logs = sorted(TMP.glob("chat4000-pair-*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -3800,13 +3838,13 @@ def _hermes_reload_windows(hermes_bin: str) -> Optional[str]:
     when it can't read /proc/<pid>/cmdline (UNCERTAIN: if the real gateway argv
     differs from `gateway run`, the relaunch shape may not match — reported).
     Returns "relaunch" once a live gateway is verified, else None."""
-    for pid in _find_pids_by_argv(HERMES_GATEWAY_ARGV):
+    for pid in _hermes_gateway_pids():
         _pid_kill(pid)  # graceful first
     time.sleep(3)
-    for pid in _find_pids_by_argv(HERMES_GATEWAY_ARGV):
+    for pid in _hermes_gateway_pids():
         _pid_kill(pid, force=True)  # escalate for survivors
     time.sleep(2)
-    if _find_pids_by_argv(HERMES_GATEWAY_ARGV):
+    if _hermes_gateway_pids():
         # A supervisor kept/brought it back — don't double-start.
         return "relaunch"
     log_path = str(TMP / "chat4000-gateway.log")
@@ -3894,9 +3932,8 @@ def _wait_pair_watcher_resolved(max_wait: int) -> None:
     the OpenClaw path passes an explicit pid and uses _wait_pair_pid_resolved."""
     deadline = time.time() + max_wait
     while time.time() < deadline:
-        # POSIX: _find_pids_by_argv is `pgrep -f "chat4000 pair"`. Empty ⇒ gone.
-        # Windows: PowerShell CIM by command line.
-        if not _find_pids_by_argv("chat4000 pair"):
+        # Empty ⇒ the watcher is gone (pairing resolved). See _hermes_pair_watcher_pids.
+        if not _hermes_pair_watcher_pids():
             return  # watcher gone — pairing resolved
         time.sleep(5)
 
@@ -3998,15 +4035,11 @@ def _run_hermes_deferred_reload(hermes_bin: str, max_wait: int) -> int:
 
 
 def _hermes_gateway_alive() -> bool:
-    """Is a Hermes gateway process live? Mirrors the kill side, which targets
-    `hermes gateway` via pgrep -f, so the same pattern is the authoritative
-    'did it come back' signal. (Hermes, unlike OpenClaw, writes no pid lockfile
-    we can read, so argv is the signal we have.)"""
-    # POSIX: _find_pids_by_argv is `pgrep -f "hermes gateway"` (identical signal).
-    # Windows: PowerShell CIM by command line, matching the `hermes.exe gateway`
-    # form (HERMES_GATEWAY_ARGV) — the bare "hermes gateway" never matches the
-    # Windows process whose argv0 is `...\hermes.exe`.
-    return bool(_find_pids_by_argv(HERMES_GATEWAY_ARGV))
+    """Is a Hermes gateway process live? Mirrors the kill side (both use
+    _hermes_gateway_pids), so the same signal decides 'did it come back'. (Hermes,
+    unlike OpenClaw, writes no pid lockfile we can read, so the process listing is
+    the signal we have — by image name on Windows, by argv via pgrep on POSIX.)"""
+    return bool(_hermes_gateway_pids())
 
 
 def _verify_hermes_gateway_back(timeout: float = 30.0) -> bool:
