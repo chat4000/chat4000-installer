@@ -1865,6 +1865,15 @@ def _download_github_tarball(slug: str, ref: str) -> tuple:
         return None, f"extracting the GitHub tarball failed: {exc}"
 
 
+# PostHog SDK log lines the plugin CLIs (`chat4000 prepare`/`pair`) can emit —
+# most visibly `[PostHog] flush timed out after N seconds with M items pending`
+# when a best-effort analytics flush can't reach the ingestion host. It's noise
+# the user should never see; we drop it from the echoed stream (the plugin also
+# silences its own posthog logger, this is belt-and-suspenders + covers pip/other
+# streamed subprocesses). Kept in the captured buffer + debug log for forensics.
+_POSTHOG_NOISE_RE = re.compile(r"\[PostHog\]|flush timed out.*items pending", re.IGNORECASE)
+
+
 def _run_streaming(cmd: list, *, quiet: bool, cwd: Optional[str] = None) -> tuple:
     """Run cmd with stdout+stderr merged, echoing lines unless quiet.
     Returns (returncode, full_output)."""
@@ -1874,7 +1883,7 @@ def _run_streaming(cmd: list, *, quiet: bool, cwd: Optional[str] = None) -> tupl
     buf: list = []
     if proc.stdout is not None:
         for line in proc.stdout:
-            if not quiet:
+            if not quiet and not _POSTHOG_NOISE_RE.search(line):
                 sys.stdout.write(line)
                 sys.stdout.flush()
             buf.append(line)
