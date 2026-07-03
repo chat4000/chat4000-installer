@@ -96,8 +96,8 @@ class TestHermesNoPairGate(unittest.TestCase):
 
         with mock.patch.object(installer.subprocess, "run", side_effect=fake_subprocess_run), \
              mock.patch.object(installer, "detect_uv", return_value=None), \
-             mock.patch.object(installer, "hermes_install_via_pip", return_value=None), \
-             mock.patch.object(installer, "hermes_install_via_uv", return_value=None), \
+             mock.patch.object(installer, "hermes_install_via_pip", return_value=(0, "")), \
+             mock.patch.object(installer, "hermes_install_via_uv", return_value=(0, "")), \
              mock.patch.object(installer, "symlink_chat4000_onto_path", return_value=None), \
              mock.patch.object(installer, "_run_streaming", return_value=(0, "")), \
              mock.patch.object(installer, "_hermes_restart_gateway", side_effect=fake_restart), \
@@ -129,7 +129,7 @@ class TestHermesNoPairGate(unittest.TestCase):
         }
         with mock.patch.object(installer.subprocess, "run", return_value=_FakeProc(0, stdout="chat4000_hermes_plugin")), \
              mock.patch.object(installer, "detect_uv", return_value=None), \
-             mock.patch.object(installer, "hermes_install_via_pip", return_value=None), \
+             mock.patch.object(installer, "hermes_install_via_pip", return_value=(0, "")), \
              mock.patch.object(installer, "symlink_chat4000_onto_path", return_value=None), \
              mock.patch.object(installer, "_emit", return_value=None), \
              mock.patch.object(installer, "use_agent_distinct_id", return_value="x"):

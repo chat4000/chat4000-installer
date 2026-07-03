@@ -185,8 +185,15 @@ def _config_dir() -> Path:
 
 def _venv_exe(venv_bin: str, name: str) -> str:
     """Path to a venv executable — `name.exe` under Scripts on Windows, bare `name`
-    under bin on POSIX. POSIX result is byte-identical to the old f"{venv_bin}/{name}"."""
-    return f"{venv_bin}/{name}.exe" if IS_WINDOWS else f"{venv_bin}/{name}"
+    under bin on POSIX. POSIX result is byte-identical to the old f"{venv_bin}/{name}".
+
+    Path(...) join, not a hardcoded f"{..}/{..}" — `venv_bin` is already
+    backslash-separated on Windows, so a literal "/" produced a MIXED-separator
+    path (`...\\venv\\Scripts/python.exe`) passed to `uv --python`. Leading
+    suspect for a real Windows uv install failure building the plugin from
+    source (fails installing `wheel` into uv's isolated build env)."""
+    suffix = ".exe" if IS_WINDOWS else ""
+    return str(Path(venv_bin) / f"{name}{suffix}")
 
 
 def _enable_ansi() -> None:
@@ -611,6 +618,15 @@ def _scrub_secrets(s: str) -> str:
     s = re.sub(r"phc_[A-Za-z0-9]{30,}", "[REDACTED_POSTHOG_KEY]", s)
     s = re.sub(r"(?i)Bearer\s+[A-Za-z0-9._-]+", "Bearer [REDACTED]", s)
     return s
+
+
+def _err_tail(text: Optional[str], limit: int = 1500) -> str:
+    """Scrub + tail-slice diagnostic text for an `installer_failed` prop. Tail,
+    not head: pip/uv/npm print verbose setup noise first and the actual error
+    last, so a head-cut (the old `str(exc)[:200]` pattern) tends to show the
+    command line and miss the reason entirely. PostHog/Kafka have no practical
+    trouble with a value this size — there's no need to cut tighter than this."""
+    return _scrub_secrets((text or "").strip())[-limit:] or "(no output captured)"
 
 
 # ─── PostHog (stdlib HTTPS, no SDK) ───────────────────────────────────────
@@ -1692,18 +1708,22 @@ def _hermes_plugin_source(ref: str) -> str:
     return f"{HERMES_REPO_URL}/archive/{ref}.tar.gz"
 
 
-def hermes_install_via_uv(uv: str, venv_python: str, ref: str, *, capture: bool = False) -> None:
-    subprocess.run(
+def hermes_install_via_uv(uv: str, venv_python: str, ref: str, *, quiet: bool = False) -> tuple:
+    """Returns (returncode, merged stdout+stderr) — via `_run_streaming` so the
+    full output is ALWAYS captured (for the failure event / debug log) even
+    while it also streams live to the human's terminal when not `quiet`."""
+    return _run_streaming(
         [
             uv, "pip", "install", "--python", venv_python,
             "--find-links", PYVODOZEMAC_FIND_LINKS,
             _hermes_plugin_source(ref),
         ],
-        check=True, capture_output=capture, text=capture,
+        quiet=quiet,
     )
 
 
-def hermes_install_via_pip(venv_python: str, ref: str, *, capture: bool = False) -> None:
+def hermes_install_via_pip(venv_python: str, ref: str, *, quiet: bool = False) -> tuple:
+    """Returns (returncode, merged stdout+stderr) — see hermes_install_via_uv."""
     has_pip = (
         subprocess.run([venv_python, "-c", "import pip"], capture_output=True).returncode == 0
     )
@@ -1714,13 +1734,13 @@ def hermes_install_via_pip(venv_python: str, ref: str, *, capture: bool = False)
             with urllib.request.urlopen("https://bootstrap.pypa.io/get-pip.py", timeout=20) as resp:  # noqa: S310
                 bootstrap = resp.read()
             subprocess.run([venv_python], input=bootstrap, check=True)
-    subprocess.run(
+    return _run_streaming(
         [
             venv_python, "-m", "pip", "install", "--upgrade",
             "--find-links", PYVODOZEMAC_FIND_LINKS,
             _hermes_plugin_source(ref),
         ],
-        check=True, capture_output=capture, text=capture,
+        quiet=quiet,
     )
 
 
@@ -2824,19 +2844,22 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
     hm_ref = args.hermes_branch or args.ref
     hdr(f"📦 Installing chat4000 plugin from {HERMES_REPO_URL}@{hm_ref}")
     uv = detect_uv()
-    try:
-        if uv:
-            ok(f"Using uv at {C_CYN}{uv}{C_RST}")
-            _emit("installer_uv_detected", {"uv_path": uv})
-            hermes_install_via_uv(uv, venv_python, hm_ref)
-            installer_used = "uv"
-        else:
-            warn("uv not found — falling back to venv pip")
-            hermes_install_via_pip(venv_python, hm_ref)
-            installer_used = "pip"
-    except subprocess.CalledProcessError as exc:
-        err(f"Install failed: {exc}")
-        _emit("installer_failed", {"stage": "pip_install", "error_class": type(exc).__name__, "error_msg": str(exc)[:200], "installer_used": uv and "uv" or "pip"})
+    if uv:
+        ok(f"Using uv at {C_CYN}{uv}{C_RST}")
+        _emit("installer_uv_detected", {"uv_path": uv})
+        installer_used = "uv"
+        pip_rc, pip_out = hermes_install_via_uv(uv, venv_python, hm_ref)
+    else:
+        warn("uv not found — falling back to venv pip")
+        installer_used = "pip"
+        pip_rc, pip_out = hermes_install_via_pip(venv_python, hm_ref)
+    if pip_rc != 0:
+        err(f"Install failed (exit {pip_rc}).")
+        _emit("installer_failed", {
+            "stage": "pip_install", "error_class": "CalledProcessError",
+            "error_msg": _err_tail(pip_out), "exit_code": pip_rc,
+            "installer_used": installer_used,
+        })
         return 1
     ok("Plugin installed.")
 
@@ -2847,7 +2870,7 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
     if check.returncode != 0:
         err("Plugin installed but import failed:")
         err(check.stderr.strip())
-        _emit("installer_failed", {"stage": "import_check", "error_msg": check.stderr.strip()[:200]})
+        _emit("installer_failed", {"stage": "import_check", "error_msg": _err_tail(check.stderr)})
         return 1
 
     ver = subprocess.run(
@@ -2880,10 +2903,10 @@ def install_into_hermes(t: dict, args, *, interactive: bool) -> int:
     prep_cmd = [chat4000_bin, "prepare"]
     if args.stage:
         prep_cmd.append("--stage")
-    prep_rc, _prep_out = _run_streaming(prep_cmd, quiet=False)
+    prep_rc, prep_out = _run_streaming(prep_cmd, quiet=False)
     if prep_rc != 0:
         err(f"Setup (chat4000 prepare) exited {prep_rc}.")
-        _emit("installer_failed", {"stage": "prepare", "exit_code": prep_rc})
+        _emit("installer_failed", {"stage": "prepare", "exit_code": prep_rc, "error_msg": _err_tail(prep_out)})
         return prep_rc
 
     # 2/3 — Restart the gateway FIRST (non-agent / server flow) so it actually
@@ -3040,7 +3063,7 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
             err("  - Permissions on the OpenClaw plugins directory")
         # IN6: error_class distinguishes the host-version preflight (HostTooOld)
         # from a generic InstallFailed.
-        _emit("installer_failed", {"stage": "plugin_install", "error_class": fail_class or "InstallFailed", "error_msg": output_tail[:200] or "no output", "output_tail": output_tail, "ref": oc_ref})
+        _emit("installer_failed", {"stage": "plugin_install", "error_class": fail_class or "InstallFailed", "error_msg": _err_tail(output_tail), "output_tail": output_tail, "ref": oc_ref})
         return 1
     ok(f"chat4000 plugin ready (GitHub @{oc_ref}).")
     _emit("installer_pkg_installed", {"plugin_package": OPENCLAW_PKG, "source": "github", "ref": oc_ref, "spec": used_spec, "from_version": cur_ver, "was_installed": installed})
@@ -3155,7 +3178,7 @@ def install_into_openclaw(t: dict, args, *, interactive: bool) -> int:
             except OSError as exc:
                 # IN11: couldn't even launch `pair` — parity with the Hermes flow.
                 err(f"Could not run pairing: {exc}")
-                _emit("installer_failed", {"stage": "pair", "error_class": "launch_failed", "error_msg": str(exc)[:200]})
+                _emit("installer_failed", {"stage": "pair", "error_class": "launch_failed", "error_msg": _err_tail(str(exc))})
                 return 1
             pair_outcome = _read_pair_outcome(_outcome_file, pair_rc)
             if pair_rc != 0:
@@ -3306,9 +3329,9 @@ def agent_error(stage: str, detail: str, *, stage_token: Optional[str] = None, e
     the matching `installer_failed` terminal event fires (IN7). The crash /
     interrupt boundary passes NO token: it already emitted installer_crashed /
     installer_cancelled and must not double-count a terminal state."""
-    detail = _scrub_secrets((detail or "").strip())[-800:] or "(no further detail)"
+    detail = _err_tail(detail, limit=800)
     if stage_token:
-        props = {"stage": stage_token, "error_msg": detail[:200]}
+        props = {"stage": stage_token, "error_msg": detail}
         if error_class:
             props["error_class"] = error_class
         _emit("installer_failed", props)
@@ -4191,17 +4214,13 @@ def install_hermes_agent(t: dict, args) -> int:
     hm_ref = args.hermes_branch or args.ref
     # 1. Install the plugin from the GitHub ref (quiet).
     uv = detect_uv()
-    try:
-        if uv:
-            hermes_install_via_uv(uv, venv_python, hm_ref, capture=True)
-        else:
-            hermes_install_via_pip(venv_python, hm_ref, capture=True)
-    except subprocess.CalledProcessError as exc:
-        out = getattr(exc, "stderr", None) or getattr(exc, "stdout", None) or ""
-        if isinstance(out, bytes):
-            out = out.decode("utf-8", "ignore")
-        return agent_error(f"installing the Hermes plugin from GitHub @{hm_ref}", out or str(exc),
-                           stage_token="pip_install")
+    if uv:
+        pip_rc, pip_out = hermes_install_via_uv(uv, venv_python, hm_ref, quiet=True)
+    else:
+        pip_rc, pip_out = hermes_install_via_pip(venv_python, hm_ref, quiet=True)
+    if pip_rc != 0:
+        return agent_error(f"installing the Hermes plugin from GitHub @{hm_ref}", pip_out,
+                           stage_token="pip_install", error_class="CalledProcessError")
     # 2. Import-check.
     chk = subprocess.run([venv_python, "-c", "import chat4000_hermes_plugin"], capture_output=True, text=True)
     if chk.returncode != 0:
@@ -4701,7 +4720,7 @@ def _entry() -> int:
     except SystemExit:
         raise
     except BaseException as exc:  # noqa: BLE001  # installer top-level boundary: reports to its own sinks, then exits
-        _emit("installer_crashed", {"error_class": type(exc).__name__, "error_msg": str(exc)[:200]})
+        _emit("installer_crashed", {"error_class": type(exc).__name__, "error_msg": _err_tail(str(exc))})
         send_sentry_envelope(exc, tags={"crash_stage": "uncaught"})
         if _AGENT_MODE:
             # err()/warn() are muted in agent mode — without this, a crash exits 1
